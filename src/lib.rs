@@ -1,12 +1,5 @@
-// So we want an MPT
-// It exposes upsert
-// It exposes get_proof
-
-// We're going to do it all in memory
-// We're going to do it one operation at time
-
 use log::{debug, info};
-use sha2::{Digest, Sha256};
+use sha2::{Digest};
 use std::collections::HashMap;
 
 mod prefix;
@@ -31,8 +24,8 @@ impl LeafNode {
     pub fn calculate_hash(key: Hash, value: Hash) -> Hash {
         let mut hasher = sha2::Sha256::new();
         hasher.update(b"leaf");
-        hasher.update(&key);
-        hasher.update(&value);
+        hasher.update(key);
+        hasher.update(value);
         hasher.finalize().into()
     }
 }
@@ -64,10 +57,10 @@ impl InteriorNode {
     pub fn calculate_hash(prefix: Prefix, left_hash: Hash, right_hash: Hash) -> Hash {
         let mut hasher = sha2::Sha256::new();
         hasher.update(b"interior");
-        hasher.update(&prefix.hash);
-        hasher.update(&prefix.length.to_be_bytes());
-        hasher.update(&left_hash);
-        hasher.update(&right_hash);
+        hasher.update(prefix.hash);
+        hasher.update(prefix.length.to_be_bytes());
+        hasher.update(left_hash);
+        hasher.update(right_hash);
         hasher.finalize().into()
     }
 }
@@ -97,7 +90,7 @@ fn short_hex_hash(hash: &Hash) -> String {
     let mut s = String::with_capacity(8);
     for b in hash.iter().take(4) {
         // 4 bytes = 8 hex chars
-        write!(&mut s, "{:02x}", b).unwrap();
+        write!(&mut s, "{b:02x}").unwrap();
     }
     s
 }
@@ -118,6 +111,12 @@ fn short_hex_prefix(prefix: &Prefix) -> String {
         prefix_bits.push(bit);
     }
     prefix_bits.iter().map(|b| if *b > 0 { '1' } else { '0' }).collect()
+}
+
+impl Default for SimpleMPT {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SimpleMPT {
@@ -224,7 +223,7 @@ impl SimpleMPT {
                             lmh,
                             rmh,
                         );
-                        let nip = new_interior.prefix.clone();
+                        let nip = new_interior.prefix;
                         updates.push((new_interior.prefix, Node::Interior(new_interior)));
                         updates.push((nlp, Node::Leaf(new_leaf)));
                         finished_prefix = nip;
@@ -263,6 +262,6 @@ impl SimpleMPT {
             }
             self.store.insert(prefix, node);
         }
-        return finished_prefix;
+        finished_prefix
     }
 }

@@ -1,6 +1,5 @@
 use jellyfish_rs::{Hash, Node, Prefix, SimpleMPT};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 
@@ -18,14 +17,14 @@ fn hash_value(value: &str) -> Hash {
 
 fn append_mermaid_to_file(mpt: &SimpleMPT, path: &str, step: usize, key: &str, value: &str) {
     let mut buffer = Vec::new();
-    buffer.extend_from_slice(format!("\n## Step {}: Insert ('{}', '{}')\n\n", step, key, value).as_bytes());
+    buffer.extend_from_slice(format!("\n## Step {step}: Insert ('{key}', '{value}')\n\n").as_bytes());
     buffer.extend_from_slice(b"```mermaid\n");
     buffer.extend_from_slice(b"graph TD\n");
     buffer.extend_from_slice(collect_mermaid_node(mpt).as_bytes());
     buffer.extend_from_slice(b"```\n");
     let mut file = OpenOptions::new()
         .create(true)
-        .write(true)
+        
         .append(true)
         .open(path)
         .unwrap();
@@ -45,7 +44,7 @@ fn collect_mermaid_node(mpt: &SimpleMPT) -> String {
             Node::Leaf(leaf) => format!("leaf_{}", hex::encode(&leaf.key[..4])),
             Node::Interior(interior) => format!("int_{}", hex::encode(&interior.prefix.hash[..4])),
         };
-        name_cache.insert(prefix.clone(), name.clone());
+        name_cache.insert(*prefix, name.clone());
         name
     };
     for (prefix, node) in mpt.store.iter() {
@@ -67,11 +66,11 @@ fn collect_mermaid_node(mpt: &SimpleMPT) -> String {
                 // Edges to children
                 if let Some(left_node) = mpt.store.get(&interior.left) {
                     let left_name = get_name(&interior.left, left_node);
-                    lines.push_str(&format!("  {} --> {}\n", this_name, left_name));
+                    lines.push_str(&format!("  {this_name} --> {left_name}\n"));
                 }
                 if let Some(right_node) = mpt.store.get(&interior.right) {
                     let right_name = get_name(&interior.right, right_node);
-                    lines.push_str(&format!("  {} --> {}\n", this_name, right_name));
+                    lines.push_str(&format!("  {this_name} --> {right_name}\n"));
                 }
             }
         }
@@ -120,5 +119,5 @@ fn main() {
             output_file
         );
     }
-    println!("\nAll diagrams written to {}", output_file);
+    println!("\nAll diagrams written to {output_file}");
 }
