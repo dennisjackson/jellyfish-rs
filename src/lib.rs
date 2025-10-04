@@ -139,14 +139,14 @@ impl SimpleMPT {
         };
 
         match node {
-            Node::Leaf(leaf) => self.handle_leaf_upsert(current_prefix, leaf, key, value),
+            Node::Leaf(leaf) => self.base_leaf_upsert(current_prefix, leaf, key, value),
             Node::Interior(interior) => {
-                self.handle_interior_upsert(interior, key_prefix, key, value)
+                self.recursive_interior_upsert(interior, key_prefix, key, value)
             }
         }
     }
 
-    fn handle_leaf_upsert(
+    fn base_leaf_upsert(
         &mut self,
         current_prefix: Prefix,
         leaf: LeafNode,
@@ -194,7 +194,7 @@ impl SimpleMPT {
         merged_prefix
     }
 
-    fn handle_interior_upsert(
+    fn recursive_interior_upsert(
         &mut self,
         interior: InteriorNode,
         key_prefix: Prefix,
