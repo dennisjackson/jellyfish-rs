@@ -33,16 +33,10 @@ impl Prefix {
         if self.length > other.length {
             return false;
         }
-        let full_bytes = (self.length / 8) as usize;
-        let rem_bits = (self.length % 8) as u8;
-        // Compare all full bytes
-        if self.hash[..full_bytes] != other.hash[..full_bytes] {
-            return false;
-        }
-        // If there are remaining bits, compare those as well
-        if rem_bits > 0 {
-            let mask = 0xFF << (8 - rem_bits);
-            if (self.hash[full_bytes] & mask) != (other.hash[full_bytes] & mask) {
+        for i in 0..self.length {
+            let bit_self = (self.hash[(i / 8) as usize] >> (7 - (i % 8))) & 1;
+            let bit_other = (other.hash[(i / 8) as usize] >> (7 - (i % 8))) & 1;
+            if bit_self != bit_other {
                 return false;
             }
         }
@@ -50,36 +44,18 @@ impl Prefix {
     }
 
     pub fn common_prefix(a: &Prefix, b: &Prefix) -> Prefix {
-        // Take slices up to the minimum length of either prefix.
-        // XOR them together. Count leading zeros.
-        // The common prefix length is the number of leading zeros.
-        // Return that many bits of either prefix.
         let min_length = a.length.min(b.length);
-        let max_bytes = ((min_length + 7) / 8) as usize; // Round up to include partial bytes
-
         let mut common_bits = 0u16;
-
-        // Compare byte by byte
-        for i in 0..max_bytes {
-            let xor = a.hash[i] ^ b.hash[i];
-            if xor == 0 {
-                // All 8 bits match
-                common_bits += 8;
-            } else {
-                // Count leading zeros in this byte
-                common_bits += xor.leading_zeros() as u16;
+        for i in 0..min_length {
+            let bit_a = (a.hash[(i / 8) as usize] >> (7 - (i % 8))) & 1 != 0;
+            let bit_b = (b.hash[(i / 8) as usize] >> (7 - (i % 8))) & 1 != 0;
+            if bit_a != bit_b {
                 break;
             }
+            common_bits += 1;
         }
-
-        // Cap at the minimum length of the two prefixes
-        common_bits = common_bits.min(min_length);
-
-        // Copy the hash from either prefix (they're the same up to common_bits)
-        let prefix_bytes = a.hash;
-
         Prefix {
-            hash: prefix_bytes,
+            hash: a.hash,
             length: common_bits,
         }
     }
