@@ -156,43 +156,17 @@ fn short_hex(hash: &Hash) -> String {
 }
 
 fn short_hex_prefix(prefix: &Prefix) -> String {
-    use std::fmt::Write;
-    let mut s = String::new();
-
-    // Calculate how many bits to show
-    let bits_to_show = prefix.length.min(32); // Show at most 32 bits (8 hex chars)
-    let full_nibbles = (bits_to_show / 4) as usize;
-    let remaining_bits = (bits_to_show % 4) as usize;
-
-    // Write full nibbles (hex digits)
-    for i in 0..full_nibbles {
-        let byte_idx = i / 2;
-        let nibble = if i % 2 == 0 {
-            (prefix.hash[byte_idx] >> 4) & 0x0F
-        } else {
-            prefix.hash[byte_idx] & 0x0F
-        };
-        write!(&mut s, "{:x}", nibble).unwrap();
+    if prefix.length == 256 {
+        return short_hex(&prefix.hash);
+    } else if prefix.length == 0 {
+        return "empty".into();
     }
-
-    // Handle remaining bits if any
-    if remaining_bits > 0 {
-        let byte_idx = full_nibbles / 2;
-        let nibble = if full_nibbles % 2 == 0 {
-            (prefix.hash[byte_idx] >> 4) & 0x0F
-        } else {
-            prefix.hash[byte_idx] & 0x0F
-        };
-        // Mask off the bits we don't want
-        let mask = 0x0F << (4 - remaining_bits);
-        let masked_nibble = (nibble & mask) >> (4 - remaining_bits);
-        write!(&mut s, "{:x}", masked_nibble).unwrap();
+    let mut prefix_bits = Vec::new();
+    for i in 0..prefix.length {
+        let bit = (prefix.hash[(i / 8) as usize] >> (7 - (i % 8))) & 1;
+        prefix_bits.push(bit);
     }
-
-    // Add length indicator
-    write!(&mut s, "[{}]", prefix.length).unwrap();
-
-    s
+    prefix_bits.iter().map(|b| if *b > 0 { '1' } else { '0' }).collect()
 }
 
 impl SimpleMPT {
@@ -250,7 +224,7 @@ impl SimpleMPT {
                 }
                 Node::Interior(interior) => {
                     debug!("At interior node prefix {} left: {} right: {}", short_hex_prefix(&interior.prefix), short_hex_prefix(&interior.left), short_hex_prefix(&interior.right));
-                    if interior.left.prefix_of(&Prefix::from_hash(key)) {
+                    if key < interior.prefix.hash {
                         debug!("At interior node, descending left");
                         let new_left = self.recursive_upsert(interior.left, key, value);
                         updates.push((
@@ -264,7 +238,7 @@ impl SimpleMPT {
                             )),
                         ));
                         finished_prefix = interior.prefix;
-                    } else if interior.right.prefix_of(&Prefix::from_hash(key)) {
+                    } else if key >= interior.prefix.hash {
                         debug!("At interior node, descending right");
                         let new_right = self.recursive_upsert(interior.right, key, value);
                         updates.push((

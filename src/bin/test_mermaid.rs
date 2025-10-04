@@ -102,11 +102,11 @@ fn main() {
         ("banana", "yellow"),
         ("grape", "purple"),
         ("lemon", "yellow"),
-        // ("lime", "green"),
-        // ("orange", "orange"),
-        // ("blueberry", "blue"),
-        // ("strawberry", "red"),
-        // ("lemon", "pink")
+        ("lime", "green"),
+        ("orange", "orange"),
+        ("blueberry", "blue"),
+        ("strawberry", "red"),
+        ("lemon", "pink")
     ];
     for (i, (k, v)) in items.iter().enumerate() {
         let key = hash_key(k);
