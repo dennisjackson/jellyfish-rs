@@ -1,5 +1,21 @@
 pub type Hash = [u8; 32];
 
+pub trait HashExt {
+    fn short_hex(&self) -> String;
+}
+
+impl HashExt for Hash {
+    fn short_hex(&self) -> String {
+        use std::fmt::Write;
+        let mut s = String::with_capacity(8);
+        for b in self.iter().take(4) {
+            // 4 bytes = 8 hex chars
+            write!(&mut s, "{b:02x}").unwrap();
+        }
+        s
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Prefix {
     pub hash: Hash,
@@ -16,6 +32,20 @@ impl Prefix {
             hash: [0; 32],
             length: 0,
         }
+    }
+
+    pub fn short_hex(&self) -> String {
+        if self.length == 256 {
+            return self.hash.short_hex();
+        } else if self.length == 0 {
+            return "empty".into();
+        }
+        let mut prefix_bits = Vec::new();
+        for i in 0..self.length {
+            let bit = (self.hash[(i / 8) as usize] >> (7 - (i % 8))) & 1;
+            prefix_bits.push(bit);
+        }
+        prefix_bits.iter().map(|b| if *b > 0 { '1' } else { '0' }).collect()
     }
 
     pub fn prefix_of(&self, other: &Prefix) -> bool {

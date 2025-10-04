@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 mod prefix;
 pub use prefix::{Hash, Prefix};
+use prefix::HashExt;
 
 #[derive(Clone)]
 pub struct LeafNode {
@@ -85,34 +86,6 @@ pub struct SimpleMPT {
     pub root: Prefix,
 }
 
-fn short_hex_hash(hash: &Hash) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(8);
-    for b in hash.iter().take(4) {
-        // 4 bytes = 8 hex chars
-        write!(&mut s, "{b:02x}").unwrap();
-    }
-    s
-}
-
-fn short_hex(hash: &Hash) -> String {
-    short_hex_hash(hash)
-}
-
-fn short_hex_prefix(prefix: &Prefix) -> String {
-    if prefix.length == 256 {
-        return short_hex(&prefix.hash);
-    } else if prefix.length == 0 {
-        return "empty".into();
-    }
-    let mut prefix_bits = Vec::new();
-    for i in 0..prefix.length {
-        let bit = (prefix.hash[(i / 8) as usize] >> (7 - (i % 8))) & 1;
-        prefix_bits.push(bit);
-    }
-    prefix_bits.iter().map(|b| if *b > 0 { '1' } else { '0' }).collect()
-}
-
 impl Default for SimpleMPT {
     fn default() -> Self {
         Self::new()
@@ -130,8 +103,8 @@ impl SimpleMPT {
     pub fn upsert(&mut self, key: Hash, value: Hash) {
         info!(
             "Upserting key: {}, value: {}",
-            short_hex(&key),
-            short_hex(&value)
+            key.short_hex(),
+            value.short_hex()
         );
         let new_root = self.recursive_upsert(self.root, key, value);
         self.root = new_root;
@@ -141,11 +114,11 @@ impl SimpleMPT {
         let mut updates = Vec::new();
         let finished_prefix: Prefix;
         let current_node = self.store.get(&current_prefix).cloned(); // Clone the node, ending the borrow
-        debug!("Current node prefix {:?}", short_hex_prefix(&current_prefix));
+        debug!("Current node prefix {:?}", current_prefix.short_hex());
         if let Some(node) = current_node {
             match node {
                 Node::Leaf(leaf) => {
-                    debug!("At leaf node with key {}", short_hex(&leaf.key));
+                    debug!("At leaf node with key {}", leaf.key.short_hex());
                     if leaf.key == key {
                         debug!("At leaf node with matching key, updating in place");
                         let updated_leaf = LeafNode::new(key, value);
@@ -173,7 +146,7 @@ impl SimpleMPT {
                     }
                 }
                 Node::Interior(interior) => {
-                    debug!("At interior node prefix {} left: {} right: {}", short_hex_prefix(&interior.prefix), short_hex_prefix(&interior.left), short_hex_prefix(&interior.right));
+                    debug!("At interior node prefix {} left: {} right: {}", interior.prefix.short_hex(), interior.left.short_hex(), interior.right.short_hex());
                     if key < interior.prefix.hash {
                         debug!("At interior node, descending left");
                         let new_left = self.recursive_upsert(interior.left, key, value);
@@ -244,18 +217,18 @@ impl SimpleMPT {
                 Node::Leaf(ref leaf) => {
                     debug!(
                         "  Node: Prefix: {} Leaf key:{} value:{}",
-                        short_hex_prefix(&prefix),
-                        short_hex(&leaf.key),
-                        short_hex(&leaf.value),
+                        prefix.short_hex(),
+                        leaf.key.short_hex(),
+                        leaf.value.short_hex(),
                         // short_hex(&leaf.merkle_hash)
                     );
                 }
                 Node::Interior(ref interior) => {
                     debug!(
                         "  Node: Interior prefix:{} left:{} right:{}",
-                        short_hex_prefix(&interior.prefix),
-                        short_hex_prefix(&interior.left),
-                        short_hex_prefix(&interior.right),
+                        interior.prefix.short_hex(),
+                        interior.left.short_hex(),
+                        interior.right.short_hex(),
                         // short_hex(&interior.merkle_hash)
                     );
                 }
