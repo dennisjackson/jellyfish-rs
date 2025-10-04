@@ -2,6 +2,7 @@ use jellyfish_rs::{Hash, Node, Prefix, SimpleMPT};
 use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::io::Write;
+use jellyfish_rs::prefix::HashExt;
 
 fn hash_key(key: &str) -> Hash {
     let mut hasher = Sha256::new();
@@ -17,14 +18,14 @@ fn hash_value(value: &str) -> Hash {
 
 fn append_mermaid_to_file(mpt: &SimpleMPT, path: &str, step: usize, key: &str, value: &str) {
     let mut buffer = Vec::new();
-    buffer.extend_from_slice(format!("\n## Step {step}: Insert ('{key}', '{value}')\n\n").as_bytes());
+    buffer
+        .extend_from_slice(format!("\n## Step {step}: Insert ('{key}', '{value}')\n\n").as_bytes());
     buffer.extend_from_slice(b"```mermaid\n");
     buffer.extend_from_slice(b"graph TD\n");
     buffer.extend_from_slice(collect_mermaid_node(mpt).as_bytes());
     buffer.extend_from_slice(b"```\n");
     let mut file = OpenOptions::new()
         .create(true)
-        
         .append(true)
         .open(path)
         .unwrap();
@@ -41,8 +42,8 @@ fn collect_mermaid_node(mpt: &SimpleMPT) -> String {
             return name.clone();
         }
         let name = match node {
-            Node::Leaf(leaf) => format!("leaf_{}", hex::encode(&leaf.key[..4])),
-            Node::Interior(interior) => format!("int_{}", hex::encode(&interior.prefix.hash[..4])),
+            Node::Leaf(leaf) => format!("leaf_{}", &leaf.key.short_hex()),
+            Node::Interior(interior) => format!("int_{}_{}",&interior.prefix.length, &interior.prefix.short_hex()),
         };
         name_cache.insert(*prefix, name.clone());
         name
@@ -52,16 +53,16 @@ fn collect_mermaid_node(mpt: &SimpleMPT) -> String {
         match node {
             Node::Leaf(leaf) => {
                 lines.push_str(&format!(
-                    "  {}[\"Leaf\\nkey:{}\"]\n",
+                    "  {}[\"L:{}\"]\n",
                     this_name,
-                    hex::encode(&leaf.key[..4])
+                    &leaf.key.short_hex()
                 ));
             }
             Node::Interior(interior) => {
                 lines.push_str(&format!(
-                    "  {}[\"Interior\\nprefix:{}\"]\n",
+                    "  {}[\"I:{}\"]\n",
                     this_name,
-                    hex::encode(&interior.prefix.hash[..4])
+                    &interior.prefix.short_hex()
                 ));
                 // Edges to children
                 if let Some(left_node) = mpt.store.get(&interior.left) {
@@ -105,7 +106,7 @@ fn main() {
         ("orange", "aubergine"),
         ("blueberry", "blue"),
         ("strawberry", "red"),
-        ("lemon", "pink")
+        ("lemon", "pink"),
     ];
     for (i, (k, v)) in items.iter().enumerate() {
         let key = hash_key(k);
