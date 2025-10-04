@@ -103,7 +103,7 @@ fn main() {
         ("grape", "purple"),
         ("lemon", "yellow"),
         ("lime", "green"),
-        ("orange", "orange"),
+        ("orange", "aubergine"),
         ("blueberry", "blue"),
         ("strawberry", "red"),
         ("lemon", "pink")

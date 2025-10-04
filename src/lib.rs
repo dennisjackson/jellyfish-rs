@@ -54,6 +54,11 @@ impl Prefix {
             }
             common_bits += 1;
         }
+        let mut common_hash = a.hash.clone();
+        // Zero out bits beyond common_bits
+        for i in common_bits..256 {
+            common_hash[(i / 8) as usize] &= !(1 << (7 - (i % 8)));
+        }
         Prefix {
             hash: a.hash,
             length: common_bits,
