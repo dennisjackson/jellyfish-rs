@@ -189,115 +189,12 @@ fn benchmark_durable_incremental_on_large_tree(c: &mut Criterion) {
     });
     group.finish();
 }
-
-fn benchmark_sqlite_queries_fresh_1000(_c: &mut Criterion) {
-    let data = generate_test_data(1000);
-
-    // Run once to get query count
-    let mut tree = DurableBatchMPT::new();
-    tree.reset_sqlite_query_count();
-    tree.batch_upsert(&data);
-    let total_queries = tree.sqlite_query_count();
-    let queries_per_node = total_queries as f64 / 1000.0;
-
-    println!("\nFresh 1000 nodes:");
-    println!("  Total SQLite queries: {}", total_queries);
-    println!("  Queries per node: {:.4}", queries_per_node);
-}
-
-fn benchmark_sqlite_queries_fresh_10000(_c: &mut Criterion) {
-    let data = generate_test_data(10_000);
-
-    // Run once to get query count
-    let mut tree = DurableBatchMPT::new();
-    tree.reset_sqlite_query_count();
-    tree.batch_upsert(&data);
-    let total_queries = tree.sqlite_query_count();
-    let queries_per_node = total_queries as f64 / 10_000.0;
-
-    println!("\nFresh 10,000 nodes:");
-    println!("  Total SQLite queries: {}", total_queries);
-    println!("  Queries per node: {:.4}", queries_per_node);
-}
-
-fn benchmark_sqlite_queries_small_incremental(_c: &mut Criterion) {
-    // Generate initial 10,000 nodes
-    let base_data = generate_test_data(10_000);
-    // Generate additional 100 nodes to insert
-    let incremental_data: Vec<(Hash, Hash)> = (10_000usize..10_100usize)
-        .map(|i| {
-            let mut key_hasher = Sha256::new();
-            key_hasher.update(b"key");
-            key_hasher.update(i.to_le_bytes());
-            let key: Hash = key_hasher.finalize().into();
-
-            let mut value_hasher = Sha256::new();
-            value_hasher.update(b"value");
-            value_hasher.update(i.to_le_bytes());
-            let value: Hash = value_hasher.finalize().into();
-
-            (key, value)
-        })
-        .collect();
-
-    // Run once to get query count
-    let mut tree = DurableBatchMPT::new();
-    tree.batch_upsert(&base_data);
-    tree.clear_cache();
-    tree.reset_sqlite_query_count();
-    tree.batch_upsert(&incremental_data);
-    let total_queries = tree.sqlite_query_count();
-    let queries_per_node = total_queries as f64 / 100.0;
-
-    println!("\nIncremental 100 nodes on 10,000 base:");
-    println!("  Total SQLite queries: {}", total_queries);
-    println!("  Queries per node: {:.4}", queries_per_node);
-}
-
-fn benchmark_sqlite_queries_incremental(_c: &mut Criterion) {
-    // Generate initial 100,000 nodes
-    let base_data = generate_test_data(100_000);
-    // Generate additional 10,000 nodes to insert
-    let incremental_data: Vec<(Hash, Hash)> = (100_000usize..110_000usize)
-        .map(|i| {
-            let mut key_hasher = Sha256::new();
-            key_hasher.update(b"key");
-            key_hasher.update(i.to_le_bytes());
-            let key: Hash = key_hasher.finalize().into();
-
-            let mut value_hasher = Sha256::new();
-            value_hasher.update(b"value");
-            value_hasher.update(i.to_le_bytes());
-            let value: Hash = value_hasher.finalize().into();
-
-            (key, value)
-        })
-        .collect();
-
-    // Run once to get query count
-    let mut tree = DurableBatchMPT::new();
-    tree.batch_upsert(&base_data);
-    tree.clear_cache();
-    tree.reset_sqlite_query_count();
-    tree.batch_upsert(&incremental_data);
-    let total_queries = tree.sqlite_query_count();
-    let queries_per_node = total_queries as f64 / 10_000.0;
-
-    println!("\nIncremental 10,000 nodes on 100,000 base:");
-    println!("  Total SQLite queries: {}", total_queries);
-    println!("  Queries per node: {:.4}", queries_per_node);
-}
-
 criterion_group!(
     benches,
     benchmark_fresh_1000,
     benchmark_fresh_10_000,
     benchmark_incremental_on_large_tree,
     benchmark_durable_incremental_on_large_tree,
-    benchmark_sqlite_queries_fresh_1000,
-    benchmark_sqlite_queries_fresh_10000,
-    benchmark_sqlite_queries_incremental,
-    benchmark_sqlite_queries_small_incremental
 );
 
 criterion_main!(benches);
