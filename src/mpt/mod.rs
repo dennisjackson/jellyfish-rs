@@ -8,6 +8,9 @@ pub use simple::SimpleMPT;
 mod batch;
 pub use batch::BatchMPT;
 
+mod durable_batch;
+pub use durable_batch::DurableBatchMPT;
+
 #[derive(Clone)]
 pub struct LeafNode {
     pub key: Hash,

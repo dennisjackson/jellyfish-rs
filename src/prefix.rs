@@ -43,6 +43,38 @@ pub struct Prefix {
     pub length: u16,
 }
 
+// Implement bincode Encode and Decode for Prefix
+impl bincode::Encode for Prefix {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> Result<(), bincode::error::EncodeError> {
+        bincode::Encode::encode(&self.hash, encoder)?;
+        bincode::Encode::encode(&self.length, encoder)?;
+        Ok(())
+    }
+}
+
+impl<Context> bincode::Decode<Context> for Prefix {
+    fn decode<D: bincode::de::Decoder>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let hash = bincode::Decode::decode(decoder)?;
+        let length = bincode::Decode::decode(decoder)?;
+        Ok(Prefix { hash, length })
+    }
+}
+
+impl<'de, Context> bincode::BorrowDecode<'de, Context> for Prefix {
+    fn borrow_decode<D: bincode::de::BorrowDecoder<'de>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let hash = bincode::BorrowDecode::borrow_decode(decoder)?;
+        let length = bincode::BorrowDecode::borrow_decode(decoder)?;
+        Ok(Prefix { hash, length })
+    }
+}
+
 impl From<Hash> for Prefix {
     fn from(hash: Hash) -> Self {
         Prefix { hash, length: 256 }

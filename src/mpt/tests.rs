@@ -14,6 +14,7 @@ macro_rules! test_all_impls {
             // Add new implementations here as they're created
             test_impl::<SimpleMPT>();
             test_impl::<BatchMPT>();
+            test_impl::<DurableBatchMPT>();
         }
     };
 }

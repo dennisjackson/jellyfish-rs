@@ -1,6 +1,6 @@
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use jellyfish_rs::Hash;
-use jellyfish_rs::mpt::{BatchMPT, MerklePatriciaTree, SimpleMPT};
+use jellyfish_rs::mpt::{BatchMPT, DurableBatchMPT, MerklePatriciaTree, SimpleMPT};
 use sha2::{Digest, Sha256};
 
 /// Generate deterministic test data
@@ -45,6 +45,14 @@ fn benchmark_simple_vs_batch_1000(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("durable_batch_implementation", |b| {
+        b.iter(|| {
+            let mut tree = DurableBatchMPT::new();
+            tree.batch_upsert(black_box(&data));
+            tree
+        });
+    });
+
     group.finish();
 }
 
@@ -66,6 +74,14 @@ fn benchmark_simple_vs_batch_10000(c: &mut Criterion) {
     group.bench_function("batch_implementation", |b| {
         b.iter(|| {
             let mut tree = BatchMPT::new();
+            tree.batch_upsert(black_box(&data));
+            tree
+        });
+    });
+
+    group.bench_function("durable_batch_implementation", |b| {
+        b.iter(|| {
+            let mut tree = DurableBatchMPT::new();
             tree.batch_upsert(black_box(&data));
             tree
         });
