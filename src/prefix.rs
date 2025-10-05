@@ -355,7 +355,7 @@ mod tests {
         }
 
         // Check remaining bits if any
-        if common_len % 8 != 0 {
+        if !common_len.is_multiple_of(8) {
             let rem_bits = common_len % 8;
             let mask = 0xFF << (8 - rem_bits);
             assert_eq!(
