@@ -1,4 +1,4 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use jellyfish_rs::Hash;
 use jellyfish_rs::mpt::{BatchMPT, MerklePatriciaTree, SimpleMPT};
 use sha2::{Digest, Sha256};
@@ -26,6 +26,9 @@ fn benchmark_simple_vs_batch_1000(c: &mut Criterion) {
     let mut group = c.benchmark_group("simple_vs_batch_1000_nodes");
     let data = generate_test_data(1000);
 
+    // Configure throughput to report insertions per second
+    group.throughput(Throughput::Elements(1000));
+
     group.bench_function("simple_implementation", |b| {
         b.iter(|| {
             let mut tree = SimpleMPT::new();
@@ -48,6 +51,9 @@ fn benchmark_simple_vs_batch_1000(c: &mut Criterion) {
 fn benchmark_simple_vs_batch_10000(c: &mut Criterion) {
     let mut group = c.benchmark_group("simple_vs_batch_10000_nodes");
     let data = generate_test_data(10_000);
+
+    // Configure throughput to report insertions per second
+    group.throughput(Throughput::Elements(10_000));
 
     group.bench_function("simple_implementation", |b| {
         b.iter(|| {
