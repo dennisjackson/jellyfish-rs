@@ -22,7 +22,7 @@ fn test_single_insert() {
     mpt.upsert(key, value);
 
     assert_eq!(mpt.store.len(), 1);
-    let node = mpt.store.get(&Prefix::from_hash(key)).unwrap();
+    let node = mpt.store.get(&Prefix::from(key)).unwrap();
     match node {
         Node::Leaf(leaf) => {
             assert_eq!(leaf.key, key);
@@ -50,7 +50,7 @@ fn test_update_existing_key() {
 
     // Should still have only one leaf node
     assert_eq!(mpt.store.len(), 1);
-    let node = mpt.store.get(&Prefix::from_hash(key)).unwrap();
+    let node = mpt.store.get(&Prefix::from(key)).unwrap();
     match node {
         Node::Leaf(leaf) => {
             assert_eq!(leaf.key, key);
@@ -189,9 +189,9 @@ fn test_leaf_node_hash_calculation() {
 
 #[test]
 fn test_interior_node_hash_calculation() {
-    let prefix = Prefix::from_hash(create_hash(0));
-    let left = Prefix::from_hash(create_hash(1));
-    let right = Prefix::from_hash(create_hash(2));
+    let prefix = Prefix::from(create_hash(0));
+    let left = Prefix::from(create_hash(1));
+    let right = Prefix::from(create_hash(2));
     let left_hash = create_hash(101);
     let right_hash = create_hash(102);
 
@@ -219,7 +219,7 @@ fn test_multiple_updates_same_key() {
     // Should still have only one node
     assert_eq!(mpt.store.len(), 1);
 
-    let node = mpt.store.get(&Prefix::from_hash(key)).unwrap();
+    let node = mpt.store.get(&Prefix::from(key)).unwrap();
     match node {
         Node::Leaf(leaf) => {
             assert_eq!(leaf.key, key);

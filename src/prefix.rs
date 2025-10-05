@@ -22,11 +22,13 @@ pub struct Prefix {
     pub length: u16,
 }
 
-impl Prefix {
-    pub fn from_hash(hash: Hash) -> Self {
+impl From<Hash> for Prefix {
+    fn from(hash: Hash) -> Self {
         Prefix { hash, length: 256 }
     }
+}
 
+impl Prefix {
     pub fn root() -> Self {
         Prefix {
             hash: [0; 32],
@@ -59,6 +61,17 @@ impl Prefix {
             let bit_self = (self.hash[(i / 8) as usize] >> (7 - (i % 8))) & 1;
             let bit_other = (other.hash[(i / 8) as usize] >> (7 - (i % 8))) & 1;
             if bit_self != bit_other {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub fn contains(&self, key: &Hash) -> bool {
+        for i in 0..self.length {
+            let bit_prefix = (self.hash[(i / 8) as usize] >> (7 - (i % 8))) & 1;
+            let bit_key = (key[(i / 8) as usize] >> (7 - (i % 8))) & 1;
+            if bit_prefix != bit_key {
                 return false;
             }
         }
@@ -121,8 +134,8 @@ mod tests {
             0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x01, 0x02, 0x03, 0x04,
             0x05, 0x06, 0x07, 0x08,
         ];
-        let prefix_a = Prefix::from_hash(hash);
-        let prefix_b = Prefix::from_hash(hash);
+        let prefix_a = Prefix::from(hash);
+        let prefix_b = Prefix::from(hash);
 
         let result = Prefix::common_prefix(&prefix_a, &prefix_b);
 
@@ -144,8 +157,8 @@ mod tests {
             0x00, 0x00, 0x00, 0x00,
         ];
 
-        let prefix_a = Prefix::from_hash(hash_a);
-        let prefix_b = Prefix::from_hash(hash_b);
+        let prefix_a = Prefix::from(hash_a);
+        let prefix_b = Prefix::from(hash_b);
 
         let result = Prefix::common_prefix(&prefix_a, &prefix_b);
 
@@ -166,8 +179,8 @@ mod tests {
             0xFF, 0xFF, 0xFF, 0xFF,
         ];
 
-        let prefix_a = Prefix::from_hash(hash_a);
-        let prefix_b = Prefix::from_hash(hash_b);
+        let prefix_a = Prefix::from(hash_a);
+        let prefix_b = Prefix::from(hash_b);
 
         let result = Prefix::common_prefix(&prefix_a, &prefix_b);
 
@@ -190,8 +203,8 @@ mod tests {
             0x00, 0x00, 0x00, 0x00,
         ];
 
-        let prefix_a = Prefix::from_hash(hash_a);
-        let prefix_b = Prefix::from_hash(hash_b);
+        let prefix_a = Prefix::from(hash_a);
+        let prefix_b = Prefix::from(hash_b);
 
         let result = Prefix::common_prefix(&prefix_a, &prefix_b);
 
@@ -215,8 +228,8 @@ mod tests {
             0x00, 0x00, 0x00, 0x00,
         ];
 
-        let prefix_a = Prefix::from_hash(hash_a);
-        let prefix_b = Prefix::from_hash(hash_b);
+        let prefix_a = Prefix::from(hash_a);
+        let prefix_b = Prefix::from(hash_b);
 
         let result = Prefix::common_prefix(&prefix_a, &prefix_b);
 
@@ -267,8 +280,8 @@ mod tests {
             0x00, 0x00, 0x00, 0x00,
         ];
 
-        let prefix_a = Prefix::from_hash(hash_a);
-        let prefix_b = Prefix::from_hash(hash_b);
+        let prefix_a = Prefix::from(hash_a);
+        let prefix_b = Prefix::from(hash_b);
 
         let result = Prefix::common_prefix(&prefix_a, &prefix_b);
 
@@ -286,7 +299,7 @@ mod tests {
             0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01,
             0x23, 0x45, 0x67, 0x89,
         ];
-        let prefix = Prefix::from_hash(hash);
+        let prefix = Prefix::from(hash);
 
         let result = Prefix::common_prefix(&root, &prefix);
 
@@ -308,8 +321,8 @@ mod tests {
             0x00, 0x00, 0x00, 0x00,
         ];
 
-        let prefix_a = Prefix::from_hash(hash_a);
-        let prefix_b = Prefix::from_hash(hash_b);
+        let prefix_a = Prefix::from(hash_a);
+        let prefix_b = Prefix::from(hash_b);
 
         let result_ab = Prefix::common_prefix(&prefix_a, &prefix_b);
         let result_ba = Prefix::common_prefix(&prefix_b, &prefix_a);

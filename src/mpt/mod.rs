@@ -128,7 +128,7 @@ impl SimpleMPT {
     fn recursive_upsert(&mut self, current_prefix: Prefix, key: Hash, value: Hash) -> Prefix {
         debug!("Current node prefix {:?}", current_prefix.short_hex());
 
-        let key_prefix = Prefix::from_hash(key);
+        let key_prefix = Prefix::from(key);
         let Some(node) = self.store.get(&current_prefix).cloned() else {
             // Empty tree: insert new leaf node
             debug!("Tree is empty, inserting a new leaf");
@@ -138,16 +138,15 @@ impl SimpleMPT {
         };
 
         match node {
-            Node::Leaf(leaf) => self.base_leaf_upsert(current_prefix, leaf, key, value),
+            Node::Leaf(leaf) => self.base_leaf_upsert(leaf, key, value),
             Node::Interior(interior) => {
-                self.recursive_interior_upsert(interior, key_prefix, key, value)
+                self.recursive_interior_upsert(interior, key, value)
             }
         }
     }
 
     fn base_leaf_upsert(
         &mut self,
-        current_prefix: Prefix,
         leaf: LeafNode,
         key: Hash,
         value: Hash,
@@ -158,15 +157,16 @@ impl SimpleMPT {
             // Update existing leaf in place
             debug!("At leaf node with matching key, updating in place");
             let updated_leaf = LeafNode::new(key, value);
-            self.insert_node(current_prefix, Node::Leaf(updated_leaf));
-            return current_prefix;
+            let lp = Prefix::from(leaf.key);
+            self.insert_node(lp, Node::Leaf(updated_leaf));
+            return lp;
         }
 
         // Split: create new interior node with both leaves as children
         debug!("At leaf node with different key, splitting");
         let new_leaf = LeafNode::new(key, value);
-        let existing_prefix = Prefix::from_hash(leaf.key);
-        let new_prefix = Prefix::from_hash(key);
+        let existing_prefix = Prefix::from(leaf.key);
+        let new_prefix = Prefix::from(key);
         let merged_prefix = Prefix::common_prefix(&existing_prefix, &new_prefix);
 
         let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
@@ -196,7 +196,6 @@ impl SimpleMPT {
     fn recursive_interior_upsert(
         &mut self,
         interior: InteriorNode,
-        key_prefix: Prefix,
         key: Hash,
         value: Hash,
     ) -> Prefix {
@@ -207,11 +206,11 @@ impl SimpleMPT {
             interior.right.short_hex()
         );
 
-        if !interior.prefix.prefix_of(&key_prefix) {
+        if !interior.prefix.contains(&key) {
             // Key diverges before interior's prefix ends: create new parent
             debug!("Key diverges from interior prefix, creating new parent");
             let new_leaf = LeafNode::new(key, value);
-            let new_leaf_prefix = Prefix::from_hash(key);
+            let new_leaf_prefix = Prefix::from(key);
             let common = Prefix::common_prefix(&interior.prefix, &new_leaf_prefix);
 
             let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
