@@ -1,27 +1,23 @@
-use dashmap::DashMap;
 use log::info;
 use rayon::prelude::*;
-use rusqlite::{Connection, Result as SqliteResult, params};
+use rusqlite::{Connection, Result as SqliteResult};
 use std::sync::{Arc, Mutex};
 
 use crate::mpt::MerklePatriciaTree;
 use crate::{Hash, Prefix};
 
-use super::{InteriorNode, LeafNode, Node};
+use super::{Cache, InteriorNode, LeafNode, Node};
 
 /// A durable batch-optimized Merkle Patricia Tree implementation backed by SQLite.
 /// This implementation performs batch upserts by:
-/// 1. Loading necessary nodes from SQLite into a DashMap cache
+/// 1. Loading necessary nodes from SQLite into a Cache
 /// 2. Performing the batch upsert in memory
 /// 3. Writing changed nodes back to SQLite
 ///
 /// The tree structure is persisted to disk, allowing for larger-than-memory trees.
 pub struct DurableBatchMPT {
-    db: Arc<Mutex<Connection>>,
-    cache: Arc<DashMap<Prefix, Node>>,
-    dirty: Arc<DashMap<Prefix, ()>>,
+    cache: Cache,
     root: Prefix,
-    tree_size: Arc<Mutex<usize>>,
 }
 
 impl DurableBatchMPT {
@@ -56,21 +52,12 @@ impl DurableBatchMPT {
             [],
         )?;
 
-        // Load tree size from metadata
-        let tree_size = conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key = 'tree_size'",
-                [],
-                |row| row.get::<_, i64>(0).map(|v| v as usize),
-            )
-            .unwrap_or(0);
+        let db = Arc::new(Mutex::new(conn));
+        let cache = Cache::new(Arc::clone(&db));
 
         Ok(Self {
-            db: Arc::new(Mutex::new(conn)),
-            cache: Arc::new(DashMap::new()),
-            dirty: Arc::new(DashMap::new()),
+            cache,
             root: Prefix::root(),
-            tree_size: Arc::new(Mutex::new(tree_size)),
         })
     }
 
@@ -81,41 +68,22 @@ impl DurableBatchMPT {
 
     /// Load a node from SQLite into the cache if not already present.
     fn load_node(&self, prefix: &Prefix) -> Option<Node> {
-        // Check cache first
+        // Check cache first, or load from database via pre_advise
         if let Some(node) = self.cache.get(prefix) {
-            return Some(node.clone());
+            return Some(node);
         }
 
-        // Load from database
-        let db = self.db.lock().unwrap();
-        let mut stmt = db
-            .prepare("SELECT node_type, node_data FROM nodes WHERE prefix_hash = ?1 AND prefix_length = ?2")
-            .ok()?;
-
-        let result = stmt
-            .query_row(params![&prefix.hash[..], prefix.length], |row| {
-                let node_type: String = row.get(0)?;
-                let node_data: Vec<u8> = row.get(1)?;
-
-                let node = Node::deserialize(&node_type, &node_data)
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
-
-                Ok(node)
-            })
-            .ok()?;
-
-        // Cache the loaded node
-        self.cache.insert(*prefix, result.clone());
-        Some(result)
+        // Use pre_advise to load from database
+        self.cache.pre_advise(&[*prefix]).ok()?;
+        self.cache.get(prefix)
     }
 
     /// Load a node and its immediate children into the cache.
     fn load_node_with_children(&self, prefix: &Prefix) {
         if let Some(node) = self.load_node(prefix) {
             if let Node::Interior(interior) = node {
-                // Preload children
-                self.load_node(&interior.left);
-                self.load_node(&interior.right);
+                // Preload children using pre_advise
+                let _ = self.cache.pre_advise(&[interior.left, interior.right]);
             }
         }
     }
@@ -128,7 +96,7 @@ impl DurableBatchMPT {
             self.load_node_with_children(&current);
 
             let node = match self.cache.get(&current) {
-                Some(n) => n.clone(),
+                Some(n) => n,
                 None => break,
             };
 
@@ -151,52 +119,19 @@ impl DurableBatchMPT {
 
     /// Write all dirty nodes back to SQLite.
     fn flush_to_disk(&self) -> SqliteResult<()> {
-        let db = self.db.lock().unwrap();
+        // Use Cache::flush to write all dirty nodes
+        self.cache.flush()?;
 
-        let tx = db.unchecked_transaction()?;
-
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO nodes (prefix_hash, prefix_length, node_type, node_data) VALUES (?1, ?2, ?3, ?4)"
-            )?;
-
-            for entry in self.dirty.iter() {
-                let prefix = entry.key();
-
-                if let Some(node) = self.cache.get(prefix) {
-                    let (node_type, node_data) = node.value().serialize()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?;
-
-                    stmt.execute(params![
-                        &prefix.hash[..],
-                        prefix.length,
-                        node_type,
-                        node_data
-                    ])?;
-                }
-            }
-        }
-
-        // Update tree size in metadata
-        {
-            let tree_size = *self.tree_size.lock().unwrap();
-            tx.execute(
-                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('tree_size', ?1)",
-                params![tree_size as i64],
-            )?;
-        }
-
-        tx.commit()?;
-
-        // Clear dirty set after successful flush
-        self.dirty.clear();
+        // Note: tree_size metadata could be updated here if needed
+        // For now, we track it separately in memory
 
         Ok(())
     }
 
     /// Mark a node as dirty (needs to be written to disk).
-    fn mark_dirty(&self, prefix: Prefix) {
-        self.dirty.insert(prefix, ());
+    /// This is now handled automatically by Cache::set(), but kept for API compatibility.
+    fn mark_dirty(&self, _prefix: Prefix) {
+        // No-op: Cache now handles dirty tracking automatically in set()
     }
 
     /// Helper to order two children based on whether the key goes right at the split point
@@ -243,15 +178,6 @@ impl DurableBatchMPT {
         let new_root = self.recursive_batch_upsert(self.root, entries_vec);
         self.root = new_root;
 
-        // Update tree size based on new nodes added to cache
-        let new_cache_size = self.cache.len();
-        *self.tree_size.lock().unwrap() = new_cache_size;
-
-        info!(
-            "Tree size updated: {} -> {} nodes",
-            old_cache_size, new_cache_size
-        );
-
         // Flush all changes to disk
         if let Err(e) = self.flush_to_disk() {
             log::error!("Failed to flush to disk: {}", e);
@@ -288,7 +214,7 @@ impl DurableBatchMPT {
 
         let first_prefix = Prefix::from(first_key);
         let first_leaf = LeafNode::new(first_key, first_value);
-        self.cache.insert(first_prefix, Node::Leaf(first_leaf));
+        self.cache.set(first_prefix, Node::Leaf(first_leaf));
         self.mark_dirty(first_prefix);
 
         // Recursively insert remaining entries
@@ -303,7 +229,7 @@ impl DurableBatchMPT {
         if let Ok(idx) = entries.binary_search_by_key(&leaf.key, |(k, _)| *k) {
             let (_, new_value) = entries.remove(idx);
             let updated_leaf = LeafNode::new(leaf.key, new_value);
-            self.cache.insert(leaf_prefix, Node::Leaf(updated_leaf));
+            self.cache.set(leaf_prefix, Node::Leaf(updated_leaf));
             self.mark_dirty(leaf_prefix);
 
             if entries.is_empty() {
@@ -344,9 +270,9 @@ impl DurableBatchMPT {
         );
 
         self.cache
-            .insert(merged_prefix, Node::Interior(new_interior));
-        self.cache.insert(existing_prefix, Node::Leaf(leaf));
-        self.cache.insert(new_prefix, Node::Leaf(new_leaf));
+            .set(merged_prefix, Node::Interior(new_interior));
+        self.cache.set(existing_prefix, Node::Leaf(leaf));
+        self.cache.set(new_prefix, Node::Leaf(new_leaf));
 
         self.mark_dirty(merged_prefix);
         self.mark_dirty(existing_prefix);
@@ -395,8 +321,8 @@ impl DurableBatchMPT {
             let new_interior =
                 InteriorNode::new(common, left_prefix, right_prefix, left_hash, right_hash);
 
-            self.cache.insert(common, Node::Interior(new_interior));
-            self.cache.insert(new_leaf_prefix, Node::Leaf(new_leaf));
+            self.cache.set(common, Node::Interior(new_interior));
+            self.cache.set(new_leaf_prefix, Node::Leaf(new_leaf));
 
             self.mark_dirty(common);
             self.mark_dirty(new_leaf_prefix);
@@ -445,7 +371,7 @@ impl DurableBatchMPT {
             InteriorNode::new(interior.prefix, new_left, new_right, left_hash, right_hash);
 
         self.cache
-            .insert(interior.prefix, Node::Interior(updated_interior));
+            .set(interior.prefix, Node::Interior(updated_interior));
         self.mark_dirty(interior.prefix);
 
         interior.prefix
@@ -458,7 +384,7 @@ impl DurableBatchMPT {
 
     /// Get cache statistics.
     pub fn cache_stats(&self) -> (usize, usize) {
-        (self.cache.len(), self.dirty.len())
+        (self.cache.len(), self.cache.dirty_len())
     }
 }
 
@@ -472,36 +398,10 @@ impl MerklePatriciaTree for DurableBatchMPT {
     }
 
     fn enumerate_nodes(&self) -> Vec<(Prefix, Node)> {
-        // For durable implementation, we need to load all nodes from database
-        let db = self.db.lock().unwrap();
-        let mut stmt = db
-            .prepare("SELECT prefix_hash, prefix_length, node_type, node_data FROM nodes")
-            .expect("Failed to prepare statement");
-
-        let nodes = stmt
-            .query_map([], |row| {
-                let prefix_hash: Vec<u8> = row.get(0)?;
-                let prefix_length: u16 = row.get::<_, i64>(1)? as u16;
-                let node_type: String = row.get(2)?;
-                let node_data: Vec<u8> = row.get(3)?;
-
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&prefix_hash);
-                let prefix = Prefix {
-                    hash,
-                    length: prefix_length,
-                };
-
-                let node = Node::deserialize(&node_type, &node_data)
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
-
-                Ok((prefix, node))
-            })
-            .expect("Failed to query nodes")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("Failed to collect nodes");
-
-        nodes
+        // Use Cache's enumerate_nodes method
+        self.cache
+            .enumerate_nodes()
+            .expect("Failed to enumerate nodes")
     }
 
     fn get_root_hash(&self) -> Option<Hash> {
@@ -513,7 +413,7 @@ impl MerklePatriciaTree for DurableBatchMPT {
 
         // Try cache first
         if let Some(node) = self.cache.get(&prefix) {
-            if let Node::Leaf(leaf) = node.value() {
+            if let Node::Leaf(leaf) = node {
                 return Some(leaf.value);
             }
         }
@@ -600,7 +500,7 @@ mod tests {
         mpt.batch_upsert(&entries);
 
         // Verify tree size is tracked
-        let tree_size = *mpt.tree_size.lock().unwrap();
+        let tree_size = mpt.cache.tree_size();
         assert!(tree_size > 0);
         assert_eq!(tree_size, mpt.cache.len());
 
