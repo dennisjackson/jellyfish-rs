@@ -1,5 +1,6 @@
 use log::info;
 use rusqlite::{Connection, Result as SqliteResult};
+use std::env;
 use std::sync::{Arc, Mutex};
 
 use crate::mpt::MerklePatriciaTree;
@@ -314,7 +315,17 @@ impl DurableBatchMPT {
 
 impl MerklePatriciaTree for DurableBatchMPT {
     fn new() -> Self {
-        Self::new_in_memory().expect("Failed to create in-memory database")
+        // Generate a unique temporary file path using process ID and timestamp
+        let temp_dir = env::temp_dir();
+        let pid = std::process::id();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_file = temp_dir.join(format!("jellyfish_mpt_{}_{}.db", pid, timestamp));
+        let db_path = temp_file.to_str().expect("Invalid temp path");
+
+        Self::new_with_path(db_path).expect("Failed to create temporary database")
     }
 
     fn upsert(&mut self, key: Hash, value: Hash) {
