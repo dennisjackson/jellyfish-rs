@@ -1,5 +1,6 @@
+use dashmap::DashMap;
 use log::info;
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::mpt::MerklePatriciaTree;
 use crate::{Hash, Prefix};
@@ -9,8 +10,9 @@ use super::{InteriorNode, LeafNode, Node};
 /// A batch-optimized Merkle Patricia Tree implementation.
 /// This implementation efficiently performs batch upserts by deferring
 /// hash recalculations until after all insertions are complete.
+/// Uses a concurrent hashmap (DashMap) for thread-safe parallel operations.
 pub struct BatchMPT {
-    pub store: HashMap<Prefix, Node>,
+    pub store: Arc<DashMap<Prefix, Node>>,
     pub root: Prefix,
 }
 
@@ -23,7 +25,7 @@ impl Default for BatchMPT {
 impl BatchMPT {
     pub fn new() -> Self {
         Self {
-            store: HashMap::new(),
+            store: Arc::new(DashMap::new()),
             root: Prefix::root(),
         }
     }
@@ -61,34 +63,38 @@ impl BatchMPT {
         entries_vec.dedup_by_key(|(k, _)| *k);
 
         // Perform recursive batch upsert
-        let new_root = self.recursive_batch_upsert(self.root, &mut entries_vec);
+        let new_root = Self::recursive_batch_upsert(&self.store, self.root, entries_vec);
         self.root = new_root;
     }
 
     /// Recursively batch upsert entries at the current node.
     /// Returns the prefix of the (possibly new) root of this subtree.
     fn recursive_batch_upsert(
-        &mut self,
+        store: &Arc<DashMap<Prefix, Node>>,
         current_prefix: Prefix,
-        entries: &mut Vec<(Hash, Hash)>,
+        entries: Vec<(Hash, Hash)>,
     ) -> Prefix {
         if entries.is_empty() {
             return current_prefix;
         }
 
-        let Some(node) = self.store.get(&current_prefix).cloned() else {
+        let node = store.get(&current_prefix).map(|n| n.clone());
+        let Some(node) = node else {
             // Empty tree: insert all entries
-            return self.batch_insert_into_empty(entries);
+            return Self::batch_insert_into_empty(store, entries);
         };
 
         match node {
-            Node::Leaf(leaf) => self.batch_upsert_at_leaf(leaf, entries),
-            Node::Interior(interior) => self.batch_upsert_at_interior(interior, entries),
+            Node::Leaf(leaf) => Self::batch_upsert_at_leaf(store, leaf, entries),
+            Node::Interior(interior) => Self::batch_upsert_at_interior(store, interior, entries),
         }
     }
 
     /// Insert all entries into an empty tree.
-    fn batch_insert_into_empty(&mut self, entries: &mut Vec<(Hash, Hash)>) -> Prefix {
+    fn batch_insert_into_empty(
+        store: &Arc<DashMap<Prefix, Node>>,
+        mut entries: Vec<(Hash, Hash)>,
+    ) -> Prefix {
         if entries.is_empty() {
             return Prefix::root();
         }
@@ -98,27 +104,31 @@ impl BatchMPT {
 
         let first_prefix = Prefix::from(first_key);
         let first_leaf = LeafNode::new(first_key, first_value);
-        self.store.insert(first_prefix, Node::Leaf(first_leaf));
+        store.insert(first_prefix, Node::Leaf(first_leaf));
 
         // Recursively insert remaining entries
-        self.recursive_batch_upsert(first_prefix, entries)
+        Self::recursive_batch_upsert(store, first_prefix, entries)
     }
 
     /// Batch upsert at a leaf node.
-    fn batch_upsert_at_leaf(&mut self, leaf: LeafNode, entries: &mut Vec<(Hash, Hash)>) -> Prefix {
+    fn batch_upsert_at_leaf(
+        store: &Arc<DashMap<Prefix, Node>>,
+        leaf: LeafNode,
+        mut entries: Vec<(Hash, Hash)>,
+    ) -> Prefix {
         let leaf_prefix = Prefix::from(leaf.key);
 
         // Check if any entry updates this leaf (using binary search since entries are sorted)
         if let Ok(idx) = entries.binary_search_by_key(&leaf.key, |(k, _)| *k) {
             let (_, new_value) = entries.remove(idx);
             let updated_leaf = LeafNode::new(leaf.key, new_value);
-            self.store.insert(leaf_prefix, Node::Leaf(updated_leaf));
+            store.insert(leaf_prefix, Node::Leaf(updated_leaf));
 
             if entries.is_empty() {
                 return leaf_prefix;
             }
             // Continue inserting remaining entries
-            return self.recursive_batch_upsert(leaf_prefix, entries);
+            return Self::recursive_batch_upsert(store, leaf_prefix, entries);
         }
 
         if entries.is_empty() {
@@ -151,20 +161,19 @@ impl BatchMPT {
             right_hash,
         );
 
-        self.store
-            .insert(merged_prefix, Node::Interior(new_interior));
-        self.store.insert(existing_prefix, Node::Leaf(leaf));
-        self.store.insert(new_prefix, Node::Leaf(new_leaf));
+        store.insert(merged_prefix, Node::Interior(new_interior));
+        store.insert(existing_prefix, Node::Leaf(leaf));
+        store.insert(new_prefix, Node::Leaf(new_leaf));
 
         // Continue with remaining entries
-        self.recursive_batch_upsert(merged_prefix, entries)
+        Self::recursive_batch_upsert(store, merged_prefix, entries)
     }
 
     /// Batch upsert at an interior node.
     fn batch_upsert_at_interior(
-        &mut self,
+        store: &Arc<DashMap<Prefix, Node>>,
         interior: InteriorNode,
-        entries: &mut Vec<(Hash, Hash)>,
+        entries: Vec<(Hash, Hash)>,
     ) -> Prefix {
         // Partition entries: those that belong under this node vs. those that diverge
         let mut contained_entries = Vec::new();
@@ -199,13 +208,12 @@ impl BatchMPT {
             let new_interior =
                 InteriorNode::new(common, left_prefix, right_prefix, left_hash, right_hash);
 
-            self.store.insert(common, Node::Interior(new_interior));
-            self.store.insert(new_leaf_prefix, Node::Leaf(new_leaf));
+            store.insert(common, Node::Interior(new_interior));
+            store.insert(new_leaf_prefix, Node::Leaf(new_leaf));
 
             // Merge remaining entries and continue
             contained_entries.extend(divergent_entries);
-            *entries = contained_entries;
-            return self.recursive_batch_upsert(common, entries);
+            return Self::recursive_batch_upsert(store, common, contained_entries);
         }
 
         // All entries belong under this interior node
@@ -221,29 +229,33 @@ impl BatchMPT {
             }
         }
 
-        // Recursively process left and right subtrees
-        let new_left = if !left_entries.is_empty() {
-            self.recursive_batch_upsert(interior.left, &mut left_entries)
-        } else {
-            interior.left
-        };
-
-        let new_right = if !right_entries.is_empty() {
-            self.recursive_batch_upsert(interior.right, &mut right_entries)
-        } else {
-            interior.right
-        };
+        // Recursively process left and right subtrees in parallel
+        let store_clone = Arc::clone(store);
+        let (new_left, new_right) = rayon::join(
+            || {
+                if !left_entries.is_empty() {
+                    Self::recursive_batch_upsert(store, interior.left, left_entries)
+                } else {
+                    interior.left
+                }
+            },
+            || {
+                if !right_entries.is_empty() {
+                    Self::recursive_batch_upsert(&store_clone, interior.right, right_entries)
+                } else {
+                    interior.right
+                }
+            },
+        );
 
         // Recalculate this interior node's hash based on updated children
-        let left_hash = self.store.get(&new_left).unwrap().merkle_hash();
-        let right_hash = self.store.get(&new_right).unwrap().merkle_hash();
+        let left_hash = store.get(&new_left).unwrap().merkle_hash();
+        let right_hash = store.get(&new_right).unwrap().merkle_hash();
 
         let updated_interior =
             InteriorNode::new(interior.prefix, new_left, new_right, left_hash, right_hash);
 
-        self.store
-            .insert(interior.prefix, Node::Interior(updated_interior));
-        entries.clear();
+        store.insert(interior.prefix, Node::Interior(updated_interior));
         interior.prefix
     }
 }
@@ -258,7 +270,10 @@ impl MerklePatriciaTree for BatchMPT {
     }
 
     fn enumerate_nodes(&self) -> Vec<(Prefix, Node)> {
-        self.store.iter().map(|(k, v)| (*k, v.clone())).collect()
+        self.store
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().clone()))
+            .collect()
     }
 
     fn get_root_hash(&self) -> Option<Hash> {
@@ -267,7 +282,7 @@ impl MerklePatriciaTree for BatchMPT {
 
     fn get_leaf_value(&self, key: Hash) -> Option<Hash> {
         let prefix = Prefix::from(key);
-        match self.store.get(&prefix) {
+        match self.store.get(&prefix).as_deref() {
             Some(Node::Leaf(leaf)) => Some(leaf.value),
             _ => None,
         }
