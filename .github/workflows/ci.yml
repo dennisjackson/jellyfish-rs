@@ -159,7 +159,15 @@ jobs:
         path: target
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
+    - name: Cache cargo-mutants binary
+      uses: actions/cache@v4
+      id: cache-cargo-mutants
+      with:
+        path: ~/.cargo/bin/cargo-mutants
+        key: ${{ runner.os }}-cargo-mutants-binary
+
     - name: Install cargo-mutants
+      if: steps.cache-cargo-mutants.outputs.cache-hit != 'true'
       run: cargo install cargo-mutants
 
     - name: Run cargo mutants
