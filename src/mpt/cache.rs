@@ -2,8 +2,8 @@ use dashmap::DashMap;
 use rusqlite::{Connection, Result as SqliteResult, params};
 use std::sync::{Arc, Mutex};
 
-use crate::Prefix;
 use super::Node;
+use crate::Prefix;
 
 /// A cache structure that wraps DashMap and provides SQLite-backed persistent storage.
 /// This cache allows preloading keys from disk and batch writing keys back to disk.
@@ -109,9 +109,8 @@ impl Cache {
     pub fn pre_advise(&self, _keys: &[Prefix]) -> SqliteResult<()> {
         let db = self.db.lock().unwrap();
 
-        let mut stmt = db.prepare(
-            "SELECT prefix_hash, prefix_length, node_type, node_data FROM nodes"
-        )?;
+        let mut stmt =
+            db.prepare("SELECT prefix_hash, prefix_length, node_type, node_data FROM nodes")?;
 
         let nodes = stmt.query_map([], |row| {
             let prefix_hash: Vec<u8> = row.get(0)?;
@@ -161,15 +160,12 @@ impl Cache {
 
             for key in keys {
                 if let Some(node) = self.map.get(key) {
-                    let (node_type, node_data) = node.value().serialize()
+                    let (node_type, node_data) = node
+                        .value()
+                        .serialize()
                         .map_err(|_| rusqlite::Error::InvalidQuery)?;
 
-                    stmt.execute(params![
-                        &key.hash[..],
-                        key.length,
-                        node_type,
-                        node_data
-                    ])?;
+                    stmt.execute(params![&key.hash[..], key.length, node_type, node_data])?;
                 }
                 // Skip keys that aren't in the cache
             }
@@ -200,15 +196,12 @@ impl Cache {
 
             for key in &dirty_keys {
                 if let Some(node) = self.map.get(key) {
-                    let (node_type, node_data) = node.value().serialize()
+                    let (node_type, node_data) = node
+                        .value()
+                        .serialize()
                         .map_err(|_| rusqlite::Error::InvalidQuery)?;
 
-                    stmt.execute(params![
-                        &key.hash[..],
-                        key.length,
-                        node_type,
-                        node_data
-                    ])?;
+                    stmt.execute(params![&key.hash[..], key.length, node_type, node_data])?;
                 }
             }
         }
@@ -230,9 +223,8 @@ impl Cache {
     /// This queries the database directly to get all persisted nodes.
     pub fn enumerate_nodes(&self) -> SqliteResult<Vec<(Prefix, Node)>> {
         let db = self.db.lock().unwrap();
-        let mut stmt = db.prepare(
-            "SELECT prefix_hash, prefix_length, node_type, node_data FROM nodes"
-        )?;
+        let mut stmt =
+            db.prepare("SELECT prefix_hash, prefix_length, node_type, node_data FROM nodes")?;
 
         let nodes = stmt
             .query_map([], |row| {
@@ -261,8 +253,8 @@ impl Cache {
 
 #[cfg(test)]
 mod tests {
+    use super::super::LeafNode;
     use super::*;
-    use super::super::{LeafNode};
 
     fn create_test_db() -> Arc<Mutex<Connection>> {
         let conn = Connection::open_in_memory().unwrap();
@@ -277,7 +269,8 @@ mod tests {
                 PRIMARY KEY (prefix_hash, prefix_length)
             )",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         Arc::new(Mutex::new(conn))
     }

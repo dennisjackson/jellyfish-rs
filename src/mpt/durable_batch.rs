@@ -91,7 +91,14 @@ impl DurableBatchMPT {
         // Remove duplicates, keeping the last occurrence (latest value)
         entries_vec.dedup_by_key(|(k, _)| *k);
 
-        self.cache.pre_advise(&entries_vec.iter().map(|(k, _)| Prefix::from(*k)).collect::<Vec<_>>()).ok();
+        self.cache
+            .pre_advise(
+                &entries_vec
+                    .iter()
+                    .map(|(k, _)| Prefix::from(*k))
+                    .collect::<Vec<_>>(),
+            )
+            .ok();
 
         // Perform recursive batch upsert
         let new_root = self.recursive_batch_upsert(self.root, entries_vec);
@@ -188,8 +195,7 @@ impl DurableBatchMPT {
             right_hash,
         );
 
-        self.cache
-            .set(merged_prefix, Node::Interior(new_interior));
+        self.cache.set(merged_prefix, Node::Interior(new_interior));
         self.cache.set(existing_prefix, Node::Leaf(leaf));
         self.cache.set(new_prefix, Node::Leaf(new_leaf));
 
