@@ -42,57 +42,6 @@ impl DurableBatchMPT {
         Self::new_with_path(":memory:")
     }
 
-    /// Load a node from SQLite into the cache if not already present.
-    fn load_node(&self, prefix: &Prefix) -> Option<Node> {
-        // Check cache first, or load from database via pre_advise
-        if let Some(node) = self.cache.get(prefix) {
-            return Some(node);
-        }
-
-        // Use pre_advise to load from database
-        self.cache.pre_advise(&[*prefix]).ok()?;
-        self.cache.get(prefix)
-    }
-
-    /// Load a node and its immediate children into the cache.
-    fn load_node_with_children(&self, prefix: &Prefix) {
-        if let Some(node) = self.load_node(prefix) {
-            if let Node::Interior(interior) = node {
-                // Preload children using pre_advise
-                let _ = self.cache.pre_advise(&[interior.left, interior.right]);
-            }
-        }
-    }
-
-    /// Recursively load all nodes in the path from root to the given key.
-    fn load_path_to_key(&self, key: Hash) {
-        let mut current = self.root;
-
-        loop {
-            self.load_node_with_children(&current);
-
-            let node = match self.cache.get(&current) {
-                Some(n) => n,
-                None => break,
-            };
-
-            match node {
-                Node::Leaf(_) => break,
-                Node::Interior(interior) => {
-                    if interior.prefix.contains(&key) {
-                        current = if interior.prefix.key_goes_right(key) {
-                            interior.right
-                        } else {
-                            interior.left
-                        };
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
     /// Write all dirty nodes back to SQLite.
     fn flush_to_disk(&self) -> SqliteResult<()> {
         // Use Cache::flush to write all dirty nodes
@@ -142,13 +91,7 @@ impl DurableBatchMPT {
         // Remove duplicates, keeping the last occurrence (latest value)
         entries_vec.dedup_by_key(|(k, _)| *k);
 
-        // Load paths for all keys to ensure necessary nodes are in cache
-        entries_vec.par_iter().for_each(|(key, _)| {
-            self.load_path_to_key(*key);
-        });
-
-        // Track the old cache size to calculate how many nodes were added
-        let old_cache_size = self.cache.len();
+        self.cache.pre_advise(&entries_vec.iter().map(|(k, _)| Prefix::from(*k)).collect::<Vec<_>>()).ok();
 
         // Perform recursive batch upsert
         let new_root = self.recursive_batch_upsert(self.root, entries_vec);
@@ -381,21 +324,16 @@ impl MerklePatriciaTree for DurableBatchMPT {
     }
 
     fn get_root_hash(&self) -> Option<Hash> {
-        self.load_node(&self.root).map(|n| n.merkle_hash())
+        self.cache.get(&self.root).map(|n| n.merkle_hash())
     }
 
     fn get_leaf_value(&self, key: Hash) -> Option<Hash> {
         let prefix = Prefix::from(key);
 
-        // Try cache first
-        if let Some(node) = self.cache.get(&prefix) {
-            if let Node::Leaf(leaf) = node {
-                return Some(leaf.value);
-            }
-        }
+        self.cache.pre_advise(&[prefix]).unwrap();
 
         // Load from database
-        match self.load_node(&prefix)? {
+        match self.cache.get(&prefix)? {
             Node::Leaf(leaf) => Some(leaf.value),
             _ => None,
         }

@@ -103,39 +103,41 @@ impl Cache {
         self.map.retain(|key, _| needed_keys.contains(key));
     }
 
-    /// Pre-advise: Load a list of keys from SQLite into the cache.
-    /// This is useful for preloading nodes that will be needed soon.
-    /// Keys that are already in the cache will not be reloaded.
-    pub fn pre_advise(&self, keys: &[Prefix]) -> SqliteResult<()> {
-        if keys.is_empty() {
-            return Ok(());
-        }
-
+    /// Pre-advise: Load all nodes from SQLite into the cache.
+    /// This ignores the keys parameter and loads all nodes from the database.
+    /// Nodes that are already in the cache will not be reloaded.
+    pub fn pre_advise(&self, _keys: &[Prefix]) -> SqliteResult<()> {
         let db = self.db.lock().unwrap();
 
-        for key in keys {
+        let mut stmt = db.prepare(
+            "SELECT prefix_hash, prefix_length, node_type, node_data FROM nodes"
+        )?;
+
+        let nodes = stmt.query_map([], |row| {
+            let prefix_hash: Vec<u8> = row.get(0)?;
+            let prefix_length: u16 = row.get::<_, i64>(1)? as u16;
+            let node_type: String = row.get(2)?;
+            let node_data: Vec<u8> = row.get(3)?;
+
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&prefix_hash);
+            let prefix = Prefix {
+                hash,
+                length: prefix_length,
+            };
+
+            let node = Node::deserialize(&node_type, &node_data)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+            Ok((prefix, node))
+        })?;
+
+        for result in nodes {
+            let (prefix, node) = result?;
             // Skip if already in cache
-            if self.map.contains_key(key) {
-                continue;
+            if !self.map.contains_key(&prefix) {
+                self.map.insert(prefix, node);
             }
-
-            // Load from database
-            let mut stmt = db.prepare(
-                "SELECT node_type, node_data FROM nodes WHERE prefix_hash = ?1 AND prefix_length = ?2"
-            )?;
-
-            if let Ok(node) = stmt.query_row(params![&key.hash[..], key.length], |row| {
-                let node_type: String = row.get(0)?;
-                let node_data: Vec<u8> = row.get(1)?;
-
-                let node = Node::deserialize(&node_type, &node_data)
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
-
-                Ok(node)
-            }) {
-                self.map.insert(*key, node);
-            }
-            // If the key doesn't exist in the database, we simply don't add it to the cache
         }
 
         Ok(())
