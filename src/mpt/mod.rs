@@ -139,18 +139,11 @@ impl SimpleMPT {
 
         match node {
             Node::Leaf(leaf) => self.base_leaf_upsert(leaf, key, value),
-            Node::Interior(interior) => {
-                self.recursive_interior_upsert(interior, key, value)
-            }
+            Node::Interior(interior) => self.recursive_interior_upsert(interior, key, value),
         }
     }
 
-    fn base_leaf_upsert(
-        &mut self,
-        leaf: LeafNode,
-        key: Hash,
-        value: Hash,
-    ) -> Prefix {
+    fn base_leaf_upsert(&mut self, leaf: LeafNode, key: Hash, value: Hash) -> Prefix {
         debug!("At leaf node with key {}", leaf.key.short_hex());
 
         if leaf.key == key {
@@ -222,7 +215,8 @@ impl SimpleMPT {
                 interior.merkle_hash,
             );
 
-            let new_interior = InteriorNode::new(common, left_prefix, right_prefix, left_hash, right_hash);
+            let new_interior =
+                InteriorNode::new(common, left_prefix, right_prefix, left_hash, right_hash);
 
             self.insert_node(common, Node::Interior(new_interior));
             self.insert_node(new_leaf_prefix, Node::Leaf(new_leaf));
@@ -233,22 +227,23 @@ impl SimpleMPT {
         let goes_right = interior.prefix.key_goes_right(key);
         let (new_left, new_right) = if goes_right {
             debug!("At interior node, descending right");
-            (interior.left, self.recursive_upsert(interior.right, key, value))
+            (
+                interior.left,
+                self.recursive_upsert(interior.right, key, value),
+            )
         } else {
             debug!("At interior node, descending left");
-            (self.recursive_upsert(interior.left, key, value), interior.right)
+            (
+                self.recursive_upsert(interior.left, key, value),
+                interior.right,
+            )
         };
 
         let left_hash = self.store.get(&new_left).unwrap().merkle_hash();
         let right_hash = self.store.get(&new_right).unwrap().merkle_hash();
 
-        let updated_interior = InteriorNode::new(
-            interior.prefix,
-            new_left,
-            new_right,
-            left_hash,
-            right_hash,
-        );
+        let updated_interior =
+            InteriorNode::new(interior.prefix, new_left, new_right, left_hash, right_hash);
 
         self.insert_node(interior.prefix, Node::Interior(updated_interior));
         interior.prefix

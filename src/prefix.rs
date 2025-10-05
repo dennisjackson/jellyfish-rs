@@ -393,10 +393,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00,
         ];
 
-        let short_prefix = Prefix {
-            hash,
-            length: 4,
-        };
+        let short_prefix = Prefix { hash, length: 4 };
         let long_prefix = Prefix::from(hash);
 
         assert!(short_prefix.prefix_of(&long_prefix));
@@ -411,10 +408,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00,
         ];
 
-        let short_prefix = Prefix {
-            hash,
-            length: 4,
-        };
+        let short_prefix = Prefix { hash, length: 4 };
         let long_prefix = Prefix::from(hash);
 
         assert!(!long_prefix.prefix_of(&short_prefix));
@@ -628,7 +622,10 @@ mod tests {
         };
         assert_eq!(prefix_zero.short_hex(), "0");
 
-        let hash_one = [0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let hash_one = [
+            0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
         let prefix_one = Prefix {
             hash: hash_one,
             length: 1,
@@ -644,10 +641,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00,
         ];
-        let prefix = Prefix {
-            hash,
-            length: 4,
-        };
+        let prefix = Prefix { hash, length: 4 };
         assert_eq!(prefix.short_hex(), "1111");
     }
 
@@ -659,10 +653,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00,
         ];
-        let prefix = Prefix {
-            hash,
-            length: 8,
-        };
+        let prefix = Prefix { hash, length: 8 };
         // 0xAB = 10101011
         assert_eq!(prefix.short_hex(), "10101011");
     }
@@ -748,14 +739,8 @@ mod tests {
             0x00, 0x00, 0x00, 0x00,
         ];
 
-        let prefix_4 = Prefix {
-            hash,
-            length: 4,
-        };
-        let prefix_8 = Prefix {
-            hash,
-            length: 8,
-        };
+        let prefix_4 = Prefix { hash, length: 4 };
+        let prefix_8 = Prefix { hash, length: 8 };
         let prefix_256 = Prefix::from(hash);
 
         assert_ne!(prefix_4.short_hex(), prefix_8.short_hex());
@@ -847,7 +832,11 @@ mod tests {
     fn test_key_goes_right_mid_byte() {
         // Test in the middle of a byte (e.g., bit position 4)
         let prefix_4 = Prefix {
-            hash: [0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            hash: [
+                0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+            ],
             length: 4,
         };
 
@@ -887,10 +876,16 @@ mod tests {
             // Create key without bit at position set
             let key_without_bit = [0x00; 32];
 
-            assert!(prefix.key_goes_right(key_with_bit),
-                "Failed at position {}: expected right", position);
-            assert!(!prefix.key_goes_right(key_without_bit),
-                "Failed at position {}: expected left", position);
+            assert!(
+                prefix.key_goes_right(key_with_bit),
+                "Failed at position {}: expected right",
+                position
+            );
+            assert!(
+                !prefix.key_goes_right(key_without_bit),
+                "Failed at position {}: expected left",
+                position
+            );
         }
     }
 
@@ -972,21 +967,18 @@ mod tests {
             };
 
             // Create various keys
-            let keys = [
-                [0xFF; 32],
-                [0x00; 32],
-                [0xAA; 32],
-                [0x55; 32],
-            ];
+            let keys = [[0xFF; 32], [0x00; 32], [0xAA; 32], [0x55; 32]];
 
             for key in &keys {
                 let key_prefix = Prefix::from(*key);
                 let expected = key_prefix.get_bit(position);
                 let actual = prefix.key_goes_right(*key);
 
-                assert_eq!(actual, expected,
+                assert_eq!(
+                    actual, expected,
                     "Mismatch at position {}: key_goes_right={}, get_bit={}",
-                    position, actual, expected);
+                    position, actual, expected
+                );
             }
         }
     }

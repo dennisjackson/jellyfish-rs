@@ -1,8 +1,8 @@
+use jellyfish_rs::prefix::HashExt;
 use jellyfish_rs::{Hash, Node, Prefix, SimpleMPT};
 use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::io::Write;
-use jellyfish_rs::prefix::HashExt;
 
 fn hash_key(key: &str) -> Hash {
     let mut hasher = Sha256::new();
@@ -43,7 +43,11 @@ fn collect_mermaid_node(mpt: &SimpleMPT) -> String {
         }
         let name = match node {
             Node::Leaf(leaf) => format!("leaf_{}", &leaf.key.short_hex()),
-            Node::Interior(interior) => format!("int_{}_{}",&interior.prefix.length, &interior.prefix.short_hex()),
+            Node::Interior(interior) => format!(
+                "int_{}_{}",
+                &interior.prefix.length,
+                &interior.prefix.short_hex()
+            ),
         };
         name_cache.insert(*prefix, name.clone());
         name
