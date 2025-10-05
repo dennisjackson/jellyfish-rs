@@ -223,4 +223,10 @@ impl MerklePatriciaTree for SimpleMPT {
             _ => None,
         }
     }
+
+    fn batch_upsert(&mut self, entries: &[(Hash, Hash)]) {
+        for (key, value) in entries {
+            self.upsert(*key, *value);
+        }
+    }
 }
