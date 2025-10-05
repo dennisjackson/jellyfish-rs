@@ -2,6 +2,8 @@ pub type Hash = [u8; 32];
 
 pub trait HashExt {
     fn short_hex(&self) -> String;
+    fn get_bit(&self, position: u16) -> bool;
+    fn zero_bits_from(&self, start_bit: u16) -> Hash;
 }
 
 impl HashExt for Hash {
@@ -13,6 +15,25 @@ impl HashExt for Hash {
             write!(&mut s, "{b:02x}").unwrap();
         }
         s
+    }
+
+    /// Get the bit at the given position in the hash (0 = leftmost bit)
+    fn get_bit(&self, position: u16) -> bool {
+        if position >= 256 {
+            return false;
+        }
+        let byte_index = (position / 8) as usize;
+        let bit_index = 7 - (position % 8);
+        (self[byte_index] >> bit_index) & 1 != 0
+    }
+
+    /// Zero out all bits from start_bit onwards (0 = leftmost bit)
+    fn zero_bits_from(&self, start_bit: u16) -> Hash {
+        let mut result = *self;
+        for i in start_bit..256 {
+            result[(i / 8) as usize] &= !(1 << (7 - (i % 8)));
+        }
+        result
     }
 }
 
@@ -44,12 +65,12 @@ impl Prefix {
         }
         let mut prefix_bits = Vec::new();
         for i in 0..self.length {
-            let bit = (self.hash[(i / 8) as usize] >> (7 - (i % 8))) & 1;
+            let bit = self.hash.get_bit(i);
             prefix_bits.push(bit);
         }
         prefix_bits
             .iter()
-            .map(|b| if *b > 0 { '1' } else { '0' })
+            .map(|b| if *b { '1' } else { '0' })
             .collect()
     }
 
@@ -58,9 +79,7 @@ impl Prefix {
             return false;
         }
         for i in 0..self.length {
-            let bit_self = (self.hash[(i / 8) as usize] >> (7 - (i % 8))) & 1;
-            let bit_other = (other.hash[(i / 8) as usize] >> (7 - (i % 8))) & 1;
-            if bit_self != bit_other {
+            if self.hash.get_bit(i) != other.hash.get_bit(i) {
                 return false;
             }
         }
@@ -69,9 +88,7 @@ impl Prefix {
 
     pub fn contains(&self, key: &Hash) -> bool {
         for i in 0..self.length {
-            let bit_prefix = (self.hash[(i / 8) as usize] >> (7 - (i % 8))) & 1;
-            let bit_key = (key[(i / 8) as usize] >> (7 - (i % 8))) & 1;
-            if bit_prefix != bit_key {
+            if self.hash.get_bit(i) != key.get_bit(i) {
                 return false;
             }
         }
@@ -82,18 +99,12 @@ impl Prefix {
         let min_length = a.length.min(b.length);
         let mut common_bits = 0u16;
         for i in 0..min_length {
-            let bit_a = (a.hash[(i / 8) as usize] >> (7 - (i % 8))) & 1 != 0;
-            let bit_b = (b.hash[(i / 8) as usize] >> (7 - (i % 8))) & 1 != 0;
-            if bit_a != bit_b {
+            if a.hash.get_bit(i) != b.hash.get_bit(i) {
                 break;
             }
             common_bits += 1;
         }
-        let mut common_hash = a.hash;
-        // Zero out bits beyond common_bits
-        for i in common_bits..256 {
-            common_hash[(i / 8) as usize] &= !(1 << (7 - (i % 8)));
-        }
+        let common_hash = a.hash.zero_bits_from(common_bits);
         Prefix {
             hash: common_hash,
             length: common_bits,
@@ -101,13 +112,15 @@ impl Prefix {
     }
 
     /// Get the bit at the given position in the hash (0 = leftmost bit)
+    /// Panics if position >= self.length
     pub fn get_bit(&self, position: u16) -> bool {
-        if position >= 256 {
-            return false;
-        }
-        let byte_index = (position / 8) as usize;
-        let bit_index = 7 - (position % 8);
-        (self.hash[byte_index] >> bit_index) & 1 != 0
+        assert!(
+            position < self.length,
+            "Position {} is beyond prefix length {}",
+            position,
+            self.length
+        );
+        self.hash.get_bit(position)
     }
 
     /// Determine if a key should go left (false) or right (true) at this prefix
@@ -116,9 +129,7 @@ impl Prefix {
         if self.length >= 256 {
             return false;
         }
-        let byte_index = (self.length / 8) as usize;
-        let bit_index = 7 - (self.length % 8);
-        (key[byte_index] >> bit_index) & 1 != 0
+        key.get_bit(self.length)
     }
 }
 
@@ -551,14 +562,23 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "Position 256 is beyond prefix length 256")]
     fn test_get_bit_out_of_range() {
-        // Test that getting a bit beyond 256 returns false
+        // Test that getting a bit at or beyond the prefix length panics
         let hash = [0xFF; 32];
         let prefix = Prefix::from(hash);
 
-        assert!(!prefix.get_bit(256));
-        assert!(!prefix.get_bit(300));
-        assert!(!prefix.get_bit(1000));
+        prefix.get_bit(256); // This should panic
+    }
+
+    #[test]
+    #[should_panic(expected = "is beyond prefix length")]
+    fn test_get_bit_beyond_short_prefix() {
+        // Test that getting a bit beyond a short prefix's length panics
+        let hash = [0xFF; 32];
+        let prefix = Prefix { hash, length: 10 };
+
+        prefix.get_bit(10); // This should panic (length is 10, so valid bits are 0-9)
     }
 
     #[test]
