@@ -361,8 +361,7 @@ mod tests {
             assert_eq!(
                 result_ab.hash[full_bytes] & mask,
                 result_ba.hash[full_bytes] & mask,
-                "Partial byte {} differs",
-                full_bytes
+                "Partial byte {full_bytes} differs"
             );
         }
     }
@@ -503,7 +502,7 @@ mod tests {
         let prefix = Prefix::from(hash);
 
         for i in 0..256 {
-            assert!(prefix.get_bit(i), "Bit {} should be 1", i);
+            assert!(prefix.get_bit(i), "Bit {i} should be 1");
         }
     }
 
@@ -514,7 +513,7 @@ mod tests {
         let prefix = Prefix::from(hash);
 
         for i in 0..256 {
-            assert!(!prefix.get_bit(i), "Bit {} should be 0", i);
+            assert!(!prefix.get_bit(i), "Bit {i} should be 0");
         }
     }
 
@@ -526,9 +525,9 @@ mod tests {
 
         for i in 0..256 {
             if i % 2 == 0 {
-                assert!(prefix.get_bit(i), "Bit {} should be 1", i);
+                assert!(prefix.get_bit(i), "Bit {i} should be 1");
             } else {
-                assert!(!prefix.get_bit(i), "Bit {} should be 0", i);
+                assert!(!prefix.get_bit(i), "Bit {i} should be 0");
             }
         }
     }
@@ -898,13 +897,11 @@ mod tests {
 
             assert!(
                 prefix.key_goes_right(key_with_bit),
-                "Failed at position {}: expected right",
-                position
+                "Failed at position {position}: expected right"
             );
             assert!(
                 !prefix.key_goes_right(key_without_bit),
-                "Failed at position {}: expected left",
-                position
+                "Failed at position {position}: expected left"
             );
         }
     }
@@ -996,8 +993,7 @@ mod tests {
 
                 assert_eq!(
                     actual, expected,
-                    "Mismatch at position {}: key_goes_right={}, get_bit={}",
-                    position, actual, expected
+                    "Mismatch at position {position}: key_goes_right={actual}, get_bit={expected}"
                 );
             }
         }
