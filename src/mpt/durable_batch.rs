@@ -25,32 +25,8 @@ impl DurableBatchMPT {
     pub fn new_with_path(db_path: &str) -> SqliteResult<Self> {
         let conn = Connection::open(db_path)?;
 
-        // Create table if it doesn't exist
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS nodes (
-                prefix_hash BLOB NOT NULL,
-                prefix_length INTEGER NOT NULL,
-                node_type TEXT NOT NULL,
-                node_data BLOB NOT NULL,
-                PRIMARY KEY (prefix_hash, prefix_length)
-            )",
-            [],
-        )?;
-
-        // Create index for faster lookups
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_prefix ON nodes(prefix_hash, prefix_length)",
-            [],
-        )?;
-
-        // Create metadata table for storing tree size and other metadata
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS metadata (
-                key TEXT PRIMARY KEY,
-                value INTEGER NOT NULL
-            )",
-            [],
-        )?;
+        // Initialize database schema
+        Cache::initialize_database(&conn)?;
 
         let db = Arc::new(Mutex::new(conn));
         let cache = Cache::new(Arc::clone(&db));
