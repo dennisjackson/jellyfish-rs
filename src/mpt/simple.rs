@@ -219,7 +219,7 @@ impl MerklePatriciaTree for SimpleMPT {
     fn get_leaf_value(&self, key: Hash) -> Option<Hash> {
         let prefix = Prefix::from(key);
         match self.store.get(&prefix) {
-            Some(Node::Leaf(leaf)) if leaf.key == key => Some(leaf.value),
+            Some(Node::Leaf(leaf)) => Some(leaf.value),
             _ => None,
         }
     }

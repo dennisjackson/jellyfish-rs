@@ -41,11 +41,11 @@ fn verify_interior_node_structure<T: MerklePatriciaTree>(mpt: &T) -> bool {
     let nodes: std::collections::HashMap<Prefix, Node> =
         mpt.enumerate_nodes().into_iter().collect();
 
-    for (_, node) in &nodes {
-        if let Node::Interior(interior) = node {
-            if !nodes.contains_key(&interior.left) || !nodes.contains_key(&interior.right) {
-                return false;
-            }
+    for node in nodes.values() {
+        if let Node::Interior(interior) = node
+            && (!nodes.contains_key(&interior.left) || !nodes.contains_key(&interior.right))
+        {
+            return false;
         }
     }
     true
