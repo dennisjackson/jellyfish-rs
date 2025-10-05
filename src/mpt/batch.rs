@@ -1,8 +1,7 @@
-use log::{debug, info};
+use log::info;
 use std::collections::HashMap;
 
 use crate::mpt::MerklePatriciaTree;
-use crate::prefix::HashExt;
 use crate::{Hash, Prefix};
 
 use super::{InteriorNode, LeafNode, Node};
@@ -55,11 +54,14 @@ impl BatchMPT {
 
         info!("Batch upserting {} entries", entries.len());
 
-        // Convert to HashMap for efficient lookups and updates
-        let mut entries_map: HashMap<Hash, Hash> = entries.iter().copied().collect();
+        // Convert to sorted vector for efficient partitioning
+        let mut entries_vec: Vec<(Hash, Hash)> = entries.to_vec();
+        entries_vec.sort_by_key(|(k, _)| *k);
+        // Remove duplicates, keeping the last occurrence (latest value)
+        entries_vec.dedup_by_key(|(k, _)| *k);
 
         // Perform recursive batch upsert
-        let new_root = self.recursive_batch_upsert(self.root, &mut entries_map);
+        let new_root = self.recursive_batch_upsert(self.root, &mut entries_vec);
         self.root = new_root;
     }
 
@@ -68,7 +70,7 @@ impl BatchMPT {
     fn recursive_batch_upsert(
         &mut self,
         current_prefix: Prefix,
-        entries: &mut HashMap<Hash, Hash>,
+        entries: &mut Vec<(Hash, Hash)>,
     ) -> Prefix {
         if entries.is_empty() {
             return current_prefix;
@@ -86,14 +88,13 @@ impl BatchMPT {
     }
 
     /// Insert all entries into an empty tree.
-    fn batch_insert_into_empty(&mut self, entries: &mut HashMap<Hash, Hash>) -> Prefix {
+    fn batch_insert_into_empty(&mut self, entries: &mut Vec<(Hash, Hash)>) -> Prefix {
         if entries.is_empty() {
             return Prefix::root();
         }
 
         // Start with the first entry
-        let (&first_key, &first_value) = entries.iter().next().unwrap();
-        entries.remove(&first_key);
+        let (first_key, first_value) = entries.remove(0);
 
         let first_prefix = Prefix::from(first_key);
         let first_leaf = LeafNode::new(first_key, first_value);
@@ -104,16 +105,12 @@ impl BatchMPT {
     }
 
     /// Batch upsert at a leaf node.
-    fn batch_upsert_at_leaf(
-        &mut self,
-        leaf: LeafNode,
-        entries: &mut HashMap<Hash, Hash>,
-    ) -> Prefix {
+    fn batch_upsert_at_leaf(&mut self, leaf: LeafNode, entries: &mut Vec<(Hash, Hash)>) -> Prefix {
         let leaf_prefix = Prefix::from(leaf.key);
 
-        // Check if any entry updates this leaf
-        if let Some(&new_value) = entries.get(&leaf.key) {
-            entries.remove(&leaf.key);
+        // Check if any entry updates this leaf (using binary search since entries are sorted)
+        if let Ok(idx) = entries.binary_search_by_key(&leaf.key, |(k, _)| *k) {
+            let (_, new_value) = entries.remove(idx);
             let updated_leaf = LeafNode::new(leaf.key, new_value);
             self.store.insert(leaf_prefix, Node::Leaf(updated_leaf));
 
@@ -130,8 +127,7 @@ impl BatchMPT {
 
         // Split: need to create interior node(s) and distribute entries
         // Start with the first non-matching entry
-        let (&first_key, &first_value) = entries.iter().next().unwrap();
-        entries.remove(&first_key);
+        let (first_key, first_value) = entries.remove(0);
 
         let new_leaf = LeafNode::new(first_key, first_value);
         let new_prefix = Prefix::from(first_key);
@@ -168,25 +164,24 @@ impl BatchMPT {
     fn batch_upsert_at_interior(
         &mut self,
         interior: InteriorNode,
-        entries: &mut HashMap<Hash, Hash>,
+        entries: &mut Vec<(Hash, Hash)>,
     ) -> Prefix {
         // Partition entries: those that belong under this node vs. those that diverge
-        let mut contained_entries = HashMap::new();
-        let mut divergent_entries = HashMap::new();
+        let mut contained_entries = Vec::new();
+        let mut divergent_entries = Vec::new();
 
-        for (&key, &value) in entries.iter() {
+        for &(key, value) in entries.iter() {
             if interior.prefix.contains(&key) {
-                contained_entries.insert(key, value);
+                contained_entries.push((key, value));
             } else {
-                divergent_entries.insert(key, value);
+                divergent_entries.push((key, value));
             }
         }
 
         // Handle divergent entries first (they require creating a new parent)
         if !divergent_entries.is_empty() {
             // Create new parent(s) for divergent entries
-            let (&first_key, &first_value) = divergent_entries.iter().next().unwrap();
-            divergent_entries.remove(&first_key);
+            let (first_key, first_value) = divergent_entries.remove(0);
 
             let new_leaf = LeafNode::new(first_key, first_value);
             let new_leaf_prefix = Prefix::from(first_key);
@@ -215,14 +210,14 @@ impl BatchMPT {
 
         // All entries belong under this interior node
         // Partition them by left/right
-        let mut left_entries = HashMap::new();
-        let mut right_entries = HashMap::new();
+        let mut left_entries = Vec::new();
+        let mut right_entries = Vec::new();
 
-        for (&key, &value) in contained_entries.iter() {
+        for &(key, value) in contained_entries.iter() {
             if interior.prefix.key_goes_right(key) {
-                right_entries.insert(key, value);
+                right_entries.push((key, value));
             } else {
-                left_entries.insert(key, value);
+                left_entries.push((key, value));
             }
         }
 
