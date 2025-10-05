@@ -97,32 +97,8 @@ impl DurableBatchMPT {
                 let node_type: String = row.get(0)?;
                 let node_data: Vec<u8> = row.get(1)?;
 
-                let node = match node_type.as_str() {
-                    "leaf" => {
-                        let decoded: (Hash, Hash, Hash) =
-                            bincode::decode_from_slice(&node_data, bincode::config::standard())
-                                .map(|(v, _)| v)
-                                .map_err(|_| rusqlite::Error::InvalidQuery)?;
-                        Node::Leaf(LeafNode {
-                            key: decoded.0,
-                            value: decoded.1,
-                            merkle_hash: decoded.2,
-                        })
-                    }
-                    "interior" => {
-                        let decoded: (Prefix, Hash, Prefix, Prefix) =
-                            bincode::decode_from_slice(&node_data, bincode::config::standard())
-                                .map(|(v, _)| v)
-                                .map_err(|_| rusqlite::Error::InvalidQuery)?;
-                        Node::Interior(InteriorNode {
-                            prefix: decoded.0,
-                            merkle_hash: decoded.1,
-                            left: decoded.2,
-                            right: decoded.3,
-                        })
-                    }
-                    _ => return Err(rusqlite::Error::InvalidQuery),
-                };
+                let node = Node::deserialize(&node_type, &node_data)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
 
                 Ok(node)
             })
@@ -188,29 +164,8 @@ impl DurableBatchMPT {
                 let prefix = entry.key();
 
                 if let Some(node) = self.cache.get(prefix) {
-                    let (node_type, node_data) = match node.value() {
-                        Node::Leaf(leaf) => {
-                            let data = bincode::encode_to_vec(
-                                (leaf.key, leaf.value, leaf.merkle_hash),
-                                bincode::config::standard(),
-                            )
-                            .map_err(|_| rusqlite::Error::InvalidQuery)?;
-                            ("leaf", data)
-                        }
-                        Node::Interior(interior) => {
-                            let data = bincode::encode_to_vec(
-                                (
-                                    interior.prefix,
-                                    interior.merkle_hash,
-                                    interior.left,
-                                    interior.right,
-                                ),
-                                bincode::config::standard(),
-                            )
-                            .map_err(|_| rusqlite::Error::InvalidQuery)?;
-                            ("interior", data)
-                        }
-                    };
+                    let (node_type, node_data) = node.value().serialize()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?;
 
                     stmt.execute(params![
                         &prefix.hash[..],
@@ -536,32 +491,9 @@ impl MerklePatriciaTree for DurableBatchMPT {
                     hash,
                     length: prefix_length,
                 };
-                let node = match node_type.as_str() {
-                    "leaf" => {
-                        let decoded: (Hash, Hash, Hash) =
-                            bincode::decode_from_slice(&node_data, bincode::config::standard())
-                                .map(|(v, _)| v)
-                                .map_err(|_| rusqlite::Error::InvalidQuery)?;
-                        Node::Leaf(LeafNode {
-                            key: decoded.0,
-                            value: decoded.1,
-                            merkle_hash: decoded.2,
-                        })
-                    }
-                    "interior" => {
-                        let decoded: (Prefix, Hash, Prefix, Prefix) =
-                            bincode::decode_from_slice(&node_data, bincode::config::standard())
-                                .map(|(v, _)| v)
-                                .map_err(|_| rusqlite::Error::InvalidQuery)?;
-                        Node::Interior(InteriorNode {
-                            prefix: decoded.0,
-                            merkle_hash: decoded.1,
-                            left: decoded.2,
-                            right: decoded.3,
-                        })
-                    }
-                    _ => return Err(rusqlite::Error::InvalidQuery),
-                };
+
+                let node = Node::deserialize(&node_type, &node_data)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
 
                 Ok((prefix, node))
             })

@@ -11,6 +11,9 @@ pub use batch::BatchMPT;
 mod durable_batch;
 pub use durable_batch::DurableBatchMPT;
 
+mod cache;
+pub use cache::Cache;
+
 #[derive(Clone)]
 pub struct LeafNode {
     pub key: Hash,
@@ -82,6 +85,63 @@ impl Node {
         match self {
             Node::Leaf(leaf) => leaf.merkle_hash,
             Node::Interior(interior) => interior.merkle_hash,
+        }
+    }
+
+    /// Serialize a node to its database representation.
+    pub fn serialize(&self) -> Result<(&'static str, Vec<u8>), String> {
+        match self {
+            Node::Leaf(leaf) => {
+                let data = bincode::encode_to_vec(
+                    (leaf.key, leaf.value, leaf.merkle_hash),
+                    bincode::config::standard(),
+                )
+                .map_err(|e| format!("Failed to encode leaf: {}", e))?;
+                Ok(("leaf", data))
+            }
+            Node::Interior(interior) => {
+                let data = bincode::encode_to_vec(
+                    (
+                        interior.prefix,
+                        interior.merkle_hash,
+                        interior.left,
+                        interior.right,
+                    ),
+                    bincode::config::standard(),
+                )
+                .map_err(|e| format!("Failed to encode interior: {}", e))?;
+                Ok(("interior", data))
+            }
+        }
+    }
+
+    /// Deserialize a node from its database representation.
+    pub fn deserialize(node_type: &str, node_data: &[u8]) -> Result<Self, String> {
+        match node_type {
+            "leaf" => {
+                let decoded: (Hash, Hash, Hash) =
+                    bincode::decode_from_slice(node_data, bincode::config::standard())
+                        .map(|(v, _)| v)
+                        .map_err(|e| format!("Failed to decode leaf: {}", e))?;
+                Ok(Node::Leaf(LeafNode {
+                    key: decoded.0,
+                    value: decoded.1,
+                    merkle_hash: decoded.2,
+                }))
+            }
+            "interior" => {
+                let decoded: (Prefix, Hash, Prefix, Prefix) =
+                    bincode::decode_from_slice(node_data, bincode::config::standard())
+                        .map(|(v, _)| v)
+                        .map_err(|e| format!("Failed to decode interior: {}", e))?;
+                Ok(Node::Interior(InteriorNode {
+                    prefix: decoded.0,
+                    merkle_hash: decoded.1,
+                    left: decoded.2,
+                    right: decoded.3,
+                }))
+            }
+            _ => Err(format!("Unknown node type: {}", node_type)),
         }
     }
 }
