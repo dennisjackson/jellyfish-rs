@@ -1,4 +1,4 @@
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use rusqlite::{Connection, Result as SqliteResult, params};
 use std::sync::{Arc, Mutex};
 
@@ -14,7 +14,7 @@ pub struct Cache {
     /// SQLite database connection for persistent storage
     db: Arc<Mutex<Connection>>,
     /// Tracks keys that have been modified and need to be written to disk
-    dirty: Arc<DashMap<Prefix, ()>>,
+    dirty: Arc<DashSet<Prefix>>,
 }
 
 impl Cache {
@@ -56,7 +56,7 @@ impl Cache {
         Self {
             map: Arc::new(DashMap::new()),
             db,
-            dirty: Arc::new(DashMap::new()),
+            dirty: Arc::new(DashSet::new()),
         }
     }
 
@@ -70,7 +70,7 @@ impl Cache {
     /// Automatically marks the key as dirty for later flushing.
     pub fn set(&self, key: Prefix, value: Node) {
         self.map.insert(key, value);
-        self.dirty.insert(key, ());
+        self.dirty.insert(key);
     }
 
     /// Get the number of entries currently in the cache.
@@ -145,7 +145,7 @@ impl Cache {
     /// Flush all dirty (modified) keys to the database.
     /// After successful flush, clears the dirty tracking.
     pub fn flush(&self) -> SqliteResult<()> {
-        let dirty_keys: Vec<Prefix> = self.dirty.iter().map(|entry| *entry.key()).collect();
+        let dirty_keys: Vec<Prefix> = self.dirty.iter().map(|entry| *entry).collect();
 
         if dirty_keys.is_empty() {
             return Ok(());
