@@ -1,5 +1,4 @@
 use log::info;
-use rayon::prelude::*;
 use rusqlite::{Connection, Result as SqliteResult};
 use std::sync::{Arc, Mutex};
 
@@ -117,7 +116,7 @@ impl DurableBatchMPT {
             return current_prefix;
         }
 
-        let node = self.cache.get(&current_prefix).map(|n| n.clone());
+        let node = self.cache.get(&current_prefix);
         let Some(node) = node else {
             // Empty tree: insert all entries
             return self.batch_insert_into_empty(entries);
