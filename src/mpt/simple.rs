@@ -1,6 +1,7 @@
 use log::{debug, info};
 use std::collections::HashMap;
 
+use crate::mpt::MerklePatriciaTree;
 use crate::prefix::HashExt;
 use crate::{Hash, Prefix};
 
@@ -195,5 +196,31 @@ impl SimpleMPT {
             }
         }
         self.store.insert(prefix, node);
+    }
+}
+
+impl MerklePatriciaTree for SimpleMPT {
+    fn new() -> Self {
+        Self::new()
+    }
+
+    fn upsert(&mut self, key: Hash, value: Hash) {
+        self.upsert(key, value);
+    }
+
+    fn enumerate_nodes(&self) -> Vec<(Prefix, Node)> {
+        self.store.iter().map(|(k, v)| (*k, v.clone())).collect()
+    }
+
+    fn get_root_hash(&self) -> Option<Hash> {
+        self.store.get(&self.root).map(|n| n.merkle_hash())
+    }
+
+    fn get_leaf_value(&self, key: Hash) -> Option<Hash> {
+        let prefix = Prefix::from(key);
+        match self.store.get(&prefix) {
+            Some(Node::Leaf(leaf)) if leaf.key == key => Some(leaf.value),
+            _ => None,
+        }
     }
 }

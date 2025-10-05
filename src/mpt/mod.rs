@@ -80,5 +80,13 @@ impl Node {
     }
 }
 
+pub trait MerklePatriciaTree {
+    fn new() -> Self;
+    fn upsert(&mut self, key: Hash, value: Hash);
+    fn enumerate_nodes(&self) -> Vec<(Prefix, Node)>;
+    fn get_root_hash(&self) -> Option<Hash>;
+    fn get_leaf_value(&self, key: Hash) -> Option<Hash>;
+}
+
 #[cfg(test)]
 mod tests;
