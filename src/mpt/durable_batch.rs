@@ -2,7 +2,6 @@ use dashmap::DashMap;
 use log::info;
 use rayon::prelude::*;
 use rusqlite::{Connection, Result as SqliteResult, params};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::mpt::MerklePatriciaTree;
@@ -23,8 +22,6 @@ pub struct DurableBatchMPT {
     dirty: Arc<DashMap<Prefix, ()>>,
     root: Prefix,
     tree_size: Arc<Mutex<usize>>,
-    /// Counter for SQLite queries (reads and writes)
-    sqlite_query_count: Arc<AtomicUsize>,
 }
 
 impl DurableBatchMPT {
@@ -74,7 +71,6 @@ impl DurableBatchMPT {
             dirty: Arc::new(DashMap::new()),
             root: Prefix::root(),
             tree_size: Arc::new(Mutex::new(tree_size)),
-            sqlite_query_count: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -83,242 +79,12 @@ impl DurableBatchMPT {
         Self::new_with_path(":memory:")
     }
 
-    /// Calculate the depth of common prefix levels we should preload.
-    /// This determines how many levels from the root are likely to be shared
-    /// by multiple keys in the batch, making them worth preloading.
-    fn calculate_preload_depth(&self, keys: &[Hash]) -> usize {
-        if keys.is_empty() {
-            return 0;
-        }
-
-        let size = *self.tree_size.lock().unwrap();
-        if size == 0 {
-            return 0;
-        }
-
-        // Calculate the approximate depth of the tree
-        let tree_depth = (size as f64).log2() as usize;
-
-        // For small batches, preload conservatively
-        // For large batches, preload more aggressively
-        let batch_size = keys.len();
-
-        if batch_size == 1 {
-            // Single insert: preload minimal depth
-            return tree_depth.min(3);
-        } else if batch_size < 10 {
-            // Small batch: preload top few levels
-            return tree_depth.min(5);
-        } else if batch_size < 100 {
-            // Medium batch: preload more levels
-            return tree_depth.min(8);
-        } else {
-            // Large batch: preload significant portion of tree
-            // but leave room for the deeper levels
-            if tree_depth <= 5 {
-                tree_depth
-            } else {
-                tree_depth - 2
-            }
-        }
-    }
-
-    /// Bulk load multiple nodes from the database in a single query.
-    /// Returns a map of prefix -> node for all found nodes.
-    fn bulk_load_nodes(&self, prefixes: &[Prefix]) -> std::collections::HashMap<Prefix, Node> {
-        if prefixes.is_empty() {
-            return std::collections::HashMap::new();
-        }
-
-        // Track this as a SQLite query
-        self.sqlite_query_count.fetch_add(1, Ordering::Relaxed);
-
-        let db = self.db.lock().unwrap();
-
-        // Build a query with multiple OR conditions
-        // For better performance with large sets, we use a temporary table approach
-        let tx = db.unchecked_transaction().unwrap();
-
-        // Create temporary table for the prefixes we want to load
-        tx.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS temp_prefixes (
-                prefix_hash BLOB NOT NULL,
-                prefix_length INTEGER NOT NULL
-            )",
-            [],
-        )
-        .unwrap();
-
-        // Clear any previous data
-        tx.execute("DELETE FROM temp_prefixes", []).unwrap();
-
-        // Insert all prefixes we want to load
-        {
-            let mut stmt = tx
-                .prepare("INSERT INTO temp_prefixes (prefix_hash, prefix_length) VALUES (?1, ?2)")
-                .unwrap();
-            for prefix in prefixes {
-                stmt.execute(params![&prefix.hash[..], prefix.length])
-                    .unwrap();
-            }
-        }
-
-        // Now do a single JOIN query to get all matching nodes
-        let results = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT n.prefix_hash, n.prefix_length, n.node_type, n.node_data
-                 FROM nodes n
-                 INNER JOIN temp_prefixes t
-                 ON n.prefix_hash = t.prefix_hash AND n.prefix_length = t.prefix_length",
-                )
-                .unwrap();
-
-            stmt.query_map([], |row| {
-                let prefix_hash: Vec<u8> = row.get(0)?;
-                let prefix_length: u16 = row.get::<_, i64>(1)? as u16;
-                let node_type: String = row.get(2)?;
-                let node_data: Vec<u8> = row.get(3)?;
-
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&prefix_hash);
-                let prefix = Prefix {
-                    hash,
-                    length: prefix_length,
-                };
-
-                let node = match node_type.as_str() {
-                    "leaf" => {
-                        let decoded: (Hash, Hash, Hash) =
-                            bincode::decode_from_slice(&node_data, bincode::config::standard())
-                                .map(|(v, _)| v)
-                                .map_err(|_| rusqlite::Error::InvalidQuery)?;
-                        Node::Leaf(LeafNode {
-                            key: decoded.0,
-                            value: decoded.1,
-                            merkle_hash: decoded.2,
-                        })
-                    }
-                    "interior" => {
-                        let decoded: (Prefix, Hash, Prefix, Prefix) =
-                            bincode::decode_from_slice(&node_data, bincode::config::standard())
-                                .map(|(v, _)| v)
-                                .map_err(|_| rusqlite::Error::InvalidQuery)?;
-                        Node::Interior(InteriorNode {
-                            prefix: decoded.0,
-                            merkle_hash: decoded.1,
-                            left: decoded.2,
-                            right: decoded.3,
-                        })
-                    }
-                    _ => return Err(rusqlite::Error::InvalidQuery),
-                };
-
-                Ok((prefix, node))
-            })
-            .unwrap()
-            .collect::<Result<std::collections::HashMap<_, _>, _>>()
-            .unwrap()
-        };
-
-        tx.commit().unwrap();
-
-        results
-    }
-
-    /// Preload nodes along the paths to the keys being inserted.
-    /// This uses a smart strategy: start from the root and fan out level by level,
-    /// but only follow paths that lead to keys we're actually inserting.
-    /// Uses bulk loading to minimize database round-trips.
-    fn preload_paths_for_keys(&self, keys: &[Hash]) {
-        if keys.is_empty() {
-            return;
-        }
-
-        let depth = self.calculate_preload_depth(keys);
-        if depth == 0 {
-            return;
-        }
-
-        info!("Preloading top {} levels for {} keys", depth, keys.len());
-
-        // Build a set of all keys for quick lookup
-        let key_set: std::collections::HashSet<Hash> = keys.iter().copied().collect();
-
-        let mut current_level = vec![self.root];
-
-        for level in 0..depth {
-            // Collect all prefixes we need to load at this level
-            let prefixes_to_load: Vec<Prefix> = current_level
-                .iter()
-                .filter(|p| !self.cache.contains_key(p))
-                .copied()
-                .collect();
-
-            // Bulk load all nodes for this level
-            if !prefixes_to_load.is_empty() {
-                let loaded_nodes = self.bulk_load_nodes(&prefixes_to_load);
-
-                // Insert all loaded nodes into cache
-                for (prefix, node) in loaded_nodes {
-                    self.cache.insert(prefix, node);
-                }
-            }
-
-            // Now determine which children to explore for the next level
-            let mut next_level = Vec::new();
-
-            for prefix in current_level {
-                if let Some(node) = self.cache.get(&prefix) {
-                    if let Node::Interior(interior) = node.value() {
-                        // Check if any of our keys would go down the left path
-                        let mut has_left_key = false;
-                        let mut has_right_key = false;
-
-                        for key in &key_set {
-                            if interior.prefix.contains(key) {
-                                if interior.prefix.key_goes_right(*key) {
-                                    has_right_key = true;
-                                } else {
-                                    has_left_key = true;
-                                }
-                            }
-                        }
-
-                        // Only preload children if we have keys going that way
-                        if has_left_key {
-                            next_level.push(interior.left);
-                        }
-                        if has_right_key {
-                            next_level.push(interior.right);
-                        }
-                    }
-                }
-            }
-
-            if next_level.is_empty() {
-                info!(
-                    "Preloading stopped at level {} (no more paths to keys)",
-                    level
-                );
-                break;
-            }
-
-            current_level = next_level;
-        }
-
-        info!("Preloaded {} nodes into cache", self.cache.len());
-    }
-
     /// Load a node from SQLite into the cache if not already present.
     fn load_node(&self, prefix: &Prefix) -> Option<Node> {
         // Check cache first
         if let Some(node) = self.cache.get(prefix) {
             return Some(node.clone());
         }
-
-        // Track this as a SQLite query
-        self.sqlite_query_count.fetch_add(1, Ordering::Relaxed);
 
         // Load from database
         let db = self.db.lock().unwrap();
@@ -409,9 +175,6 @@ impl DurableBatchMPT {
 
     /// Write all dirty nodes back to SQLite.
     fn flush_to_disk(&self) -> SqliteResult<()> {
-        // Track this as a SQLite query (write operation)
-        self.sqlite_query_count.fetch_add(1, Ordering::Relaxed);
-
         let db = self.db.lock().unwrap();
 
         let tx = db.unchecked_transaction()?;
@@ -513,14 +276,7 @@ impl DurableBatchMPT {
         // Remove duplicates, keeping the last occurrence (latest value)
         entries_vec.dedup_by_key(|(k, _)| *k);
 
-        // Extract keys for preloading
-        let keys: Vec<Hash> = entries_vec.iter().map(|(k, _)| *k).collect();
-
-        // Preload only the nodes we'll need based on the keys being inserted
-        self.preload_paths_for_keys(&keys);
-
-        // Load remaining paths for all keys to ensure necessary nodes are in cache
-        // This will be faster now since the top levels are already cached
+        // Load paths for all keys to ensure necessary nodes are in cache
         entries_vec.par_iter().for_each(|(key, _)| {
             self.load_path_to_key(*key);
         });
@@ -749,16 +505,6 @@ impl DurableBatchMPT {
     pub fn cache_stats(&self) -> (usize, usize) {
         (self.cache.len(), self.dirty.len())
     }
-
-    /// Get the number of SQLite queries performed since last reset.
-    pub fn sqlite_query_count(&self) -> usize {
-        self.sqlite_query_count.load(Ordering::Relaxed)
-    }
-
-    /// Reset the SQLite query counter.
-    pub fn reset_sqlite_query_count(&self) {
-        self.sqlite_query_count.store(0, Ordering::Relaxed);
-    }
 }
 
 impl MerklePatriciaTree for DurableBatchMPT {
@@ -771,9 +517,6 @@ impl MerklePatriciaTree for DurableBatchMPT {
     }
 
     fn enumerate_nodes(&self) -> Vec<(Prefix, Node)> {
-        // Track this as a SQLite query
-        self.sqlite_query_count.fetch_add(1, Ordering::Relaxed);
-
         // For durable implementation, we need to load all nodes from database
         let db = self.db.lock().unwrap();
         let mut stmt = db
@@ -905,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn test_preload_optimization() {
+    fn test_batch_upsert_with_cache_clearing() {
         let mut mpt = DurableBatchMPT::new_in_memory().unwrap();
 
         // Insert enough entries to create a tree with multiple levels
@@ -929,30 +672,14 @@ mod tests {
         assert!(tree_size > 0);
         assert_eq!(tree_size, mpt.cache.len());
 
-        // Clear cache to test selective preloading
-        let cache_size_before_clear = mpt.cache.len();
+        // Clear cache to test loading from disk
         mpt.clear_cache();
         assert_eq!(mpt.cache.len(), 0);
 
         // Perform a small batch upsert with just a few keys
-        // This should only preload paths relevant to these specific keys
         let new_entries: Vec<(Hash, Hash)> =
             vec![([200u8; 32], [250u8; 32]), ([201u8; 32], [251u8; 32])];
         mpt.batch_upsert(&new_entries);
-
-        // Verify that preloading was selective - we should have loaded far fewer
-        // nodes than the entire tree, but more than just the new entries
-        let cache_size_after_insert = mpt.cache.len();
-        assert!(
-            cache_size_after_insert > 2,
-            "Should have preloaded some interior nodes"
-        );
-        assert!(
-            cache_size_after_insert < cache_size_before_clear,
-            "Should have loaded fewer nodes than full tree (loaded: {}, full tree: {})",
-            cache_size_after_insert,
-            cache_size_before_clear
-        );
 
         // Verify all original values are still retrievable (from disk)
         for (key, value) in entries.iter() {
@@ -963,48 +690,5 @@ mod tests {
         for (key, value) in new_entries.iter() {
             assert_eq!(mpt.get_leaf_value(*key), Some(*value));
         }
-    }
-
-    #[test]
-    fn test_sqlite_query_tracking() {
-        let mut mpt = DurableBatchMPT::new_in_memory().unwrap();
-
-        // Reset counter to start fresh
-        mpt.reset_sqlite_query_count();
-        assert_eq!(mpt.sqlite_query_count(), 0);
-
-        // Insert some entries
-        let entries: Vec<(Hash, Hash)> = vec![
-            ([1u8; 32], [10u8; 32]),
-            ([2u8; 32], [20u8; 32]),
-            ([3u8; 32], [30u8; 32]),
-        ];
-
-        mpt.batch_upsert(&entries);
-
-        // Should have made some SQLite queries (for preloading and flushing)
-        let queries_after_insert = mpt.sqlite_query_count();
-        assert!(
-            queries_after_insert > 0,
-            "Should have made SQLite queries during insert"
-        );
-
-        // Clear cache and retrieve values (should trigger more queries)
-        mpt.clear_cache();
-        mpt.reset_sqlite_query_count();
-
-        for (key, _) in &entries {
-            let _ = mpt.get_leaf_value(*key);
-        }
-
-        let queries_after_get = mpt.sqlite_query_count();
-        assert!(
-            queries_after_get > 0,
-            "Should have made SQLite queries during get"
-        );
-
-        // Reset counter and verify it's zero
-        mpt.reset_sqlite_query_count();
-        assert_eq!(mpt.sqlite_query_count(), 0);
     }
 }
