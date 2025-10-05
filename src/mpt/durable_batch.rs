@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use log::info;
+use rayon::prelude::*;
 use rusqlite::{Connection, Result as SqliteResult, params};
 use std::sync::{Arc, Mutex};
 
@@ -241,9 +242,9 @@ impl DurableBatchMPT {
         info!("Batch upserting {} entries", entries.len());
 
         // Load paths for all keys to ensure necessary nodes are in cache
-        for (key, _) in entries.iter() {
+        entries.par_iter().for_each(|(key, _)| {
             self.load_path_to_key(*key);
-        }
+        });
 
         // Convert to sorted vector for efficient partitioning
         let mut entries_vec: Vec<(Hash, Hash)> = entries.to_vec();
@@ -263,11 +264,7 @@ impl DurableBatchMPT {
 
     /// Recursively batch upsert entries at the current node.
     /// Returns the prefix of the (possibly new) root of this subtree.
-    fn recursive_batch_upsert(
-        &mut self,
-        current_prefix: Prefix,
-        entries: Vec<(Hash, Hash)>,
-    ) -> Prefix {
+    fn recursive_batch_upsert(&self, current_prefix: Prefix, entries: Vec<(Hash, Hash)>) -> Prefix {
         if entries.is_empty() {
             return current_prefix;
         }
@@ -285,7 +282,7 @@ impl DurableBatchMPT {
     }
 
     /// Insert all entries into an empty tree.
-    fn batch_insert_into_empty(&mut self, mut entries: Vec<(Hash, Hash)>) -> Prefix {
+    fn batch_insert_into_empty(&self, mut entries: Vec<(Hash, Hash)>) -> Prefix {
         if entries.is_empty() {
             return Prefix::root();
         }
@@ -303,7 +300,7 @@ impl DurableBatchMPT {
     }
 
     /// Batch upsert at a leaf node.
-    fn batch_upsert_at_leaf(&mut self, leaf: LeafNode, mut entries: Vec<(Hash, Hash)>) -> Prefix {
+    fn batch_upsert_at_leaf(&self, leaf: LeafNode, mut entries: Vec<(Hash, Hash)>) -> Prefix {
         let leaf_prefix = Prefix::from(leaf.key);
 
         // Check if any entry updates this leaf (using binary search since entries are sorted)
@@ -365,7 +362,7 @@ impl DurableBatchMPT {
 
     /// Batch upsert at an interior node.
     fn batch_upsert_at_interior(
-        &mut self,
+        &self,
         interior: InteriorNode,
         entries: Vec<(Hash, Hash)>,
     ) -> Prefix {
@@ -426,20 +423,23 @@ impl DurableBatchMPT {
             }
         }
 
-        // Recursively process left and right subtrees
-        // Note: We can't use rayon::join here because &mut self is not thread-safe
-        // We process sequentially instead
-        let new_left = if !left_entries.is_empty() {
-            self.recursive_batch_upsert(interior.left, left_entries)
-        } else {
-            interior.left
-        };
-
-        let new_right = if !right_entries.is_empty() {
-            self.recursive_batch_upsert(interior.right, right_entries)
-        } else {
-            interior.right
-        };
+        // Recursively process left and right subtrees in parallel using rayon
+        let (new_left, new_right) = rayon::join(
+            || {
+                if !left_entries.is_empty() {
+                    self.recursive_batch_upsert(interior.left, left_entries)
+                } else {
+                    interior.left
+                }
+            },
+            || {
+                if !right_entries.is_empty() {
+                    self.recursive_batch_upsert(interior.right, right_entries)
+                } else {
+                    interior.right
+                }
+            },
+        );
 
         // Recalculate this interior node's hash based on updated children
         let left_hash = self.cache.get(&new_left).unwrap().merkle_hash();
