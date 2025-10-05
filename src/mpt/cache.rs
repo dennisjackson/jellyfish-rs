@@ -142,40 +142,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Write a batch of keys from the cache to SQLite.
-    /// Only keys that exist in the cache will be written.
-    /// Keys that don't exist in the cache will be skipped.
-    pub fn write_batch(&self, keys: &[Prefix]) -> SqliteResult<()> {
-        if keys.is_empty() {
-            return Ok(());
-        }
-
-        let db = self.db.lock().unwrap();
-        let tx = db.unchecked_transaction()?;
-
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO nodes (prefix_hash, prefix_length, node_type, node_data) VALUES (?1, ?2, ?3, ?4)"
-            )?;
-
-            for key in keys {
-                if let Some(node) = self.map.get(key) {
-                    let (node_type, node_data) = node
-                        .value()
-                        .serialize()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?;
-
-                    stmt.execute(params![&key.hash[..], key.length, node_type, node_data])?;
-                }
-                // Skip keys that aren't in the cache
-            }
-        }
-
-        tx.commit()?;
-
-        Ok(())
-    }
-
     /// Flush all dirty (modified) keys to the database.
     /// After successful flush, clears the dirty tracking.
     pub fn flush(&self) -> SqliteResult<()> {
@@ -310,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_batch_and_pre_advise() {
+    fn test_flush_and_pre_advise() {
         let db = create_test_db();
         let cache = Cache::new(Arc::clone(&db));
 
@@ -329,7 +295,7 @@ mod tests {
         cache.set(prefix2, Node::Leaf(leaf2));
 
         // Write to database
-        cache.write_batch(&[prefix1, prefix2]).unwrap();
+        cache.flush().unwrap();
 
         // Clear cache
         cache.clear();
@@ -363,7 +329,7 @@ mod tests {
 
         // Add to cache and write to DB
         cache.set(prefix, Node::Leaf(leaf));
-        cache.write_batch(&[prefix]).unwrap();
+        cache.flush().unwrap();
 
         // Pre-advise should not reload (already in cache)
         let initial_len = cache.len();
@@ -372,12 +338,12 @@ mod tests {
     }
 
     #[test]
-    fn test_write_batch_empty() {
+    fn test_flush_empty() {
         let db = create_test_db();
         let cache = Cache::new(db);
 
-        // Should not error on empty batch
-        cache.write_batch(&[]).unwrap();
+        // Should not error on empty flush
+        cache.flush().unwrap();
     }
 
     #[test]
