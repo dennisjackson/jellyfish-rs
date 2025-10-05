@@ -13,6 +13,7 @@ macro_rules! test_all_impls {
 
             // Add new implementations here as they're created
             test_impl::<SimpleMPT>();
+            test_impl::<BatchMPT>();
         }
     };
 }
@@ -311,4 +312,195 @@ test_all_impls!(test_merkle_hash_propagation, {
         hash_before, hash_after,
         "Root hash should change when leaf value changes"
     );
+});
+
+test_all_impls!(test_batch_upsert_empty, {
+    let mut mpt = T::new();
+    let entries: Vec<(Hash, Hash)> = vec![];
+
+    mpt.batch_upsert(&entries);
+
+    assert_eq!(count_nodes(&mpt), 0);
+    assert_eq!(mpt.get_root_hash(), None);
+});
+
+test_all_impls!(test_batch_upsert_single, {
+    let mut mpt = T::new();
+    let entries = vec![(create_hash(1), create_hash(101))];
+
+    mpt.batch_upsert(&entries);
+
+    assert_eq!(count_nodes(&mpt), 1);
+    assert_eq!(mpt.get_leaf_value(create_hash(1)), Some(create_hash(101)));
+});
+
+test_all_impls!(test_batch_upsert_multiple, {
+    let mut mpt = T::new();
+    let entries = vec![
+        (create_hash(1), create_hash(101)),
+        (create_hash(2), create_hash(102)),
+        (create_hash(3), create_hash(103)),
+    ];
+
+    mpt.batch_upsert(&entries);
+
+    assert_eq!(count_leaf_nodes(&mpt), 3);
+    assert_eq!(mpt.get_leaf_value(create_hash(1)), Some(create_hash(101)));
+    assert_eq!(mpt.get_leaf_value(create_hash(2)), Some(create_hash(102)));
+    assert_eq!(mpt.get_leaf_value(create_hash(3)), Some(create_hash(103)));
+});
+
+test_all_impls!(test_batch_upsert_vs_individual, {
+    // Verify that batch_upsert produces the same result as individual upserts
+    let entries: Vec<(Hash, Hash)> = (0..10)
+        .map(|i| (create_hash(i), create_hash(i + 100)))
+        .collect();
+
+    // Use batch_upsert
+    let mut mpt_batch = T::new();
+    mpt_batch.batch_upsert(&entries);
+
+    // Use individual upserts
+    let mut mpt_individual = T::new();
+    for (key, value) in &entries {
+        mpt_individual.upsert(*key, *value);
+    }
+
+    // Should produce the same root hash
+    assert_eq!(
+        mpt_batch.get_root_hash(),
+        mpt_individual.get_root_hash(),
+        "Batch and individual upserts should produce same hash"
+    );
+
+    // All values should be retrievable
+    for (key, value) in &entries {
+        assert_eq!(mpt_batch.get_leaf_value(*key), Some(*value));
+        assert_eq!(mpt_individual.get_leaf_value(*key), Some(*value));
+    }
+});
+
+test_all_impls!(test_batch_upsert_with_updates, {
+    let mut mpt = T::new();
+
+    // Initial batch insert
+    let initial_entries = vec![
+        (create_hash(1), create_hash(101)),
+        (create_hash(2), create_hash(102)),
+        (create_hash(3), create_hash(103)),
+    ];
+    mpt.batch_upsert(&initial_entries);
+
+    let hash_before = mpt.get_root_hash();
+
+    // Batch update with some new keys and some existing keys
+    let update_entries = vec![
+        (create_hash(1), create_hash(201)), // Update existing
+        (create_hash(3), create_hash(203)), // Update existing
+        (create_hash(4), create_hash(104)), // New key
+        (create_hash(5), create_hash(105)), // New key
+    ];
+    mpt.batch_upsert(&update_entries);
+
+    let hash_after = mpt.get_root_hash();
+
+    // Hash should change
+    assert_ne!(hash_before, hash_after);
+
+    // Should have 5 leaf nodes total
+    assert_eq!(count_leaf_nodes(&mpt), 5);
+
+    // Verify all values
+    assert_eq!(mpt.get_leaf_value(create_hash(1)), Some(create_hash(201)));
+    assert_eq!(mpt.get_leaf_value(create_hash(2)), Some(create_hash(102)));
+    assert_eq!(mpt.get_leaf_value(create_hash(3)), Some(create_hash(203)));
+    assert_eq!(mpt.get_leaf_value(create_hash(4)), Some(create_hash(104)));
+    assert_eq!(mpt.get_leaf_value(create_hash(5)), Some(create_hash(105)));
+});
+
+test_all_impls!(test_batch_upsert_larger_set, {
+    let mut mpt = T::new();
+    let entries: Vec<(Hash, Hash)> = (0..50)
+        .map(|i| (create_hash(i), create_hash(i + 100)))
+        .collect();
+
+    mpt.batch_upsert(&entries);
+
+    // Should have exactly 50 leaf nodes
+    assert_eq!(count_leaf_nodes(&mpt), 50);
+
+    // Tree structure should be consistent
+    assert!(
+        verify_interior_node_structure(&mpt),
+        "All interior nodes should have valid children"
+    );
+
+    // All values should be retrievable
+    for i in 0..50 {
+        assert_eq!(
+            mpt.get_leaf_value(create_hash(i)),
+            Some(create_hash(i + 100))
+        );
+    }
+});
+
+test_all_impls!(test_batch_upsert_duplicate_keys_in_batch, {
+    // Test that if the same key appears multiple times in a batch,
+    // the last value wins
+    let mut mpt = T::new();
+    let entries = vec![
+        (create_hash(1), create_hash(101)),
+        (create_hash(1), create_hash(201)), // Duplicate key
+        (create_hash(2), create_hash(102)),
+        (create_hash(1), create_hash(111)), // Another duplicate
+    ];
+
+    mpt.batch_upsert(&entries);
+
+    // The last value for key 1 should be retained (HashMap behavior)
+    // Either way, there should be only 2 leaf nodes
+    assert_eq!(count_leaf_nodes(&mpt), 2);
+
+    // Key 1 should have one of the values (HashMap will keep the last insert)
+    let value = mpt.get_leaf_value(create_hash(1));
+    assert!(value.is_some());
+
+    // Key 2 should have its value
+    assert_eq!(mpt.get_leaf_value(create_hash(2)), Some(create_hash(102)));
+});
+
+test_all_impls!(test_batch_upsert_incremental, {
+    // Test that multiple batch upserts work correctly
+    let mut mpt = T::new();
+
+    // First batch
+    let batch1 = vec![
+        (create_hash(1), create_hash(101)),
+        (create_hash(2), create_hash(102)),
+    ];
+    mpt.batch_upsert(&batch1);
+    assert_eq!(count_leaf_nodes(&mpt), 2);
+
+    // Second batch
+    let batch2 = vec![
+        (create_hash(3), create_hash(103)),
+        (create_hash(4), create_hash(104)),
+    ];
+    mpt.batch_upsert(&batch2);
+    assert_eq!(count_leaf_nodes(&mpt), 4);
+
+    // Third batch with updates
+    let batch3 = vec![
+        (create_hash(1), create_hash(201)),
+        (create_hash(5), create_hash(105)),
+    ];
+    mpt.batch_upsert(&batch3);
+    assert_eq!(count_leaf_nodes(&mpt), 5);
+
+    // Verify final values
+    assert_eq!(mpt.get_leaf_value(create_hash(1)), Some(create_hash(201)));
+    assert_eq!(mpt.get_leaf_value(create_hash(2)), Some(create_hash(102)));
+    assert_eq!(mpt.get_leaf_value(create_hash(3)), Some(create_hash(103)));
+    assert_eq!(mpt.get_leaf_value(create_hash(4)), Some(create_hash(104)));
+    assert_eq!(mpt.get_leaf_value(create_hash(5)), Some(create_hash(105)));
 });

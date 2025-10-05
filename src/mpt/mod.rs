@@ -5,6 +5,9 @@ use crate::{Hash, Prefix};
 mod simple;
 pub use simple::SimpleMPT;
 
+mod batch;
+pub use batch::BatchMPT;
+
 #[derive(Clone)]
 pub struct LeafNode {
     pub key: Hash,
