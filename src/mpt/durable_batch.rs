@@ -24,6 +24,23 @@ impl DurableBatchMPT {
     /// Create a new durable MPT with the given SQLite database path.
     pub fn new_with_path(db_path: &str) -> SqliteResult<Self> {
         let conn = Connection::open(db_path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Configure SQLite for durability and robustness
+        // WAL mode provides better concurrency and crash resilience
+        // conn.execute("PRAGMA journal_mode = WAL", [])?;
+
+        // FULL synchronous mode ensures all data is written to disk before commit returns
+        // This guarantees durability even in case of power failure or OS crash
+        conn.execute("PRAGMA synchronous = FULL", [])?;
+
+        // Enable foreign key constraints for referential integrity
+        // conn.execute("PRAGMA foreign_keys = ON", [])?;
+
+        // Set a reasonable busy timeout (5 seconds) for handling concurrent access
+        // conn.execute("PRAGMA busy_timeout = 5000", [])?;
+
+        // Enable auto_vacuum to reclaim disk space when data is deleted
+        // conn.execute("PRAGMA auto_vacuum = INCREMENTAL", [])?;
 
         // Initialize database schema
         Cache::initialize_database(&conn)?;

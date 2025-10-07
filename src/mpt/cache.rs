@@ -15,6 +15,8 @@ pub struct Cache {
     db: Arc<Mutex<Connection>>,
     /// Tracks keys that have been modified and need to be written to disk
     dirty: Arc<DashSet<Prefix>>,
+    /// Tracks whether we're currently in an active transaction
+    in_transaction: Arc<Mutex<bool>>,
 }
 
 impl Cache {
@@ -57,6 +59,7 @@ impl Cache {
             map: Arc::new(DashMap::new()),
             db,
             dirty: Arc::new(DashSet::new()),
+            in_transaction: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -103,11 +106,20 @@ impl Cache {
         self.map.retain(|key, _| needed_keys.contains(key));
     }
 
-    /// Pre-advise: Load all nodes from SQLite into the cache.
+    /// Pre-advise: Load all nodes from SQLite into the cache and begin a durable transaction.
     /// This ignores the keys parameter and loads all nodes from the database.
     /// Nodes that are already in the cache will not be reloaded.
+    /// The transaction will remain active until flush() is called.
     pub fn pre_advise(&self, _keys: &[Prefix]) -> SqliteResult<()> {
         let db = self.db.lock().unwrap();
+
+        // Begin a durable transaction
+        let mut in_tx = self.in_transaction.lock().unwrap();
+        if !*in_tx {
+            db.execute("BEGIN DEFERRED TRANSACTION", [])?;
+            *in_tx = true;
+        }
+        drop(in_tx); // Release lock before querying
 
         let mut stmt =
             db.prepare("SELECT prefix_hash, prefix_length, node_type, node_data FROM nodes")?;
@@ -143,20 +155,37 @@ impl Cache {
     }
 
     /// Flush all dirty (modified) keys to the database.
+    /// If a transaction was started by pre_advise, it will be committed.
+    /// Otherwise, creates a new transaction for this flush operation.
     /// After successful flush, clears the dirty tracking.
     pub fn flush(&self) -> SqliteResult<()> {
         let dirty_keys: Vec<Prefix> = self.dirty.iter().map(|entry| *entry).collect();
 
         if dirty_keys.is_empty() {
+            // Even if no dirty keys, commit the transaction if one is active
+            let mut in_tx = self.in_transaction.lock().unwrap();
+            if *in_tx {
+                let db = self.db.lock().unwrap();
+                db.execute("COMMIT", [])?;
+                *in_tx = false;
+            }
             return Ok(());
         }
 
         let db = self.db.lock().unwrap();
-        let tx = db.unchecked_transaction()?;
+        let mut in_tx = self.in_transaction.lock().unwrap();
+
+        // If not in a transaction, start one for this flush
+        let needs_commit = if !*in_tx {
+            db.execute("BEGIN DEFERRED TRANSACTION", [])?;
+            true
+        } else {
+            true
+        };
 
         // Write all dirty nodes
         {
-            let mut stmt = tx.prepare(
+            let mut stmt = db.prepare(
                 "INSERT OR REPLACE INTO nodes (prefix_hash, prefix_length, node_type, node_data) VALUES (?1, ?2, ?3, ?4)"
             )?;
 
@@ -172,7 +201,11 @@ impl Cache {
             }
         }
 
-        tx.commit()?;
+        // Commit the transaction
+        if needs_commit {
+            db.execute("COMMIT", [])?;
+            *in_tx = false;
+        }
 
         // Clear dirty tracking after successful flush
         self.dirty.clear();
