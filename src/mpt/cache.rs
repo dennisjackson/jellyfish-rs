@@ -1,6 +1,6 @@
 use dashmap::{DashMap, DashSet};
 use rusqlite::{Connection, Result as SqliteResult, params};
-use std::sync::{Arc, Mutex};
+use std::{collections::HashSet, sync::{Arc, Mutex}};
 
 use super::Node;
 use crate::Prefix;
@@ -106,10 +106,10 @@ impl Cache {
         self.map.retain(|key, _| needed_keys.contains(key));
     }
 
-    /// Pre-advise: Load all nodes from SQLite into the cache and begin a durable transaction.
-    /// This ignores the keys parameter and loads all nodes from the database.
+    /// Pre-advise: Load nodes from SQLite that are needed for the given keys.
+    /// This loads all nodes on the path from root to the needed keys, plus their siblings.
     /// Nodes that are already in the cache will not be reloaded.
-    /// The transaction will remain active until flush() is called.
+    /// Begins a durable transaction that will remain active until flush() is called.
     pub fn pre_advise(&self, _keys: &[Prefix]) -> SqliteResult<()> {
         let db = self.db.lock().unwrap();
 
@@ -121,33 +121,128 @@ impl Cache {
         }
         drop(in_tx); // Release lock before querying
 
-        let mut stmt =
-            db.prepare("SELECT prefix_hash, prefix_length, node_type, node_data FROM nodes")?;
+        let mut needed_keys: HashSet<Prefix> = _keys.iter().cloned().collect();
+        let mut current_frontier = vec![Prefix::root()];
 
-        let nodes = stmt.query_map([], |row| {
-            let prefix_hash: Vec<u8> = row.get(0)?;
-            let prefix_length: u16 = row.get::<_, i64>(1)? as u16;
-            let node_type: String = row.get(2)?;
-            let node_data: Vec<u8> = row.get(3)?;
+        while !needed_keys.is_empty() && !current_frontier.is_empty() {
+            let mut next_frontier = Vec::new();
+            let mut siblings_to_load = Vec::new();
 
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&prefix_hash);
-            let prefix = Prefix {
-                hash,
-                length: prefix_length,
-            };
+            // Process each node in the current frontier
+            for prefix in &current_frontier {
+                // Skip if already in cache
+                if self.map.contains_key(prefix) {
+                    continue;
+                }
 
-            let node = Node::deserialize(&node_type, &node_data)
-                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                // Query the database for this node
+                let node_opt: Option<Node> = db
+                    .query_row(
+                        "SELECT node_type, node_data FROM nodes WHERE prefix_hash = ?1 AND prefix_length = ?2",
+                        params![&prefix.hash[..], prefix.length],
+                        |row| {
+                            let node_type: String = row.get(0)?;
+                            let node_data: Vec<u8> = row.get(1)?;
+                            Node::deserialize(&node_type, &node_data)
+                                .map_err(|_| rusqlite::Error::InvalidQuery)
+                        },
+                    )
+                    .ok();
 
-            Ok((prefix, node))
-        })?;
+                if let Some(node) = node_opt {
+                    // Insert into cache (but don't mark as dirty since it's from DB)
+                    self.map.insert(*prefix, node.clone());
 
-        for result in nodes {
-            let (prefix, node) = result?;
-            // Skip if already in cache
-            if !self.map.contains_key(&prefix) {
-                self.map.insert(prefix, node);
+                    match node {
+                        Node::Leaf(_) => {
+                            // If this is one of the needed keys, remove it
+                            needed_keys.remove(prefix);
+                        }
+                        Node::Interior(interior) => {
+                            // Determine which children are on-path to needed keys
+                            let mut left_needed = false;
+                            let mut right_needed = false;
+
+                            for needed_key in &needed_keys {
+                                if interior.prefix.prefix_of(needed_key) {
+                                    // Determine if needed_key goes left or right
+                                    if interior.prefix.key_goes_right(needed_key.hash) {
+                                        right_needed = true;
+                                    } else {
+                                        left_needed = true;
+                                    }
+                                }
+                            }
+
+                            // Add on-path children to next frontier and siblings to load list
+                            if left_needed {
+                                next_frontier.push(interior.left);
+                                // Sibling (right) should be loaded but not expanded
+                                if !next_frontier.contains(&interior.right) {
+                                    siblings_to_load.push(interior.right);
+                                }
+                            }
+                            if right_needed {
+                                next_frontier.push(interior.right);
+                                // Sibling (left) should be loaded but not expanded (if not already in frontier)
+                                if !left_needed && !siblings_to_load.contains(&interior.left) {
+                                    siblings_to_load.push(interior.left);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Load siblings but don't add to frontier
+            for sibling_prefix in siblings_to_load {
+                if self.map.contains_key(&sibling_prefix) {
+                    continue;
+                }
+
+                let node_opt: Option<Node> = db
+                    .query_row(
+                        "SELECT node_type, node_data FROM nodes WHERE prefix_hash = ?1 AND prefix_length = ?2",
+                        params![&sibling_prefix.hash[..], sibling_prefix.length],
+                        |row| {
+                            let node_type: String = row.get(0)?;
+                            let node_data: Vec<u8> = row.get(1)?;
+                            Node::deserialize(&node_type, &node_data)
+                                .map_err(|_| rusqlite::Error::InvalidQuery)
+                        },
+                    )
+                    .ok();
+
+                if let Some(node) = node_opt {
+                    self.map.insert(sibling_prefix, node);
+                }
+            }
+
+            current_frontier = next_frontier;
+        }
+
+        // After traversal, directly load any remaining needed keys that weren't found
+        // This handles cases where nodes exist in the database but aren't reachable from root
+        for needed_key in &needed_keys {
+            if self.map.contains_key(needed_key) {
+                continue;
+            }
+
+            let node_opt: Option<Node> = db
+                .query_row(
+                    "SELECT node_type, node_data FROM nodes WHERE prefix_hash = ?1 AND prefix_length = ?2",
+                    params![&needed_key.hash[..], needed_key.length],
+                    |row| {
+                        let node_type: String = row.get(0)?;
+                        let node_data: Vec<u8> = row.get(1)?;
+                        Node::deserialize(&node_type, &node_data)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)
+                    },
+                )
+                .ok();
+
+            if let Some(node) = node_opt {
+                self.map.insert(*needed_key, node);
             }
         }
 
@@ -601,7 +696,7 @@ mod tests {
         // Generate 1000 unique leaf nodes with deterministic but varied keys
         let num_nodes = 1000;
         let mut prefixes = Vec::new();
-        
+
         for i in 0..num_nodes {
             // Create unique keys by hashing the index
             let mut hasher = Sha256::new();
@@ -609,11 +704,11 @@ mod tests {
             let hash = hasher.finalize();
             let mut key = [0u8; 32];
             key.copy_from_slice(&hash);
-            
+
             let value = [(i % 256) as u8; 32];
             let prefix = Prefix::from(key);
             let leaf = LeafNode::new(key, value);
-            
+
             cache.set(prefix, Node::Leaf(leaf));
             prefixes.push(prefix);
         }
