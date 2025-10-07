@@ -189,12 +189,60 @@ fn benchmark_durable_incremental_on_large_tree(c: &mut Criterion) {
     });
     group.finish();
 }
+
+fn benchmark_batch_sizes_100k(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batch_sizes_100k_nodes");
+    group.sample_size(10);
+
+    // Generate all 100,000 nodes once
+    let all_data = generate_test_data(100_000);
+
+    // Configure throughput to report insertions per second
+    group.throughput(Throughput::Elements(100_000));
+
+    // Benchmark with batch size 500
+    group.bench_function("batch_size_500", |b| {
+        b.iter(|| {
+            let mut tree = DurableBatchMPT::new();
+            for chunk in all_data.chunks(500) {
+                tree.batch_upsert(black_box(chunk));
+            }
+            tree
+        });
+    });
+
+    // Benchmark with batch size 1000
+    group.bench_function("batch_size_1000", |b| {
+        b.iter(|| {
+            let mut tree = DurableBatchMPT::new();
+            for chunk in all_data.chunks(1000) {
+                tree.batch_upsert(black_box(chunk));
+            }
+            tree
+        });
+    });
+
+    // Benchmark with batch size 10,000
+    group.bench_function("batch_size_10000", |b| {
+        b.iter(|| {
+            let mut tree = DurableBatchMPT::new();
+            for chunk in all_data.chunks(10_000) {
+                tree.batch_upsert(black_box(chunk));
+            }
+            tree
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     benchmark_fresh_1000,
     benchmark_fresh_10_000,
     benchmark_incremental_on_large_tree,
     benchmark_durable_incremental_on_large_tree,
+    benchmark_batch_sizes_100k,
 );
 
 criterion_main!(benches);
