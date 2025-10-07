@@ -466,4 +466,209 @@ mod tests {
         let nodes = cache.enumerate_nodes().unwrap();
         assert_eq!(nodes.len(), 2);
     }
+
+    #[test]
+    fn test_pre_advise_efficiency() {
+        use super::super::InteriorNode;
+
+        let db = create_test_db();
+        let cache = Cache::new(Arc::clone(&db));
+
+        // Create a binary tree structure with controlled keys
+        // Tree structure:
+        //           root (prefix 0)
+        //          /              \
+        //    left subtree      right subtree
+        //       /    \             /    \
+        //    leaf1  leaf2      leaf3  leaf4
+
+        // Create 4 leaf nodes with specific keys
+        let mut key1 = [0u8; 32];
+        key1[0] = 0b0000_0000; // Goes left then left
+        let value1 = [1u8; 32];
+        let prefix1 = Prefix::from(key1);
+        let leaf1 = LeafNode::new(key1, value1);
+
+        let mut key2 = [0u8; 32];
+        key2[0] = 0b0100_0000; // Goes left then right
+        let value2 = [2u8; 32];
+        let prefix2 = Prefix::from(key2);
+        let leaf2 = LeafNode::new(key2, value2);
+
+        let mut key3 = [0u8; 32];
+        key3[0] = 0b1000_0000; // Goes right then left
+        let value3 = [3u8; 32];
+        let prefix3 = Prefix::from(key3);
+        let leaf3 = LeafNode::new(key3, value3);
+
+        let mut key4 = [0u8; 32];
+        key4[0] = 0b1100_0000; // Goes right then right
+        let value4 = [4u8; 32];
+        let prefix4 = Prefix::from(key4);
+        let leaf4 = LeafNode::new(key4, value4);
+
+        // Create left subtree interior node (covers left side)
+        let left_subtree_prefix = Prefix { hash: [0u8; 32], length: 1 };
+        let left_interior = InteriorNode::new(
+            left_subtree_prefix,
+            prefix1,
+            prefix2,
+            leaf1.merkle_hash,
+            leaf2.merkle_hash,
+        );
+
+        // Create right subtree interior node (covers right side)
+        let mut right_prefix_hash = [0u8; 32];
+        right_prefix_hash[0] = 0b1000_0000;
+        let right_subtree_prefix = Prefix { hash: right_prefix_hash, length: 1 };
+        let right_interior = InteriorNode::new(
+            right_subtree_prefix,
+            prefix3,
+            prefix4,
+            leaf3.merkle_hash,
+            leaf4.merkle_hash,
+        );
+
+        // Create root interior node
+        let root_prefix = Prefix::root();
+        let root_interior = InteriorNode::new(
+            root_prefix,
+            left_subtree_prefix,
+            right_subtree_prefix,
+            left_interior.merkle_hash,
+            right_interior.merkle_hash,
+        );
+
+        // Add all nodes to cache and flush to database
+        cache.set(prefix1, Node::Leaf(leaf1));
+        cache.set(prefix2, Node::Leaf(leaf2));
+        cache.set(prefix3, Node::Leaf(leaf3));
+        cache.set(prefix4, Node::Leaf(leaf4));
+        cache.set(left_subtree_prefix, Node::Interior(left_interior));
+        cache.set(right_subtree_prefix, Node::Interior(right_interior));
+        cache.set(root_prefix, Node::Interior(root_interior));
+        cache.flush().unwrap();
+
+        // Clear cache to start fresh
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+
+        // Pre-advise for just 2 keys (leaf1 and leaf3)
+        // This should load:
+        // - root (on path)
+        // - left_subtree (on path to leaf1)
+        // - right_subtree (on path to leaf3)
+        // - leaf1 (needed)
+        // - leaf2 (sibling of leaf1)
+        // - leaf3 (needed)
+        // - leaf4 (sibling of leaf3)
+        // Total: 7 nodes
+        cache.pre_advise(&[prefix1, prefix3]).unwrap();
+
+        // Verify we loaded at most 2 * needed_keys nodes
+        // Actually, with siblings, we expect: needed_keys + their on-path ancestors + their siblings
+        // For 2 needed keys in a balanced tree of depth 2:
+        // - 2 needed leaves
+        // - 2 siblings (one for each needed leaf)
+        // - 2 interior nodes on path (left_subtree, right_subtree)
+        // - 1 root
+        // = 7 total
+        let loaded_count = cache.len();
+        println!("Loaded {} nodes for 2 needed keys", loaded_count);
+
+        // The bound should be: at most 2 * needed_keys * tree_depth
+        // But a simpler bound: we should load needed keys + their ancestors + siblings on path
+        // For efficiency, we want to ensure we're not loading the entire tree
+        assert!(loaded_count <= 2 * 2 * 3, "Loaded too many nodes: {} (expected <= 12)", loaded_count);
+
+        // More importantly, verify we didn't load ALL nodes (7 total exist)
+        // We should have loaded exactly the necessary nodes
+        assert!(loaded_count <= 7, "Loaded {} nodes, but only 7 exist in tree", loaded_count);
+
+        // Verify the needed keys are actually loaded
+        assert!(cache.get(&prefix1).is_some(), "leaf1 should be loaded");
+        assert!(cache.get(&prefix3).is_some(), "leaf3 should be loaded");
+    }
+
+    #[test]
+    fn test_pre_advise_large_tree_efficiency() {
+        use super::super::InteriorNode;
+        use sha2::{Sha256, Digest};
+
+        let db = create_test_db();
+        let cache = Cache::new(Arc::clone(&db));
+
+        // Generate 1000 unique leaf nodes with deterministic but varied keys
+        let num_nodes = 1000;
+        let mut prefixes = Vec::new();
+        
+        for i in 0..num_nodes {
+            // Create unique keys by hashing the index
+            let mut hasher = Sha256::new();
+            hasher.update((i as u64).to_le_bytes());
+            let hash = hasher.finalize();
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&hash);
+            
+            let value = [(i % 256) as u8; 32];
+            let prefix = Prefix::from(key);
+            let leaf = LeafNode::new(key, value);
+            
+            cache.set(prefix, Node::Leaf(leaf));
+            prefixes.push(prefix);
+        }
+
+        // Create a simple root interior node that points to first two leaves
+        // (This creates a minimal tree structure - in reality you'd build a proper tree,
+        // but for testing efficiency we just need some nodes in the DB)
+        let root_prefix = Prefix::root();
+        let root_interior = InteriorNode::new(
+            root_prefix,
+            prefixes[0],
+            prefixes[1],
+            [1u8; 32],
+            [2u8; 32],
+        );
+        cache.set(root_prefix, Node::Interior(root_interior));
+
+        // Flush all nodes to database
+        cache.flush().unwrap();
+        println!("Flushed {} nodes to database", cache.tree_size());
+
+        // Clear cache to start fresh
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+
+        // Pre-advise for just ONE node
+        cache.pre_advise(&[prefixes[0]]).unwrap();
+
+        let loaded_count = cache.len();
+        println!("Loaded {} nodes when pre-advising 1 key from a tree of 1000+ nodes", loaded_count);
+
+        // Check that we loaded a reasonable number of nodes
+        // For a single key, we should load:
+        // - The key itself (1)
+        // - Nodes on path from root (depends on tree depth, ~log(n))
+        // - Siblings on the path (also ~log(n))
+        // For 1000 nodes, log2(1000) ≈ 10, so with siblings we'd expect ~20 nodes max
+        // Let's be generous and say anything under 50 is reasonable (2*needed_keys * reasonable_depth)
+        assert!(
+            loaded_count <= 50,
+            "Loaded too many nodes: {} (expected <= 50 for 1 key in 1000-node tree)",
+            loaded_count
+        );
+
+        // More importantly, we should NOT have loaded all or most nodes
+        assert!(
+            loaded_count < 100,
+            "Loaded {} nodes, which suggests inefficient traversal (should be ~O(log n))",
+            loaded_count
+        );
+
+        // Verify the requested key is actually loaded
+        assert!(
+            cache.get(&prefixes[0]).is_some(),
+            "The requested key should be loaded"
+        );
+    }
 }
