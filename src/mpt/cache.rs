@@ -106,6 +106,62 @@ impl Cache {
         self.map.retain(|key, _| needed_keys.contains(key));
     }
 
+    /// Helper function to batch query multiple nodes from the database.
+    /// Returns a vector of (Prefix, Node) tuples for nodes that were found.
+    fn batch_query_nodes(
+        &self,
+        db: &Connection,
+        prefixes: &[Prefix],
+    ) -> SqliteResult<Vec<(Prefix, Node)>> {
+        if prefixes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build a query with IN clause for batch fetching
+        // We need to match on (prefix_hash, prefix_length) pairs
+        let placeholders: Vec<String> = prefixes
+            .iter()
+            .map(|_| "(?, ?)".to_string())
+            .collect();
+        let query = format!(
+            "SELECT prefix_hash, prefix_length, node_type, node_data FROM nodes WHERE (prefix_hash, prefix_length) IN ({})",
+            placeholders.join(", ")
+        );
+
+        let mut stmt = db.prepare(&query)?;
+
+        // Flatten all parameters: [hash1, len1, hash2, len2, ...]
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        for prefix in prefixes {
+            params_vec.push(Box::new(prefix.hash.to_vec()));
+            params_vec.push(Box::new(prefix.length as i64));
+        }
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let nodes = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                let prefix_hash: Vec<u8> = row.get(0)?;
+                let prefix_length: u16 = row.get::<_, i64>(1)? as u16;
+                let node_type: String = row.get(2)?;
+                let node_data: Vec<u8> = row.get(3)?;
+
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&prefix_hash);
+                let prefix = Prefix {
+                    hash,
+                    length: prefix_length,
+                };
+
+                let node = Node::deserialize(&node_type, &node_data)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+                Ok((prefix, node))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(nodes)
+    }
+
     /// Pre-advise: Load nodes from SQLite that are needed for the given keys.
     /// This loads all nodes on the path from root to the needed keys, plus their siblings.
     /// Nodes that are already in the cache will not be reloaded.
@@ -128,93 +184,75 @@ impl Cache {
             let mut next_frontier = Vec::new();
             let mut siblings_to_load = Vec::new();
 
-            // Process each node in the current frontier
-            for prefix in &current_frontier {
-                // Skip if already in cache
-                if self.map.contains_key(prefix) {
-                    continue;
-                }
+            // Collect all prefixes to query in this iteration (excluding those already in cache)
+            let prefixes_to_query: Vec<Prefix> = current_frontier
+                .iter()
+                .filter(|p| !self.map.contains_key(p))
+                .cloned()
+                .collect();
 
-                // Query the database for this node
-                let node_opt: Option<Node> = db
-                    .query_row(
-                        "SELECT node_type, node_data FROM nodes WHERE prefix_hash = ?1 AND prefix_length = ?2",
-                        params![&prefix.hash[..], prefix.length],
-                        |row| {
-                            let node_type: String = row.get(0)?;
-                            let node_data: Vec<u8> = row.get(1)?;
-                            Node::deserialize(&node_type, &node_data)
-                                .map_err(|_| rusqlite::Error::InvalidQuery)
-                        },
-                    )
-                    .ok();
+            // Batch query for all frontier nodes
+            let frontier_nodes = if !prefixes_to_query.is_empty() {
+                self.batch_query_nodes(&db, &prefixes_to_query)?
+            } else {
+                Vec::new()
+            };
 
-                if let Some(node) = node_opt {
-                    // Insert into cache (but don't mark as dirty since it's from DB)
-                    self.map.insert(*prefix, node.clone());
+            // Insert all queried nodes into cache
+            for (prefix, node) in frontier_nodes {
+                self.map.insert(prefix, node.clone());
 
-                    match node {
-                        Node::Leaf(_) => {
-                            // If this is one of the needed keys, remove it
-                            needed_keys.remove(prefix);
+                match node {
+                    Node::Leaf(_) => {
+                        // If this is one of the needed keys, remove it
+                        needed_keys.remove(&prefix);
+                    }
+                    Node::Interior(interior) => {
+                        // Determine which children are on-path to needed keys
+                        let mut left_needed = false;
+                        let mut right_needed = false;
+
+                        for needed_key in &needed_keys {
+                            if interior.prefix.prefix_of(needed_key) {
+                                // Determine if needed_key goes left or right
+                                if interior.prefix.key_goes_right(needed_key.hash) {
+                                    right_needed = true;
+                                } else {
+                                    left_needed = true;
+                                }
+                            }
                         }
-                        Node::Interior(interior) => {
-                            // Determine which children are on-path to needed keys
-                            let mut left_needed = false;
-                            let mut right_needed = false;
 
-                            for needed_key in &needed_keys {
-                                if interior.prefix.prefix_of(needed_key) {
-                                    // Determine if needed_key goes left or right
-                                    if interior.prefix.key_goes_right(needed_key.hash) {
-                                        right_needed = true;
-                                    } else {
-                                        left_needed = true;
-                                    }
-                                }
+                        // Add on-path children to next frontier and siblings to load list
+                        if left_needed {
+                            next_frontier.push(interior.left);
+                            // Sibling (right) should be loaded but not expanded
+                            if !next_frontier.contains(&interior.right) {
+                                siblings_to_load.push(interior.right);
                             }
-
-                            // Add on-path children to next frontier and siblings to load list
-                            if left_needed {
-                                next_frontier.push(interior.left);
-                                // Sibling (right) should be loaded but not expanded
-                                if !next_frontier.contains(&interior.right) {
-                                    siblings_to_load.push(interior.right);
-                                }
-                            }
-                            if right_needed {
-                                next_frontier.push(interior.right);
-                                // Sibling (left) should be loaded but not expanded (if not already in frontier)
-                                if !left_needed && !siblings_to_load.contains(&interior.left) {
-                                    siblings_to_load.push(interior.left);
-                                }
+                        }
+                        if right_needed {
+                            next_frontier.push(interior.right);
+                            // Sibling (left) should be loaded but not expanded (if not already in frontier)
+                            if !left_needed && !siblings_to_load.contains(&interior.left) {
+                                siblings_to_load.push(interior.left);
                             }
                         }
                     }
                 }
             }
 
-            // Load siblings but don't add to frontier
-            for sibling_prefix in siblings_to_load {
-                if self.map.contains_key(&sibling_prefix) {
-                    continue;
-                }
+            // Batch query for siblings (excluding those already in cache)
+            let siblings_to_query: Vec<Prefix> = siblings_to_load
+                .iter()
+                .filter(|p| !self.map.contains_key(p))
+                .cloned()
+                .collect();
 
-                let node_opt: Option<Node> = db
-                    .query_row(
-                        "SELECT node_type, node_data FROM nodes WHERE prefix_hash = ?1 AND prefix_length = ?2",
-                        params![&sibling_prefix.hash[..], sibling_prefix.length],
-                        |row| {
-                            let node_type: String = row.get(0)?;
-                            let node_data: Vec<u8> = row.get(1)?;
-                            Node::deserialize(&node_type, &node_data)
-                                .map_err(|_| rusqlite::Error::InvalidQuery)
-                        },
-                    )
-                    .ok();
-
-                if let Some(node) = node_opt {
-                    self.map.insert(sibling_prefix, node);
+            if !siblings_to_query.is_empty() {
+                let sibling_nodes = self.batch_query_nodes(&db, &siblings_to_query)?;
+                for (prefix, node) in sibling_nodes {
+                    self.map.insert(prefix, node);
                 }
             }
 
@@ -223,26 +261,16 @@ impl Cache {
 
         // After traversal, directly load any remaining needed keys that weren't found
         // This handles cases where nodes exist in the database but aren't reachable from root
-        for needed_key in &needed_keys {
-            if self.map.contains_key(needed_key) {
-                continue;
-            }
+        let remaining_to_query: Vec<Prefix> = needed_keys
+            .iter()
+            .filter(|k| !self.map.contains_key(k))
+            .cloned()
+            .collect();
 
-            let node_opt: Option<Node> = db
-                .query_row(
-                    "SELECT node_type, node_data FROM nodes WHERE prefix_hash = ?1 AND prefix_length = ?2",
-                    params![&needed_key.hash[..], needed_key.length],
-                    |row| {
-                        let node_type: String = row.get(0)?;
-                        let node_data: Vec<u8> = row.get(1)?;
-                        Node::deserialize(&node_type, &node_data)
-                            .map_err(|_| rusqlite::Error::InvalidQuery)
-                    },
-                )
-                .ok();
-
-            if let Some(node) = node_opt {
-                self.map.insert(*needed_key, node);
+        if !remaining_to_query.is_empty() {
+            let remaining_nodes = self.batch_query_nodes(&db, &remaining_to_query)?;
+            for (prefix, node) in remaining_nodes {
+                self.map.insert(prefix, node);
             }
         }
 
