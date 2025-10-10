@@ -1,4 +1,4 @@
-use log::info;
+use log::{info, warn};
 use rusqlite::{Connection, Result as SqliteResult};
 use std::env;
 use std::sync::{Arc, Mutex};
@@ -48,10 +48,11 @@ impl DurableBatchMPT {
         let db = Arc::new(Mutex::new(conn));
         let cache = Cache::new(Arc::clone(&db));
 
-        Ok(Self {
-            cache,
-            root: Prefix::root(),
-        })
+        let root = cache.get_root();
+        // Ensure the cached root node is available if it exists on disk.
+        cache.get_or_load(root)?;
+
+        Ok(Self { cache, root })
     }
 
     /// Create a new in-memory durable MPT (for testing).
@@ -68,12 +69,6 @@ impl DurableBatchMPT {
         // For now, we track it separately in memory
 
         Ok(())
-    }
-
-    /// Mark a node as dirty (needs to be written to disk).
-    /// This is now handled automatically by Cache::set(), but kept for API compatibility.
-    fn mark_dirty(&self, _prefix: Prefix) {
-        // No-op: Cache now handles dirty tracking automatically in set()
     }
 
     /// Helper to order two children based on whether the key goes right at the split point
@@ -108,23 +103,10 @@ impl DurableBatchMPT {
         // Remove duplicates, keeping the last occurrence (latest value)
         entries_vec.dedup_by_key(|(k, _)| *k);
 
-        self.cache
-            .pre_advise(
-                &entries_vec
-                    .iter()
-                    .map(|(k, _)| Prefix::from(*k))
-                    .collect::<Vec<_>>(),
-            )
-            .ok();
-
         // Perform recursive batch upsert
         let new_root = self.recursive_batch_upsert(self.root, entries_vec);
         self.root = new_root;
-
-        // Flush all changes to disk
-        if let Err(e) = self.flush_to_disk() {
-            log::error!("Failed to flush to disk: {}", e);
-        }
+        self.cache.set_root(new_root);
     }
 
     /// Recursively batch upsert entries at the current node.
@@ -134,10 +116,22 @@ impl DurableBatchMPT {
             return current_prefix;
         }
 
-        let node = self.cache.get(&current_prefix);
-        let Some(node) = node else {
-            // Empty tree: insert all entries
-            return self.batch_insert_into_empty(entries);
+        let node = match self.cache.get(&current_prefix) {
+            Some(node) => node,
+            None => match self.cache.get_or_load(current_prefix) {
+                Ok(Some(node)) => node,
+                Ok(None) => {
+                    // Empty tree: insert all entries
+                    return self.batch_insert_into_empty(entries);
+                }
+                Err(err) => {
+                    warn!(
+                        "Failed to load node {:?} from cache during batch upsert: {}",
+                        current_prefix, err
+                    );
+                    return self.batch_insert_into_empty(entries);
+                }
+            },
         };
 
         match node {
@@ -158,7 +152,6 @@ impl DurableBatchMPT {
         let first_prefix = Prefix::from(first_key);
         let first_leaf = LeafNode::new(first_key, first_value);
         self.cache.set(first_prefix, Node::Leaf(first_leaf));
-        self.mark_dirty(first_prefix);
 
         // Recursively insert remaining entries
         self.recursive_batch_upsert(first_prefix, entries)
@@ -173,7 +166,6 @@ impl DurableBatchMPT {
             let (_, new_value) = entries.remove(idx);
             let updated_leaf = LeafNode::new(leaf.key, new_value);
             self.cache.set(leaf_prefix, Node::Leaf(updated_leaf));
-            self.mark_dirty(leaf_prefix);
 
             if entries.is_empty() {
                 return leaf_prefix;
@@ -215,10 +207,6 @@ impl DurableBatchMPT {
         self.cache.set(merged_prefix, Node::Interior(new_interior));
         self.cache.set(existing_prefix, Node::Leaf(leaf));
         self.cache.set(new_prefix, Node::Leaf(new_leaf));
-
-        self.mark_dirty(merged_prefix);
-        self.mark_dirty(existing_prefix);
-        self.mark_dirty(new_prefix);
 
         // Continue with remaining entries
         self.recursive_batch_upsert(merged_prefix, entries)
@@ -266,9 +254,6 @@ impl DurableBatchMPT {
             self.cache.set(common, Node::Interior(new_interior));
             self.cache.set(new_leaf_prefix, Node::Leaf(new_leaf));
 
-            self.mark_dirty(common);
-            self.mark_dirty(new_leaf_prefix);
-
             // Merge remaining entries and continue
             contained_entries.extend(divergent_entries);
             return self.recursive_batch_upsert(common, contained_entries);
@@ -314,7 +299,6 @@ impl DurableBatchMPT {
 
         self.cache
             .set(interior.prefix, Node::Interior(updated_interior));
-        self.mark_dirty(interior.prefix);
 
         interior.prefix
     }
@@ -346,7 +330,7 @@ impl MerklePatriciaTree for DurableBatchMPT {
     }
 
     fn upsert(&mut self, key: Hash, value: Hash) {
-        self.batch_upsert_optimized(&[(key, value)]);
+        self.batch_upsert(&[(key, value)]);
     }
 
     fn enumerate_nodes(&self) -> Vec<(Prefix, Node)> {
@@ -357,7 +341,14 @@ impl MerklePatriciaTree for DurableBatchMPT {
     }
 
     fn get_root_hash(&self) -> Option<Hash> {
-        self.cache.get(&self.root).map(|n| n.merkle_hash())
+        match self.cache.get_or_load(self.root) {
+            Ok(Some(node)) => Some(node.merkle_hash()),
+            Ok(None) => None,
+            Err(err) => {
+                warn!("Failed to load root node from cache: {}", err);
+                None
+            }
+        }
     }
 
     fn get_leaf_value(&self, key: Hash) -> Option<Hash> {
@@ -373,7 +364,22 @@ impl MerklePatriciaTree for DurableBatchMPT {
     }
 
     fn batch_upsert(&mut self, entries: &[(Hash, Hash)]) {
+        self.cache.release_keys(
+            &entries
+                .iter()
+                .map(|(k, _)| Prefix::from(*k))
+                .collect::<Vec<_>>(),
+        );
+        self.cache
+            .pre_advise(
+                &entries
+                    .iter()
+                    .map(|(k, _)| Prefix::from(*k))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
         self.batch_upsert_optimized(entries);
+        self.flush_to_disk().ok();
     }
 }
 
@@ -469,5 +475,42 @@ mod tests {
         for (key, value) in new_entries.iter() {
             assert_eq!(mpt.get_leaf_value(*key), Some(*value));
         }
+    }
+
+    #[test]
+    fn test_root_persisted_across_restarts() {
+        let temp_dir = env::temp_dir();
+        let pid = std::process::id();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db_path = temp_dir.join(format!("durable_batch_root_test_{}_{}.db", pid, timestamp));
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let key = [42u8; 32];
+        let value = [99u8; 32];
+
+        let expected_root = {
+            let mut first = DurableBatchMPT::new_with_path(&db_path_str).unwrap();
+            first.upsert(key, value);
+            let expected_root = first.get_root_hash();
+            assert!(expected_root.is_some());
+            expected_root
+        };
+
+        {
+            let second = DurableBatchMPT::new_with_path(&db_path_str).unwrap();
+            let persisted_root = second.get_root_hash();
+            assert!(persisted_root.is_some());
+            assert_eq!(persisted_root, expected_root);
+            assert_eq!(second.get_leaf_value(key), Some(value));
+        }
+
+        let _ = std::fs::remove_file(&db_path);
+        let wal_path = db_path.with_extension("db-wal");
+        let shm_path = db_path.with_extension("db-shm");
+        let _ = std::fs::remove_file(wal_path);
+        let _ = std::fs::remove_file(shm_path);
     }
 }

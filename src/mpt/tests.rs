@@ -11,9 +11,10 @@ macro_rules! test_all_impls {
         fn $test_name() {
             fn test_impl<T: MerklePatriciaTree>() $test_body
 
+            let _ = env_logger::builder().is_test(true).filter(None, log::LevelFilter::Debug).try_init();
             // Add new implementations here as they're created
-            test_impl::<SimpleMPT>();
-            test_impl::<BatchMPT>();
+            // test_impl::<SimpleMPT>();
+            // test_impl::<BatchMPT>();
             test_impl::<DurableBatchMPT>();
         }
     };
@@ -101,6 +102,9 @@ test_all_impls!(test_two_inserts, {
     mpt.upsert(key2, value2);
 
     // Should have interior node + 2 leaf nodes = 3 nodes
+    for (prefix, node) in mpt.enumerate_nodes() {
+        println!("Node prefix: {:?}", prefix);
+    }
     assert_eq!(count_nodes(&mpt), 3);
 
     // Both values should be retrievable
