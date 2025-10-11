@@ -1,11 +1,16 @@
+use std::hash::RandomState;
+
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use jellyfish_rs::Hash;
 use jellyfish_rs::mpt::{BatchMPT, DurableBatchMPT, MerklePatriciaTree, SimpleMPT};
+use rand;
+use rayon::range;
 use sha2::{Digest, Sha256};
 
 /// Generate deterministic test data
 fn generate_test_data(count: usize) -> Vec<(Hash, Hash)> {
-    (0..count)
+    let start = rand::random::<u32>();
+    (start..start + count as u32)
         .map(|i| {
             let mut key_hasher = Sha256::new();
             key_hasher.update(b"key");
@@ -173,6 +178,7 @@ fn benchmark_durable_incremental_on_large_tree(c: &mut Criterion) {
     // Configure throughput to report insertions per second
     group.throughput(Throughput::Elements(10_000));
 
+    //TODO: Performance regression here
     group.bench_function("durable_batch_implementation", |b| {
         b.iter_batched(
             || {
@@ -190,15 +196,15 @@ fn benchmark_durable_incremental_on_large_tree(c: &mut Criterion) {
     group.finish();
 }
 
-fn benchmark_batch_sizes_100k(c: &mut Criterion) {
-    let mut group = c.benchmark_group("batch_sizes_100k_nodes");
+fn benchmark_batch_sizes_10k(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batch_sizes_10k_nodes");
     group.sample_size(10);
 
     // Generate all 100,000 nodes once
-    let all_data = generate_test_data(100_000);
+    let all_data = generate_test_data(10_000);
 
     // Configure throughput to report insertions per second
-    group.throughput(Throughput::Elements(100_000));
+    group.throughput(Throughput::Elements(10_000));
 
     // Benchmark with batch size 500
     group.bench_function("batch_size_500", |b| {
@@ -236,13 +242,60 @@ fn benchmark_batch_sizes_100k(c: &mut Criterion) {
     group.finish();
 }
 
+fn benchmark_batch_sizes_1_000_000(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batch_sizes_1m_nodes");
+    group.sample_size(10);
+
+    // Generate all 100,000 nodes once
+    let all_data = generate_test_data(10_000);
+
+    let mut tree = DurableBatchMPT::new();
+    for i in 0..100 {
+        println!("Inserting batch {}/100", i + 1);
+        tree.batch_upsert_optimized(generate_test_data(1_000_000 / 100).as_slice());
+    }
+    tree.batch_upsert(generate_test_data(1).as_slice());
+    println!("Finished persisting");
+    // Configure throughput to report insertions per second
+    group.throughput(Throughput::Elements(10_000));
+
+    // Benchmark with batch size 500
+    group.bench_function("batch_size_500", |b| {
+        b.iter(|| {
+            for chunk in all_data.chunks(500) {
+                tree.batch_upsert(black_box(chunk));
+            }
+        });
+    });
+
+    group.bench_function("batch_size_1000", |b| {
+        b.iter(|| {
+            for chunk in all_data.chunks(1000) {
+                tree.batch_upsert(black_box(chunk));
+            }
+        });
+    });
+
+    group.bench_function("batch_size_10000", |b| {
+        b.iter(|| {
+            for chunk in all_data.chunks(10_000) {
+                tree.batch_upsert(black_box(chunk));
+            }
+        });
+    });
+
+    println!("Done");
+    group.finish();
+}
+
 criterion_group!(
     benches,
     benchmark_fresh_1000,
     benchmark_fresh_10_000,
     benchmark_incremental_on_large_tree,
     benchmark_durable_incremental_on_large_tree,
-    benchmark_batch_sizes_100k,
+    benchmark_batch_sizes_10k,
+    benchmark_batch_sizes_1_000_000,
 );
 
 criterion_main!(benches);

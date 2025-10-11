@@ -90,7 +90,7 @@ impl DurableBatchMPT {
     /// Batch upsert with recursive single-pass optimization.
     /// This method traverses the tree only once, partitioning entries at each interior node
     /// and updating hashes on the way back up the recursion.
-    fn batch_upsert_optimized(&mut self, entries: &[(Hash, Hash)]) {
+    pub fn batch_upsert_optimized(&mut self, entries: &[(Hash, Hash)]) {
         if entries.is_empty() {
             return;
         }

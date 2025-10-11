@@ -32,6 +32,14 @@ pub struct Cache {
 
 const ROOT_METADATA_KEY: &str = "root_prefix";
 
+#[cfg(not(test))]
+const CACHE_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024 * 1024;
+
+#[cfg(test)]
+const CACHE_MEMORY_LIMIT_BYTES: usize = 1024;
+
+const CACHE_ENTRY_SIZE_BYTES: usize = std::mem::size_of::<Prefix>() + std::mem::size_of::<Node>();
+
 impl Cache {
     /// Initialize the database schema by creating the necessary tables and indexes.
     /// This should be called after opening a database connection.
@@ -199,25 +207,53 @@ impl Cache {
     }
 
     pub fn release_keys(&self, needed_keys: &[Prefix]) {
-        const CACHE_PREFIX_LENGTH: u16 = 18;
+        if CACHE_ENTRY_SIZE_BYTES == 0 || CACHE_MEMORY_LIMIT_BYTES == 0 {
+            return;
+        }
 
-        // Retain keys that are either:
-        // 1. In the needed_keys list, OR
-        // 2. Interior nodes with prefix length < CACHE_PREFIX_LENGTH (18 bits)
-        self.map.retain(|key, node| {
-            // Keep if it's in the needed_keys list
-            if needed_keys.contains(key) {
-                return true;
+        let mut needed: HashSet<Prefix> = needed_keys.iter().copied().collect();
+        needed.insert(self.get_root());
+
+        let mut current_usage = self.map.len().saturating_mul(CACHE_ENTRY_SIZE_BYTES);
+        if current_usage <= CACHE_MEMORY_LIMIT_BYTES {
+            return;
+        }
+
+        let mut candidates: Vec<(Prefix, u16)> = Vec::new();
+        {
+            for entry in self.map.iter() {
+                let key = *entry.key();
+                if needed.contains(&key) {
+                    continue;
+                }
+                candidates.push((key, key.length));
             }
+        }
 
-            // Keep interior nodes with CACHE_PREFIX_LENGTH length < 18 bits
-            if let Node::Interior(int_node) = node {
-                return int_node.prefix.length < CACHE_PREFIX_LENGTH;
-            }
+        if candidates.is_empty() {
+            return;
+        }
 
-            // Remove everything else
-            false
+        candidates.sort_by(|a, b| match b.1.cmp(&a.1) {
+            std::cmp::Ordering::Equal => b.0.cmp(&a.0),
+            other => other,
         });
+
+        for (key, _) in candidates {
+            if current_usage <= CACHE_MEMORY_LIMIT_BYTES {
+                break;
+            }
+            if self.map.remove(&key).is_some() {
+                current_usage = current_usage.saturating_sub(CACHE_ENTRY_SIZE_BYTES);
+            }
+        }
+
+        if current_usage > CACHE_MEMORY_LIMIT_BYTES {
+            debug!(
+                "release_keys: cache remains above limit (usage={} bytes, limit={} bytes)",
+                current_usage, CACHE_MEMORY_LIMIT_BYTES
+            );
+        }
     }
 
     /// Helper function to batch query multiple nodes from the database.
@@ -231,47 +267,62 @@ impl Cache {
             return Ok(Vec::new());
         }
 
-        // Build a query with IN clause for batch fetching
-        // We need to match on (prefix_hash, prefix_length) pairs
-        let placeholders: Vec<String> = prefixes.iter().map(|_| "(?, ?)".to_string()).collect();
-        let query = format!(
-            "SELECT prefix_hash, prefix_length, node_type, node_data FROM nodes WHERE (prefix_hash, prefix_length) IN ({})",
-            placeholders.join(", ")
-        );
+        const PARAMS_PER_PREFIX: usize = 2;
+        let max_variables = db.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER);
+        let chunk_size = if max_variables <= 0 {
+            1
+        } else {
+            std::cmp::max(1, (max_variables as usize) / PARAMS_PER_PREFIX)
+        };
 
-        let mut stmt = db.prepare(&query)?;
+        let mut results: Vec<(Prefix, Node)> = Vec::with_capacity(prefixes.len());
 
-        // Flatten all parameters: [hash1, len1, hash2, len2, ...]
-        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        for prefix in prefixes {
-            params_vec.push(Box::new(prefix.hash.to_vec()));
-            params_vec.push(Box::new(prefix.length as i64));
+        for chunk in prefixes.chunks(chunk_size) {
+            // Build a query with IN clause for batch fetching
+            // We need to match on (prefix_hash, prefix_length) pairs
+            let placeholders: Vec<String> = chunk.iter().map(|_| "(?, ?)".to_string()).collect();
+            let query = format!(
+                "SELECT prefix_hash, prefix_length, node_type, node_data FROM nodes WHERE (prefix_hash, prefix_length) IN ({})",
+                placeholders.join(", ")
+            );
+
+            let mut stmt = db.prepare(&query)?;
+
+            // Flatten all parameters: [hash1, len1, hash2, len2, ...]
+            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+                Vec::with_capacity(chunk.len() * PARAMS_PER_PREFIX);
+            for prefix in chunk {
+                params_vec.push(Box::new(prefix.hash.to_vec()));
+                params_vec.push(Box::new(prefix.length as i64));
+            }
+            let params_refs: Vec<&dyn rusqlite::ToSql> =
+                params_vec.iter().map(|p| p.as_ref()).collect();
+
+            let nodes = stmt
+                .query_map(params_refs.as_slice(), |row| {
+                    let prefix_hash: Vec<u8> = row.get(0)?;
+                    let prefix_length: u16 = row.get::<_, i64>(1)? as u16;
+                    let node_type: String = row.get(2)?;
+                    let node_data: Vec<u8> = row.get(3)?;
+
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&prefix_hash);
+                    let prefix = Prefix {
+                        hash,
+                        length: prefix_length,
+                    };
+
+                    let node = Node::deserialize(&node_type, &node_data)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+                    Ok((prefix, node))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            results.extend(nodes);
         }
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
 
-        let nodes = stmt
-            .query_map(params_refs.as_slice(), |row| {
-                let prefix_hash: Vec<u8> = row.get(0)?;
-                let prefix_length: u16 = row.get::<_, i64>(1)? as u16;
-                let node_type: String = row.get(2)?;
-                let node_data: Vec<u8> = row.get(3)?;
-
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&prefix_hash);
-                let prefix = Prefix {
-                    hash,
-                    length: prefix_length,
-                };
-
-                let node = Node::deserialize(&node_type, &node_data)
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
-
-                Ok((prefix, node))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(nodes)
+        Ok(results)
     }
 
     /// Pre-advise: Load nodes from SQLite that are needed for the given keys.
@@ -445,16 +496,15 @@ impl Cache {
             } else {
                 const PARAMS_PER_INSERT: usize = 4;
                 let max_variables = db.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER);
-                // let max_inserts_per_tx = std::cmp::max(
-                //     1,
-                //     if max_variables <= 0 {
-                //         0
-                //     } else {
-                //         (max_variables as usize) / PARAMS_PER_INSERT
-                //     },
-                // );
-                let max_inserts_per_tx = 500;
-                let total_chunks = (dirty_keys.len() + max_inserts_per_tx - 1) / max_inserts_per_tx;
+                let max_inserts_per_tx = std::cmp::max(
+                    1,
+                    if max_variables <= 0 {
+                        0
+                    } else {
+                        (max_variables as usize) / PARAMS_PER_INSERT
+                    },
+                );
+                let total_chunks = dirty_keys.len().div_ceil(max_inserts_per_tx);
 
                 debug!(
                     "Flushing {} dirty nodes to database in {} transaction chunk(s)",
@@ -1616,144 +1666,120 @@ mod tests {
 
     #[test]
     fn test_release_keys_retains_needed_keys() {
-        use super::super::InteriorNode;
+        use super::super::LeafNode;
 
         let db = create_test_db();
         let cache = Cache::new(db);
 
-        // Create some leaf nodes
-        let key1 = [1u8; 32];
-        let prefix1 = Prefix::from(key1);
-        let leaf1 = LeafNode::new(key1, [10u8; 32]);
+        let entry_size = super::CACHE_ENTRY_SIZE_BYTES;
+        let limit = super::CACHE_MEMORY_LIMIT_BYTES;
 
-        let key2 = [2u8; 32];
-        let prefix2 = Prefix::from(key2);
-        let leaf2 = LeafNode::new(key2, [20u8; 32]);
+        let total_entries = (limit / entry_size) + 6;
+        let mut prefixes = Vec::new();
 
-        let key3 = [3u8; 32];
-        let prefix3 = Prefix::from(key3);
-        let leaf3 = LeafNode::new(key3, [30u8; 32]);
+        for i in 0..total_entries {
+            let mut key = [0u8; 32];
+            key[0] = i as u8;
+            let value = [i as u8; 32];
+            let leaf = LeafNode::new(key, value);
+            let prefix = Prefix::from(key);
+            cache.set(prefix, Node::Leaf(leaf));
+            prefixes.push(prefix);
+        }
 
-        // Create an interior node with short prefix (< 18 bits)
-        let short_interior_prefix = Prefix {
-            hash: [0u8; 32],
-            length: 10,
-        };
-        let short_interior = InteriorNode::new(
-            short_interior_prefix,
-            prefix1,
-            prefix2,
-            leaf1.merkle_hash,
-            leaf2.merkle_hash,
-        );
+        let needed_keys = [prefixes[0], prefixes[1]];
+        cache.release_keys(&needed_keys);
 
-        // Create an interior node with long prefix (>= 18 bits)
-        let long_interior_prefix = Prefix {
-            hash: [0u8; 32],
-            length: 20,
-        };
-        let long_interior = InteriorNode::new(
-            long_interior_prefix,
-            prefix2,
-            prefix3,
-            leaf2.merkle_hash,
-            leaf3.merkle_hash,
-        );
+        for prefix in needed_keys.iter() {
+            assert!(
+                cache.get(prefix).is_some(),
+                "needed key {:?} should be retained",
+                prefix
+            );
+        }
 
-        // Add all nodes to cache
-        cache.set(prefix1, Node::Leaf(leaf1));
-        cache.set(prefix2, Node::Leaf(leaf2));
-        cache.set(prefix3, Node::Leaf(leaf3));
-        cache.set(short_interior_prefix, Node::Interior(short_interior));
-        cache.set(long_interior_prefix, Node::Interior(long_interior));
-
-        assert_eq!(cache.len(), 5);
-
-        // Release keys, keeping only prefix1 as needed
-        cache.release_keys(&[prefix1]);
-
-        // Should retain:
-        // - prefix1 (in needed_keys)
-        // - short_interior_prefix (interior node with length < 18)
-        // Should remove:
-        // - prefix2 (not in needed_keys, leaf node)
-        // - prefix3 (not in needed_keys, leaf node)
-        // - long_interior_prefix (interior node with length >= 18)
-        assert_eq!(cache.len(), 2);
-        assert!(cache.get(&prefix1).is_some(), "prefix1 should be retained");
+        let usage = cache.len() * entry_size;
         assert!(
-            cache.get(&short_interior_prefix).is_some(),
-            "short interior should be retained"
+            usage <= limit,
+            "cache usage {} should not exceed limit {} after eviction",
+            usage,
+            limit
         );
-        assert!(cache.get(&prefix2).is_none(), "prefix2 should be removed");
-        assert!(cache.get(&prefix3).is_none(), "prefix3 should be removed");
+
         assert!(
-            cache.get(&long_interior_prefix).is_none(),
-            "long interior should be removed"
+            cache.get(prefixes.last().unwrap()).is_none(),
+            "non-needed leaves should be evicted first"
         );
     }
 
     #[test]
-    fn test_release_keys_retains_interior_nodes_at_boundary() {
-        use super::super::InteriorNode;
+    fn test_release_keys_prefers_deep_nodes_for_eviction() {
+        use super::super::{InteriorNode, LeafNode};
 
         let db = create_test_db();
         let cache = Cache::new(db);
 
-        // Create interior nodes at the boundary (17 and 18 bits)
-        let mut key1 = [0u8; 32];
-        key1[0] = 0b0000_0000;
-        let prefix1 = Prefix::from(key1);
-        let leaf1 = LeafNode::new(key1, [1u8; 32]);
+        let left_key = [0xAA; 32];
+        let right_key = [0xBB; 32];
+        let left_leaf = LeafNode::new(left_key, [0x11; 32]);
+        let right_leaf = LeafNode::new(right_key, [0x22; 32]);
+        let left_prefix = Prefix::from(left_key);
+        let right_prefix = Prefix::from(right_key);
 
-        let mut key2 = [0u8; 32];
-        key2[0] = 0b1000_0000;
-        let prefix2 = Prefix::from(key2);
-        let leaf2 = LeafNode::new(key2, [2u8; 32]);
+        cache.set(left_prefix, Node::Leaf(left_leaf.clone()));
+        cache.set(right_prefix, Node::Leaf(right_leaf.clone()));
 
-        // Interior node with length 17 (should be retained)
-        let interior_17_prefix = Prefix {
-            hash: [0u8; 32],
-            length: 17,
-        };
-        let interior_17 = InteriorNode::new(
-            interior_17_prefix,
-            prefix1,
-            prefix2,
-            leaf1.merkle_hash,
-            leaf2.merkle_hash,
-        );
+        let lengths = [30u16, 90, 150, 180, 200, 230, 250];
+        let mut prefixes = Vec::new();
 
-        // Interior node with length 18 (should be removed)
-        let interior_18_prefix = Prefix {
-            hash: [0u8; 32],
-            length: 18,
-        };
-        let interior_18 = InteriorNode::new(
-            interior_18_prefix,
-            prefix1,
-            prefix2,
-            leaf1.merkle_hash,
-            leaf2.merkle_hash,
-        );
+        for (idx, length) in lengths.iter().enumerate() {
+            let mut hash = [0u8; 32];
+            hash[0] = idx as u8;
+            let prefix = Prefix {
+                hash,
+                length: *length,
+            };
+            let interior = InteriorNode::new(
+                prefix,
+                left_prefix,
+                right_prefix,
+                left_leaf.merkle_hash,
+                right_leaf.merkle_hash,
+            );
+            cache.set(prefix, Node::Interior(interior));
+            prefixes.push(prefix);
+        }
 
-        cache.set(interior_17_prefix, Node::Interior(interior_17));
-        cache.set(interior_18_prefix, Node::Interior(interior_18));
+        // Only keep the shallowest prefix
+        let needed = [prefixes[0]];
+        cache.release_keys(&needed);
 
-        assert_eq!(cache.len(), 2);
-
-        // Release keys with no needed keys
-        cache.release_keys(&[]);
-
-        // Only the 17-bit interior node should remain
-        assert_eq!(cache.len(), 1);
         assert!(
-            cache.get(&interior_17_prefix).is_some(),
-            "17-bit interior should be retained"
+            cache.get(&prefixes[0]).is_some(),
+            "shallowest prefix should be retained"
+        );
+        for prefix in prefixes.iter().take(3) {
+            assert!(
+                cache.get(prefix).is_some(),
+                "shallower prefixes should be retained: {:?}",
+                prefix
+            );
+        }
+        assert!(
+            cache.get(prefixes.last().unwrap()).is_none(),
+            "deepest prefix should be evicted first"
         );
         assert!(
-            cache.get(&interior_18_prefix).is_none(),
-            "18-bit interior should be removed"
+            cache.get(&prefixes[5]).is_some(),
+            "lower-depth interior nodes should remain while deeper ones are evicted"
+        );
+
+        let usage = cache.len() * super::CACHE_ENTRY_SIZE_BYTES;
+        assert!(
+            usage <= super::CACHE_MEMORY_LIMIT_BYTES,
+            "cache usage {} should not exceed limit {}",
+            usage,
+            super::CACHE_MEMORY_LIMIT_BYTES
         );
     }
 
@@ -1786,16 +1812,28 @@ mod tests {
         cache.set(prefix1, Node::Leaf(leaf1));
         cache.set(prefix2, Node::Leaf(leaf2));
 
-        assert_eq!(cache.len(), 3);
+        let entry_size = super::CACHE_ENTRY_SIZE_BYTES;
+        let limit = super::CACHE_MEMORY_LIMIT_BYTES;
 
-        // Release keys with no needed keys
+        let additional_entries = (limit / entry_size) + 6;
+        for i in 0..additional_entries {
+            let mut key = [0u8; 32];
+            key[0] = (i + 10) as u8;
+            let value = [i as u8; 32];
+            let leaf = LeafNode::new(key, value);
+            cache.set(Prefix::from(key), Node::Leaf(leaf));
+        }
+
         cache.release_keys(&[]);
 
-        // Root should be retained (length 0 < 18)
-        assert_eq!(cache.len(), 1);
-        assert!(cache.get(&root_prefix).is_some(), "root should be retained");
-        assert!(cache.get(&prefix1).is_none(), "leaf1 should be removed");
-        assert!(cache.get(&prefix2).is_none(), "leaf2 should be removed");
+        assert!(
+            cache.get(&root_prefix).is_some(),
+            "root should never be evicted"
+        );
+        assert!(
+            cache.len() * entry_size <= limit,
+            "cache should respect memory limit after eviction"
+        );
     }
 
     #[test]
