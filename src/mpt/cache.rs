@@ -37,7 +37,7 @@ pub struct Cache {
 
 const ROOT_METADATA_KEY: &str = "root_prefix";
 
-pub(crate) const DEFAULT_CACHE_MEMORY_LIMIT_BYTES: usize = 1024 * 1024 * 10; //10 MB
+pub(crate) const DEFAULT_CACHE_MEMORY_LIMIT_BYTES: usize = 1024 * 1024 * 1024; //10 MB
 
 const CACHE_ENTRY_SIZE_BYTES: usize = std::mem::size_of::<Prefix>() + std::mem::size_of::<Node>();
 

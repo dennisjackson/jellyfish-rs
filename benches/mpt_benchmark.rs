@@ -252,7 +252,7 @@ fn benchmark_batch_sizes_1_000_000(c: &mut Criterion) {
     let mut tree = DurableBatchMPT::new();
     for i in 0..100 {
         // println!("Inserting batch {}/100", i + 1);
-        tree.batch_upsert(generate_test_data(1_000_000 / 100).as_slice());
+        tree.batch_upsert(generate_test_data(1_000_000).as_slice());
     }
     tree.batch_upsert(generate_test_data(1).as_slice());
     // println!("Finished persisting");
