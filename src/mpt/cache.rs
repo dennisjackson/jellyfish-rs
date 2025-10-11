@@ -6,14 +6,14 @@ use rusqlite::{
     params, params_from_iter,
     types::{ToSqlOutput, Type, ValueRef},
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
     collections::HashSet,
     sync::{Arc, Mutex},
 };
 
 use super::Node;
-use crate::{prefix::HashExt, Prefix};
+use crate::{Prefix, prefix::HashExt};
 
 /// A cache structure that wraps DashMap and provides SQLite-backed persistent storage.
 /// This cache allows preloading keys from disk and batch writing keys back to disk.
@@ -31,6 +31,12 @@ pub struct Cache {
     root: Arc<Mutex<Prefix>>,
     /// Indicates whether the root metadata needs to be flushed
     root_dirty: AtomicBool,
+    /// Cached tree size tracked to avoid repeated COUNT queries
+    tree_size_cache: AtomicUsize,
+    /// Indicates whether the cached tree size is currently valid
+    tree_size_known: AtomicBool,
+    /// Tracks nodes that have been inserted but not yet persisted
+    new_nodes: Arc<DashSet<Prefix>>,
     /// Maximum memory budget for cached entries, in bytes
     cache_memory_limit_bytes: usize,
 }
@@ -106,6 +112,9 @@ impl Cache {
             in_transaction: Arc::new(Mutex::new(false)),
             root: Arc::new(Mutex::new(initial_root)),
             root_dirty: AtomicBool::new(should_mark_dirty),
+            tree_size_cache: AtomicUsize::new(0),
+            tree_size_known: AtomicBool::new(false),
+            new_nodes: Arc::new(DashSet::new()),
             cache_memory_limit_bytes,
         }
     }
@@ -170,8 +179,15 @@ impl Cache {
     /// Insert or update a node in the cache.
     /// Automatically marks the key as dirty for later flushing.
     pub fn set(&self, key: Prefix, value: Node) {
-        self.map.insert(key, value);
+        let previous = self.map.insert(key, value);
         self.dirty.insert(key);
+
+        if previous.is_none() {
+            self.new_nodes.insert(key);
+            if self.tree_size_known.load(Ordering::SeqCst) {
+                self.tree_size_cache.fetch_add(1, Ordering::SeqCst);
+            }
+        }
     }
 
     /// Get the number of entries currently in the cache.
@@ -192,13 +208,43 @@ impl Cache {
         CACHE_ENTRY_SIZE_BYTES
     }
 
-    /// Get the current tree size (total number of nodes in the database).
-    pub fn tree_size(&self) -> usize {
-        let db = self.db.lock().unwrap();
-        db.query_row("SELECT COUNT(*) FROM nodes", [], |row| {
+    fn update_tree_size_cache(&self, size: usize) {
+        self.tree_size_cache.store(size, Ordering::SeqCst);
+        self.tree_size_known.store(true, Ordering::SeqCst);
+    }
+
+    fn refresh_tree_size_with_conn(&self, conn: &Connection) -> SqliteResult<usize> {
+        let base = Self::query_tree_size(conn)?;
+        let unflushed = self.new_nodes.len();
+        let total = base.saturating_add(unflushed);
+        self.update_tree_size_cache(total);
+        Ok(total)
+    }
+
+    fn query_tree_size(conn: &Connection) -> SqliteResult<usize> {
+        conn.query_row("SELECT COUNT(*) FROM nodes", [], |row| {
             row.get::<_, i64>(0).map(|v| v as usize)
         })
-        .unwrap_or(0)
+    }
+
+    /// Get the current tree size (total number of nodes in the database).
+    pub fn tree_size(&self) -> usize {
+        if self.tree_size_known.load(Ordering::SeqCst) {
+            return self.tree_size_cache.load(Ordering::SeqCst);
+        }
+
+        let result = {
+            let db = self.db.lock().unwrap();
+            self.refresh_tree_size_with_conn(&db)
+        };
+
+        match result {
+            Ok(size) => size,
+            Err(err) => {
+                warn!("Failed to load tree size from database: {}", err);
+                0
+            }
+        }
     }
 
     /// Clear all entries from the cache.
@@ -550,6 +596,8 @@ impl Cache {
                     dirty_keys.len()
                 );
 
+                let mut newly_persisted: Vec<Prefix> = Vec::new();
+
                 {
                     let mut stmt = db.prepare_cached(
                         "INSERT OR REPLACE INTO nodes (prefix_hash, prefix_length, node_type, node_data) VALUES (?1, ?2, ?3, ?4)"
@@ -564,6 +612,9 @@ impl Cache {
                                 .map_err(|_| rusqlite::Error::InvalidQuery)?;
 
                             stmt.execute(params![&key.hash[..], key.length, node_type, node_data])?;
+                            if self.new_nodes.contains(key) {
+                                newly_persisted.push(*key);
+                            }
                         } else {
                             log::warn!(
                                 "Warning: Dirty key {:?} not found in cache during flush",
@@ -580,6 +631,9 @@ impl Cache {
 
                 db.execute("COMMIT", [])?;
                 *in_tx = false;
+                for key in newly_persisted {
+                    self.new_nodes.remove(&key);
+                }
             }
         }
 
