@@ -18,6 +18,9 @@ sha2 = "0.10.9"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 
+[lib]
+bench = false
+
 [[bench]]
 name = "mpt_benchmark"
 harness = false
