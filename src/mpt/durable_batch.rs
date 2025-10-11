@@ -448,7 +448,7 @@ impl MerklePatriciaTree for DurableBatchMPT {
                 let cost_per_entry = (2.0 * entry_bytes as f64 * log_tree).max(entry_bytes as f64);
                 std::cmp::max(1, (limit_bytes as f64 / cost_per_entry) as usize)
             };
-            let chunk_capacity = std::cmp::min(chunk_capacity, 1000);
+            let chunk_capacity = std::cmp::min(chunk_capacity, 10_000);
             let end = std::cmp::min(total, start + chunk_capacity);
             let chunk = &sorted_entries[start..end];
 
