@@ -361,6 +361,7 @@ impl Cache {
         }
         drop(in_tx); // Release lock before querying
 
+        //Currently pretty inefficient. O(n^2) so we limit the max we process at once
         for (chunk_idx, keys_chunk) in _keys.chunks(100).enumerate() {
             let mut needed_keys: HashSet<Prefix> = keys_chunk.iter().cloned().collect();
             if needed_keys.is_empty() {

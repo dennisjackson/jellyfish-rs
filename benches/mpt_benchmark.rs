@@ -250,11 +250,9 @@ fn benchmark_batch_sizes_100k(c: &mut Criterion) {
     let all_data = generate_test_data(10_000);
 
     let mut tree = DurableBatchMPT::new();
-    for i in 0..100 {
-        // println!("Inserting batch {}/100", i + 1);
-        tree.batch_upsert(generate_test_data(100_000).as_slice());
-    }
-    tree.batch_upsert(generate_test_data(1).as_slice());
+    tree.set_safety_mode(false);
+    tree.batch_upsert(generate_test_data(100_000).as_slice());
+    tree.set_safety_mode(true);
     // println!("Finished persisting");
     // Configure throughput to report insertions per second
     group.throughput(Throughput::Elements(10_000));

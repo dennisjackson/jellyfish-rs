@@ -17,6 +17,7 @@ use super::{Cache, InteriorNode, LeafNode, Node};
 /// The tree structure is persisted to disk, allowing for larger-than-memory trees.
 pub struct DurableBatchMPT {
     cache: Cache,
+    db: Arc<Mutex<Connection>>,
     root: Prefix,
 }
 
@@ -25,14 +26,7 @@ impl DurableBatchMPT {
     pub fn new_with_path(db_path: &str) -> SqliteResult<Self> {
         let conn = Connection::open(db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "fullfsync", true)?; //Andrew Ayer's advice
-        // Configure SQLite for durability and robustness
-        // WAL mode provides better concurrency and crash resilience
-        // conn.execute("PRAGMA journal_mode = WAL", [])?;
-
-        // FULL synchronous mode ensures all data is written to disk before commit returns
-        // This guarantees durability even in case of power failure or OS crash
-        conn.execute("PRAGMA synchronous = FULL", [])?;
+        Self::configure_safety_pragmas(&conn, true)?;
 
         // Enable foreign key constraints for referential integrity
         // conn.execute("PRAGMA foreign_keys = ON", [])?;
@@ -53,12 +47,34 @@ impl DurableBatchMPT {
         // Ensure the cached root node is available if it exists on disk.
         cache.get_or_load(root)?;
 
-        Ok(Self { cache, root })
+        Ok(Self { cache, db, root })
     }
 
     /// Create a new in-memory durable MPT (for testing).
     pub fn new_in_memory() -> SqliteResult<Self> {
         Self::new_with_path(":memory:")
+    }
+
+    /// Toggle SQLite durability-related safety settings (fullfsync and synchronous).
+    /// Enabling these settings maximizes crash safety at the cost of write throughput.
+    /// Disabling them trades some durability for speed, which can be useful when the caller
+    /// provides its own durability guarantees or during bulk imports.
+    pub fn set_safety_mode(&self, enable: bool) -> SqliteResult<()> {
+        let conn = self.db.lock().unwrap();
+        Self::configure_safety_pragmas(&conn, enable)
+    }
+
+    fn configure_safety_pragmas(conn: &Connection, enable: bool) -> SqliteResult<()> {
+        // Andrew Ayer's advice: rely on PRAGMA fullfsync for durable SQLite WAL writes.
+        conn.pragma_update(None, "fullfsync", enable)?;
+        if enable {
+            // FULL synchronous ensures the WAL is flushed to stable storage on each commit.
+            conn.execute("PRAGMA synchronous = FULL", [])?;
+        } else {
+            // NORMAL is SQLite's WAL default and skips the extra fsync for better throughput.
+            conn.execute("PRAGMA synchronous = NORMAL", [])?;
+        }
+        Ok(())
     }
 
     /// Write all dirty nodes back to SQLite.
@@ -429,8 +445,7 @@ impl MerklePatriciaTree for DurableBatchMPT {
             } else {
                 let tree_size = self.cache.tree_size().max(2);
                 let log_tree = (tree_size as f64).ln();
-                let cost_per_entry =
-                    (2.0 * entry_bytes as f64 * log_tree).max(entry_bytes as f64);
+                let cost_per_entry = (2.0 * entry_bytes as f64 * log_tree).max(entry_bytes as f64);
                 std::cmp::max(1, (limit_bytes as f64 / cost_per_entry) as usize)
             };
             let end = std::cmp::min(total, start + chunk_capacity);
