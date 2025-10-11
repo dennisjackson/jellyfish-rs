@@ -352,9 +352,6 @@ impl Cache {
     pub fn pre_advise(&self, _keys: &[Prefix]) -> SqliteResult<()> {
         let db = self.db.lock().unwrap();
         let mut queried_nodes = 0;
-        //TODO: This makes things fail because we aren't correctly reloading the
-        //keys that we need.
-        // self.release_keys(_keys);
 
         // Begin a durable transaction
         let mut in_tx = self.in_transaction.lock().unwrap();
@@ -364,114 +361,123 @@ impl Cache {
         }
         drop(in_tx); // Release lock before querying
 
-        let mut needed_keys: HashSet<Prefix> = _keys.iter().cloned().collect();
-        let mut current_frontier = HashSet::new();
-        current_frontier.insert(self.get_root());
-        debug!(
-            "Pre-advise for {} keys, starting from root",
-            needed_keys.len()
-        );
-        for x in needed_keys.iter() {
-            debug!("  Needed key: {:?}", x.short_hex());
-        }
-        while !needed_keys.is_empty() && !current_frontier.is_empty() {
+        for (chunk_idx, keys_chunk) in _keys.chunks(100).enumerate() {
+            let mut needed_keys: HashSet<Prefix> = keys_chunk.iter().cloned().collect();
+            if needed_keys.is_empty() {
+                continue;
+            }
+
+            let mut current_frontier = HashSet::new();
+            current_frontier.insert(self.get_root());
             debug!(
-                "Iterating. Need {} keys, frontier size {}",
-                needed_keys.len(),
-                current_frontier.len()
+                "Pre-advise chunk {} for {} keys, starting from root",
+                chunk_idx + 1,
+                needed_keys.len()
             );
-            for x in &current_frontier {
-                debug!("  Frontier node: {:?}", x.short_hex());
+            for x in needed_keys.iter() {
+                debug!("  Needed key: {:?}", x.short_hex());
             }
-            let mut frontier_nodes: Vec<Node> = Vec::new();
-
-            // Separate frontier into cached and uncached nodes
-            let (cached_prefixes, prefixes_to_query): (Vec<Prefix>, Vec<Prefix>) = current_frontier
-                .iter()
-                .partition(|p| self.map.contains_key(p));
-            debug!(
-                "Frontier has {} cached, {} to query",
-                cached_prefixes.len(),
-                prefixes_to_query.len()
-            );
-
-            for p in cached_prefixes {
-                if let Some(node) = self.get(&p) {
-                    frontier_nodes.push(node.value().clone());
+            while !needed_keys.is_empty() && !current_frontier.is_empty() {
+                debug!(
+                    "Iterating chunk {}. Need {} keys, frontier size {}",
+                    chunk_idx + 1,
+                    needed_keys.len(),
+                    current_frontier.len()
+                );
+                for x in &current_frontier {
+                    debug!("  Frontier node: {:?}", x.short_hex());
                 }
-            }
+                let mut frontier_nodes: Vec<Node> = Vec::new();
 
-            let new_nodes: Vec<(Prefix, Node)> = self
-                .batch_query_nodes(&db, &prefixes_to_query)?
-                .into_iter()
-                .collect();
-            queried_nodes += new_nodes.len();
-            for (p, n) in new_nodes.iter() {
-                self.map.insert(*p, n.clone());
-            }
+                // Separate frontier into cached and uncached nodes
+                let (cached_prefixes, prefixes_to_query): (Vec<Prefix>, Vec<Prefix>) =
+                    current_frontier
+                        .iter()
+                        .partition(|p| self.map.contains_key(p));
+                debug!(
+                    "Frontier has {} cached, {} to query",
+                    cached_prefixes.len(),
+                    prefixes_to_query.len()
+                );
 
-            // At this point, all frontier nodes are in the cache.
-            frontier_nodes.extend(new_nodes.iter().map(|(_, n)| n.clone()));
-            current_frontier.clear();
-            for x in frontier_nodes.iter() {
-                debug!("  Loaded frontier node: {}", x);
-            }
-            //Now we can remove any nodes we just loaded from the needed keys.
-            for node in &frontier_nodes {
-                if let Node::Leaf(leaf) = node {
-                    let prefix = Prefix::from(leaf.key);
-                    debug!("Loaded leaf node {:?}", prefix);
-                    needed_keys.remove(&prefix);
+                for p in cached_prefixes {
+                    if let Some(node) = self.get(&p) {
+                        frontier_nodes.push(node.value().clone());
+                    }
                 }
-            }
 
-            let mut siblings_to_load: Vec<Prefix> = Vec::new();
-            for node in &frontier_nodes {
-                if let Node::Interior(interior) = node {
-                    for nk in needed_keys.iter() {
-                        if interior.left.prefix_of(nk) {
-                            current_frontier.insert(interior.left);
-                        } else if !self.map.contains_key(&interior.left) {
-                            siblings_to_load.push(interior.left);
-                        }
-                        if interior.right.prefix_of(nk) {
-                            current_frontier.insert(interior.right);
-                        } else if !self.map.contains_key(&interior.right) {
-                            siblings_to_load.push(interior.right);
+                let new_nodes: Vec<(Prefix, Node)> = self
+                    .batch_query_nodes(&db, &prefixes_to_query)?
+                    .into_iter()
+                    .collect();
+                queried_nodes += new_nodes.len();
+                for (p, n) in new_nodes.iter() {
+                    self.map.insert(*p, n.clone());
+                }
+
+                // At this point, all frontier nodes are in the cache.
+                frontier_nodes.extend(new_nodes.iter().map(|(_, n)| n.clone()));
+                current_frontier.clear();
+                for x in frontier_nodes.iter() {
+                    debug!("  Loaded frontier node: {}", x);
+                }
+                //Now we can remove any nodes we just loaded from the needed keys.
+                for node in &frontier_nodes {
+                    if let Node::Leaf(leaf) = node {
+                        let prefix = Prefix::from(leaf.key);
+                        debug!("Loaded leaf node {:?}", prefix);
+                        needed_keys.remove(&prefix);
+                    }
+                }
+
+                let mut siblings_to_load: Vec<Prefix> = Vec::new();
+                for node in &frontier_nodes {
+                    if let Node::Interior(interior) = node {
+                        for nk in needed_keys.iter() {
+                            if interior.left.prefix_of(nk) {
+                                current_frontier.insert(interior.left);
+                            } else if !self.map.contains_key(&interior.left) {
+                                siblings_to_load.push(interior.left);
+                            }
+                            if interior.right.prefix_of(nk) {
+                                current_frontier.insert(interior.right);
+                            } else if !self.map.contains_key(&interior.right) {
+                                siblings_to_load.push(interior.right);
+                            }
                         }
                     }
                 }
+
+                debug!(
+                    "Identified {} siblings to load and {} next frontier nodes for {} needed keys",
+                    siblings_to_load.len(),
+                    current_frontier.len(),
+                    needed_keys.len()
+                );
+
+                let siblings = self.batch_query_nodes(&db, &siblings_to_load)?;
+                queried_nodes += siblings.len();
+                // Insert all queried nodes into cache
+                for (prefix, node) in siblings {
+                    self.map.insert(prefix, node);
+                }
             }
 
-            debug!(
-                "Identified {} siblings to load and {} next frontier nodes for {} needed keys",
-                siblings_to_load.len(),
-                current_frontier.len(),
-                needed_keys.len()
-            );
+            // After traversal, directly load any remaining needed keys that weren't found
+            // This handles cases where nodes exist in the database but aren't reachable from root
+            // This should only happen in testing
+            let remaining_to_query: Vec<Prefix> = needed_keys
+                .iter()
+                .filter(|k| !self.map.contains_key(k))
+                .cloned()
+                .collect();
 
-            let siblings = self.batch_query_nodes(&db, &siblings_to_load)?;
-            queried_nodes += siblings.len();
-            // Insert all queried nodes into cache
-            for (prefix, node) in siblings {
-                self.map.insert(prefix, node);
-            }
-        }
-
-        // After traversal, directly load any remaining needed keys that weren't found
-        // This handles cases where nodes exist in the database but aren't reachable from root
-        // This should only happen in testing
-        let remaining_to_query: Vec<Prefix> = needed_keys
-            .iter()
-            .filter(|k| !self.map.contains_key(k))
-            .cloned()
-            .collect();
-
-        if !remaining_to_query.is_empty() {
-            let remaining_nodes = self.batch_query_nodes(&db, &remaining_to_query)?;
-            queried_nodes += remaining_nodes.len();
-            for (prefix, node) in remaining_nodes {
-                self.map.insert(prefix, node);
+            if !remaining_to_query.is_empty() {
+                let remaining_nodes = self.batch_query_nodes(&db, &remaining_to_query)?;
+                queried_nodes += remaining_nodes.len();
+                for (prefix, node) in remaining_nodes {
+                    self.map.insert(prefix, node);
+                }
             }
         }
 
