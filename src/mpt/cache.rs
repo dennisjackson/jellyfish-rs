@@ -13,7 +13,7 @@ use std::{
 };
 
 use super::Node;
-use crate::Prefix;
+use crate::{prefix::HashExt, Prefix};
 
 /// A cache structure that wraps DashMap and provides SQLite-backed persistent storage.
 /// This cache allows preloading keys from disk and batch writing keys back to disk.
@@ -228,23 +228,37 @@ impl Cache {
             return;
         }
 
-        let mut needed: HashSet<Prefix> = needed_keys.iter().copied().collect();
-        needed.insert(self.get_root());
-
         let mut current_usage = self.map.len().saturating_mul(CACHE_ENTRY_SIZE_BYTES);
         if current_usage <= self.cache_memory_limit_bytes {
             return;
+        }
+
+        let mut protected: HashSet<Prefix> =
+            HashSet::with_capacity(needed_keys.len().saturating_mul(8) + 16);
+        protected.insert(self.get_root());
+
+        for key in needed_keys.iter().copied() {
+            let mut current = key;
+            loop {
+                protected.insert(current);
+                if current.length == 0 {
+                    break;
+                }
+                let parent_length = current.length - 1;
+                let parent_hash = current.hash.zero_bits_from(parent_length);
+                current = Prefix {
+                    hash: parent_hash,
+                    length: parent_length,
+                };
+            }
         }
 
         let mut candidates: Vec<(Prefix, u16)> = Vec::new();
         {
             for entry in self.map.iter() {
                 let key = *entry.key();
-                for n in needed.iter() {
-                    if key.prefix_of(&n) || n == &key {
-                        // Key is needed, skip it
-                        continue;
-                    }
+                if protected.contains(&key) {
+                    continue;
                 }
                 candidates.push((key, key.length));
             }
