@@ -155,7 +155,7 @@ fn benchmark_incremental_on_large_tree(c: &mut Criterion) {
 
 fn benchmark_durable_incremental_on_large_tree(c: &mut Criterion) {
     let mut group = c.benchmark_group("durable_incremental_1000_on_10000_base");
-
+    group.sample_size(10);
     // Generate initial 100,000 nodes
     let base_data = generate_test_data(10_000);
     // Generate additional 1,000 nodes to insert
@@ -197,7 +197,7 @@ fn benchmark_durable_incremental_on_large_tree(c: &mut Criterion) {
 }
 
 fn benchmark_batch_sizes_10k(c: &mut Criterion) {
-    let mut group = c.benchmark_group("batch_sizes_10k_nodes");
+    let mut group = c.benchmark_group("durable_batch_sizes_10k_nodes");
     group.sample_size(10);
 
     // Generate all 100,000 nodes once
@@ -243,19 +243,18 @@ fn benchmark_batch_sizes_10k(c: &mut Criterion) {
 }
 
 fn benchmark_batch_sizes_1_000_000(c: &mut Criterion) {
-    let mut group = c.benchmark_group("batch_sizes_1m_nodes");
+    let mut group = c.benchmark_group("durable_batch_sizes_1m_nodes");
     group.sample_size(10);
 
-    // Generate all 100,000 nodes once
     let all_data = generate_test_data(10_000);
 
     let mut tree = DurableBatchMPT::new();
     for i in 0..100 {
-        println!("Inserting batch {}/100", i + 1);
+        // println!("Inserting batch {}/100", i + 1);
         tree.batch_upsert_optimized(generate_test_data(1_000_000 / 100).as_slice());
     }
     tree.batch_upsert(generate_test_data(1).as_slice());
-    println!("Finished persisting");
+    // println!("Finished persisting");
     // Configure throughput to report insertions per second
     group.throughput(Throughput::Elements(10_000));
 
@@ -284,7 +283,7 @@ fn benchmark_batch_sizes_1_000_000(c: &mut Criterion) {
         });
     });
 
-    println!("Done");
+    // println!("Done");
     group.finish();
 }
 

@@ -117,9 +117,9 @@ impl DurableBatchMPT {
         }
 
         let node = match self.cache.get(&current_prefix) {
-            Some(node) => node,
+            Some(node) => node.value().clone(),
             None => match self.cache.get_or_load(current_prefix) {
-                Ok(Some(node)) => node,
+                Ok(Some(node)) => node.value().clone(),
                 Ok(None) => {
                     // Empty tree: insert all entries
                     return self.batch_insert_into_empty(entries);
@@ -291,8 +291,18 @@ impl DurableBatchMPT {
         );
 
         // Recalculate this interior node's hash based on updated children
-        let left_hash = self.cache.get(&new_left).unwrap().merkle_hash();
-        let right_hash = self.cache.get(&new_right).unwrap().merkle_hash();
+        let left_hash = self
+            .cache
+            .get(&new_left)
+            .expect("Expected left child to exist in cache")
+            .value()
+            .merkle_hash();
+        let right_hash = self
+            .cache
+            .get(&new_right)
+            .expect("Expected right child to exist in cache")
+            .value()
+            .merkle_hash();
 
         let updated_interior =
             InteriorNode::new(interior.prefix, new_left, new_right, left_hash, right_hash);
@@ -342,7 +352,7 @@ impl MerklePatriciaTree for DurableBatchMPT {
 
     fn get_root_hash(&self) -> Option<Hash> {
         match self.cache.get_or_load(self.root) {
-            Ok(Some(node)) => Some(node.merkle_hash()),
+            Ok(Some(node)) => Some(node.value().merkle_hash()),
             Ok(None) => None,
             Err(err) => {
                 warn!("Failed to load root node from cache: {}", err);
@@ -357,7 +367,8 @@ impl MerklePatriciaTree for DurableBatchMPT {
         self.cache.pre_advise(&[prefix]).unwrap();
 
         // Load from database
-        match self.cache.get(&prefix)? {
+        let node = self.cache.get(&prefix)?;
+        match node.value() {
             Node::Leaf(leaf) => Some(leaf.value),
             _ => None,
         }

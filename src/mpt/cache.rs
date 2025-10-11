@@ -1,4 +1,4 @@
-use dashmap::{DashMap, DashSet};
+use dashmap::{DashMap, DashSet, mapref::one::Ref as DashMapRef};
 use log::{debug, warn};
 use rusqlite::{
     Connection, OptionalExtension, Result as SqliteResult, limits::Limit, params, types::Type,
@@ -39,6 +39,8 @@ const CACHE_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024 * 1024;
 const CACHE_MEMORY_LIMIT_BYTES: usize = 1024;
 
 const CACHE_ENTRY_SIZE_BYTES: usize = std::mem::size_of::<Prefix>() + std::mem::size_of::<Node>();
+
+pub type NodeReadGuard<'a> = DashMapRef<'a, Prefix, Node>;
 
 impl Cache {
     /// Initialize the database schema by creating the necessary tables and indexes.
@@ -135,14 +137,14 @@ impl Cache {
 
     /// Get a node from the cache.
     /// Returns None if the key is not present in the cache.
-    pub fn get(&self, key: &Prefix) -> Option<Node> {
-        self.map.get(key).map(|node| node.clone())
+    pub fn get(&self, key: &Prefix) -> Option<NodeReadGuard<'_>> {
+        self.map.get(key)
     }
 
     /// Retrieve a node, loading it from the database if necessary.
-    pub fn get_or_load(&self, key: Prefix) -> SqliteResult<Option<Node>> {
+    pub fn get_or_load(&self, key: Prefix) -> SqliteResult<Option<NodeReadGuard<'_>>> {
         if let Some(node) = self.map.get(&key) {
-            return Ok(Some(node.clone()));
+            return Ok(Some(node));
         }
 
         let mut nodes = {
@@ -151,8 +153,8 @@ impl Cache {
         };
 
         if let Some((_, node)) = nodes.pop() {
-            self.map.insert(key, node.clone());
-            Ok(Some(node))
+            self.map.insert(key, node);
+            Ok(self.map.get(&key))
         } else {
             Ok(None)
         }
@@ -371,7 +373,7 @@ impl Cache {
 
             for p in cached_prefixes {
                 if let Some(node) = self.get(&p) {
-                    frontier_nodes.push(node);
+                    frontier_nodes.push(node.value().clone());
                 }
             }
 
@@ -639,14 +641,16 @@ mod tests {
 
         // Set and get
         cache.set(prefix, Node::Leaf(leaf.clone()));
-        let retrieved = cache.get(&prefix);
-        assert!(retrieved.is_some());
+        let retrieved = cache
+            .get(&prefix)
+            .expect("Expected leaf node to be cached after set");
 
-        if let Some(Node::Leaf(retrieved_leaf)) = retrieved {
-            assert_eq!(retrieved_leaf.key, key);
-            assert_eq!(retrieved_leaf.value, value);
-        } else {
-            panic!("Expected leaf node");
+        match retrieved.value() {
+            Node::Leaf(retrieved_leaf) => {
+                assert_eq!(retrieved_leaf.key, key);
+                assert_eq!(retrieved_leaf.value, value);
+            }
+            _ => panic!("Expected leaf node"),
         }
     }
 
@@ -681,14 +685,16 @@ mod tests {
 
         // Verify nodes are back in cache
         assert_eq!(cache.len(), 2);
-        let retrieved1 = cache.get(&prefix1);
-        assert!(retrieved1.is_some());
+        let retrieved1 = cache
+            .get(&prefix1)
+            .expect("Expected to reload leaf node after pre_advise");
 
-        if let Some(Node::Leaf(retrieved_leaf)) = retrieved1 {
-            assert_eq!(retrieved_leaf.key, key1);
-            assert_eq!(retrieved_leaf.value, value1);
-        } else {
-            panic!("Expected leaf node");
+        match retrieved1.value() {
+            Node::Leaf(retrieved_leaf) => {
+                assert_eq!(retrieved_leaf.key, key1);
+                assert_eq!(retrieved_leaf.value, value1);
+            }
+            _ => panic!("Expected leaf node"),
         }
     }
 
