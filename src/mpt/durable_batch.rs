@@ -1,4 +1,4 @@
-use log::{debug, warn};
+use log::{debug, info, warn};
 use rusqlite::{Connection, Result as SqliteResult};
 use std::env;
 use std::sync::{Arc, Mutex};
@@ -405,22 +405,46 @@ impl MerklePatriciaTree for DurableBatchMPT {
     }
 
     fn batch_upsert(&mut self, entries: &[(Hash, Hash)]) {
-        self.cache.release_keys(
-            &entries
-                .iter()
-                .map(|(k, _)| Prefix::from(*k))
-                .collect::<Vec<_>>(),
-        );
-        self.cache
-            .pre_advise(
-                &entries
-                    .iter()
-                    .map(|(k, _)| Prefix::from(*k))
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
-        self.batch_upsert_optimized(entries);
-        self.flush_to_disk().ok();
+        if entries.is_empty() {
+            return;
+        }
+
+        // Sort entries by key so chunk boundaries follow key order
+        let mut sorted_entries = entries.to_vec();
+        sorted_entries.sort_by_key(|(key, _)| *key);
+        sorted_entries.dedup_by_key(|(key, _)| *key);
+
+        // Determine chunk size based on cache memory limit; fall back to whole batch if unlimited
+        let limit_bytes = self.cache.cache_memory_limit_bytes();
+        let entry_bytes = self.cache.cache_entry_size_bytes().max(1);
+        let mut prefix_buffer: Vec<Prefix> = Vec::new();
+
+        // Loop over dynamic chunks, releasing keys, pre-advising, batch_upserting and flushing
+        let mut start = 0;
+        let total = sorted_entries.len();
+        while start < total {
+            let remaining = total - start;
+            let chunk_capacity = if limit_bytes == 0 {
+                remaining
+            } else {
+                let tree_size = self.cache.tree_size().max(2);
+                let log_tree = (tree_size as f64).ln();
+                let cost_per_entry =
+                    (2.0 * entry_bytes as f64 * log_tree).max(entry_bytes as f64);
+                std::cmp::max(1, (limit_bytes as f64 / cost_per_entry) as usize)
+            };
+            let end = std::cmp::min(total, start + chunk_capacity);
+            let chunk = &sorted_entries[start..end];
+
+            prefix_buffer.clear();
+            prefix_buffer.extend(chunk.iter().map(|(k, _)| Prefix::from(*k)));
+
+            self.cache.release_keys(&prefix_buffer);
+            self.cache.pre_advise(&prefix_buffer).unwrap();
+            self.batch_upsert_optimized(chunk);
+            self.flush_to_disk().ok();
+            start = end;
+        }
     }
 }
 
