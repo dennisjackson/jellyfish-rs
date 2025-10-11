@@ -1,7 +1,10 @@
 use dashmap::{DashMap, DashSet, mapref::one::Ref as DashMapRef};
 use log::{debug, info, warn};
 use rusqlite::{
-    Connection, OptionalExtension, Result as SqliteResult, limits::Limit, params, types::Type,
+    Connection, OptionalExtension, Result as SqliteResult,
+    limits::Limit,
+    params, params_from_iter,
+    types::{ToSqlOutput, Type, ValueRef},
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
@@ -10,7 +13,7 @@ use std::{
 };
 
 use super::Node;
-use crate::{InteriorNode, Prefix};
+use crate::Prefix;
 
 /// A cache structure that wraps DashMap and provides SQLite-backed persistent storage.
 /// This cache allows preloading keys from disk and batch writing keys back to disk.
@@ -34,7 +37,7 @@ pub struct Cache {
 
 const ROOT_METADATA_KEY: &str = "root_prefix";
 
-pub(crate) const DEFAULT_CACHE_MEMORY_LIMIT_BYTES: usize = 1024*1024*10; //10 MB
+pub(crate) const DEFAULT_CACHE_MEMORY_LIMIT_BYTES: usize = 1024 * 1024 * 10; //10 MB
 
 const CACHE_ENTRY_SIZE_BYTES: usize = std::mem::size_of::<Prefix>() + std::mem::size_of::<Node>();
 
@@ -233,7 +236,6 @@ impl Cache {
             return;
         }
 
-
         let mut candidates: Vec<(Prefix, u16)> = Vec::new();
         {
             for entry in self.map.iter() {
@@ -280,10 +282,7 @@ impl Cache {
                 current_usage, self.cache_memory_limit_bytes
             );
         }
-        info!(
-            "Released {} internal nodes and {} leaf nodes",
-            ints, leaves
-        );
+        info!("Released {} internal nodes and {} leaf nodes", ints, leaves);
     }
 
     /// Helper function to batch query multiple nodes from the database.
@@ -306,30 +305,21 @@ impl Cache {
         };
 
         let mut results: Vec<(Prefix, Node)> = Vec::with_capacity(prefixes.len());
+        let mut query_buffer = String::new();
+        let mut param_buffer = Vec::with_capacity(chunk_size * PARAMS_PER_PREFIX);
 
         for chunk in prefixes.chunks(chunk_size) {
-            // Build a query with IN clause for batch fetching
-            // We need to match on (prefix_hash, prefix_length) pairs
-            let placeholders: Vec<String> = chunk.iter().map(|_| "(?, ?)".to_string()).collect();
-            let query = format!(
-                "SELECT prefix_hash, prefix_length, node_type, node_data FROM nodes WHERE (prefix_hash, prefix_length) IN ({})",
-                placeholders.join(", ")
-            );
-
-            let mut stmt = db.prepare(&query)?;
-
-            // Flatten all parameters: [hash1, len1, hash2, len2, ...]
-            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
-                Vec::with_capacity(chunk.len() * PARAMS_PER_PREFIX);
+            build_batch_query(&mut query_buffer, chunk.len());
+            param_buffer.clear();
             for prefix in chunk {
-                params_vec.push(Box::new(prefix.hash.to_vec()));
-                params_vec.push(Box::new(prefix.length as i64));
+                param_buffer.push(BatchQueryParam::Hash(prefix.hash.as_ref()));
+                param_buffer.push(BatchQueryParam::Length(prefix.length as i64));
             }
-            let params_refs: Vec<&dyn rusqlite::ToSql> =
-                params_vec.iter().map(|p| p.as_ref()).collect();
+
+            let mut stmt = db.prepare_cached(query_buffer.as_str())?;
 
             let nodes = stmt
-                .query_map(params_refs.as_slice(), |row| {
+                .query_map(params_from_iter(param_buffer.iter().copied()), |row| {
                     let prefix_hash: Vec<u8> = row.get(0)?;
                     let prefix_length: u16 = row.get::<_, i64>(1)? as u16;
                     let node_type: String = row.get(2)?;
@@ -485,7 +475,11 @@ impl Cache {
             }
         }
 
-        info!("Pre-advise complete. Loaded nodes: {}, Cache size: {}", queried_nodes, self.len());
+        info!(
+            "Pre-advise complete. Loaded nodes: {}, Cache size: {}",
+            queried_nodes,
+            self.len()
+        );
         Ok(())
     }
 
@@ -610,6 +604,44 @@ impl Cache {
 
         Ok(nodes)
     }
+}
+
+#[derive(Clone, Copy)]
+enum BatchQueryParam<'a> {
+    Hash(&'a [u8]),
+    Length(i64),
+}
+
+impl<'a> rusqlite::ToSql for BatchQueryParam<'a> {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(match self {
+            BatchQueryParam::Hash(bytes) => ToSqlOutput::Borrowed(ValueRef::Blob(bytes)),
+            BatchQueryParam::Length(len) => ToSqlOutput::Borrowed(ValueRef::Integer(*len)),
+        })
+    }
+}
+
+fn build_batch_query(buffer: &mut String, pair_count: usize) {
+    debug_assert!(pair_count > 0);
+    const SELECT_PREFIX: &str = "SELECT prefix_hash, prefix_length, node_type, node_data FROM nodes \
+         WHERE (prefix_hash, prefix_length) IN (";
+    const PAIR_PLACEHOLDER: &str = "(?, ?)";
+
+    buffer.clear();
+    buffer.reserve(
+        SELECT_PREFIX.len()
+            + pair_count.saturating_mul(PAIR_PLACEHOLDER.len())
+            + pair_count.saturating_sub(1)
+            + 1,
+    );
+    buffer.push_str(SELECT_PREFIX);
+    for index in 0..pair_count {
+        if index > 0 {
+            buffer.push(',');
+        }
+        buffer.push_str(PAIR_PLACEHOLDER);
+    }
+    buffer.push(')');
 }
 
 #[cfg(test)]

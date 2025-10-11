@@ -2,7 +2,7 @@ use std::fmt;
 
 use sha2::Digest;
 
-use crate::{prefix::HashExt, Hash, Prefix};
+use crate::{Hash, Prefix, prefix::HashExt};
 
 mod simple;
 pub use simple::SimpleMPT;

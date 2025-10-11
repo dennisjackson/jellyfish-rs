@@ -520,7 +520,10 @@ mod tests {
 
     #[test]
     fn test_release_pre_advise_then_batch_upsert() {
-        let _ = env_logger::builder().is_test(true).filter(None, log::LevelFilter::Debug).try_init();
+        let _ = env_logger::builder()
+            .is_test(true)
+            .filter(None, log::LevelFilter::Debug)
+            .try_init();
         let mut mpt = DurableBatchMPT::new();
 
         let key1 = [1u8; 32];
