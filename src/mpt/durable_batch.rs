@@ -103,6 +103,35 @@ impl DurableBatchMPT {
         // Remove duplicates, keeping the last occurrence (latest value)
         entries_vec.dedup_by_key(|(k, _)| *k);
 
+        let batch_nodes = entries_vec.len();
+        let limit_bytes = self.cache.cache_memory_limit_bytes();
+        if limit_bytes > 0 && batch_nodes > 0 {
+            let tree_size = self.cache.tree_size();
+            let tree_log = if tree_size > 1 {
+                (tree_size as f64).ln()
+            } else {
+                0.0
+            };
+
+            if tree_log > 0.0 {
+                let entry_size = self.cache.cache_entry_size_bytes().max(1);
+                let limit_entries = std::cmp::max(1, limit_bytes / entry_size);
+                let estimated_nodes = (batch_nodes as f64) * tree_log;
+
+                if estimated_nodes > limit_entries as f64 {
+                    warn!(
+                        "Batch upsert of {} entries may exceed cache capacity (log(tree_size={})≈{:.2}, estimated nodes≈{:.2}, limit≈{} entries, limit_bytes={})",
+                        batch_nodes,
+                        tree_size,
+                        tree_log,
+                        estimated_nodes,
+                        limit_entries,
+                        limit_bytes
+                    );
+                }
+            }
+        }
+
         // Perform recursive batch upsert
         let new_root = self.recursive_batch_upsert(self.root, entries_vec);
         self.root = new_root;

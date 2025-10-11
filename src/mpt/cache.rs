@@ -28,15 +28,13 @@ pub struct Cache {
     root: Arc<Mutex<Prefix>>,
     /// Indicates whether the root metadata needs to be flushed
     root_dirty: AtomicBool,
+    /// Maximum memory budget for cached entries, in bytes
+    cache_memory_limit_bytes: usize,
 }
 
 const ROOT_METADATA_KEY: &str = "root_prefix";
 
-#[cfg(not(test))]
-const CACHE_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024 * 1024;
-
-#[cfg(test)]
-const CACHE_MEMORY_LIMIT_BYTES: usize = 1024;
+pub(crate) const DEFAULT_CACHE_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 const CACHE_ENTRY_SIZE_BYTES: usize = std::mem::size_of::<Prefix>() + std::mem::size_of::<Node>();
 
@@ -78,6 +76,11 @@ impl Cache {
 
     /// Create a new cache with the given SQLite database connection.
     pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+        Self::new_with_limit(db, DEFAULT_CACHE_MEMORY_LIMIT_BYTES)
+    }
+
+    /// Create a new cache with a specific in-memory limit.
+    pub fn new_with_limit(db: Arc<Mutex<Connection>>, cache_memory_limit_bytes: usize) -> Self {
         let (initial_root, should_mark_dirty) = {
             let conn_guard = db.lock().unwrap();
             let result = Self::read_root_from_metadata(&conn_guard);
@@ -100,6 +103,7 @@ impl Cache {
             in_transaction: Arc::new(Mutex::new(false)),
             root: Arc::new(Mutex::new(initial_root)),
             root_dirty: AtomicBool::new(should_mark_dirty),
+            cache_memory_limit_bytes,
         }
     }
 
@@ -177,6 +181,14 @@ impl Cache {
         self.map.is_empty()
     }
 
+    pub fn cache_memory_limit_bytes(&self) -> usize {
+        self.cache_memory_limit_bytes
+    }
+
+    pub fn cache_entry_size_bytes(&self) -> usize {
+        CACHE_ENTRY_SIZE_BYTES
+    }
+
     /// Get the current tree size (total number of nodes in the database).
     pub fn tree_size(&self) -> usize {
         let db = self.db.lock().unwrap();
@@ -209,7 +221,7 @@ impl Cache {
     }
 
     pub fn release_keys(&self, needed_keys: &[Prefix]) {
-        if CACHE_ENTRY_SIZE_BYTES == 0 || CACHE_MEMORY_LIMIT_BYTES == 0 {
+        if CACHE_ENTRY_SIZE_BYTES == 0 || self.cache_memory_limit_bytes == 0 {
             return;
         }
 
@@ -217,7 +229,7 @@ impl Cache {
         needed.insert(self.get_root());
 
         let mut current_usage = self.map.len().saturating_mul(CACHE_ENTRY_SIZE_BYTES);
-        if current_usage <= CACHE_MEMORY_LIMIT_BYTES {
+        if current_usage <= self.cache_memory_limit_bytes {
             return;
         }
 
@@ -242,7 +254,7 @@ impl Cache {
         });
 
         for (key, _) in candidates {
-            if current_usage <= CACHE_MEMORY_LIMIT_BYTES {
+            if current_usage <= self.cache_memory_limit_bytes {
                 break;
             }
             if self.map.remove(&key).is_some() {
@@ -250,10 +262,10 @@ impl Cache {
             }
         }
 
-        if current_usage > CACHE_MEMORY_LIMIT_BYTES {
+        if current_usage > self.cache_memory_limit_bytes {
             debug!(
                 "release_keys: cache remains above limit (usage={} bytes, limit={} bytes)",
-                current_usage, CACHE_MEMORY_LIMIT_BYTES
+                current_usage, self.cache_memory_limit_bytes
             );
         }
     }
@@ -618,10 +630,14 @@ mod tests {
         Arc::new(Mutex::new(conn))
     }
 
+    fn create_test_cache(db: Arc<Mutex<Connection>>) -> Cache {
+        Cache::new_with_limit(db, 1024)
+    }
+
     #[test]
     fn test_new_cache() {
         let db = create_test_db();
-        let cache = Cache::new(db);
+        let cache = create_test_cache(db);
         assert_eq!(cache.len(), 0);
         assert!(cache.is_empty());
     }
@@ -629,7 +645,7 @@ mod tests {
     #[test]
     fn test_get_set() {
         let db = create_test_db();
-        let cache = Cache::new(db);
+        let cache = create_test_cache(db);
 
         let key = [1u8; 32];
         let value = [2u8; 32];
@@ -657,7 +673,7 @@ mod tests {
     #[test]
     fn test_flush_and_pre_advise() {
         let db = create_test_db();
-        let cache = Cache::new(Arc::clone(&db));
+        let cache = create_test_cache(Arc::clone(&db));
 
         let key1 = [1u8; 32];
         let value1 = [10u8; 32];
@@ -701,7 +717,7 @@ mod tests {
     #[test]
     fn test_pre_advise_skips_cached_keys() {
         let db = create_test_db();
-        let cache = Cache::new(Arc::clone(&db));
+        let cache = create_test_cache(Arc::clone(&db));
 
         let key = [1u8; 32];
         let value = [10u8; 32];
@@ -721,7 +737,7 @@ mod tests {
     #[test]
     fn test_flush_empty() {
         let db = create_test_db();
-        let cache = Cache::new(db);
+        let cache = create_test_cache(db);
 
         // Should not error on empty flush
         cache.flush().unwrap();
@@ -730,7 +746,7 @@ mod tests {
     #[test]
     fn test_pre_advise_empty() {
         let db = create_test_db();
-        let cache = Cache::new(db);
+        let cache = create_test_cache(db);
 
         // Should not error on empty batch
         cache.pre_advise(&[]).unwrap();
@@ -739,7 +755,7 @@ mod tests {
     #[test]
     fn test_dirty_tracking() {
         let db = create_test_db();
-        let cache = Cache::new(db);
+        let cache = create_test_cache(db);
 
         let key = [1u8; 32];
         let value = [10u8; 32];
@@ -761,7 +777,7 @@ mod tests {
     #[test]
     fn test_flush() {
         let db = create_test_db();
-        let cache = Cache::new(Arc::clone(&db));
+        let cache = create_test_cache(Arc::clone(&db));
 
         let key1 = [1u8; 32];
         let value1 = [10u8; 32];
@@ -793,7 +809,7 @@ mod tests {
     #[test]
     fn test_enumerate_nodes() {
         let db = create_test_db();
-        let cache = Cache::new(Arc::clone(&db));
+        let cache = create_test_cache(Arc::clone(&db));
 
         let key1 = [1u8; 32];
         let value1 = [10u8; 32];
@@ -820,7 +836,7 @@ mod tests {
         use super::super::InteriorNode;
 
         let db = create_test_db();
-        let cache = Cache::new(Arc::clone(&db));
+        let cache = create_test_cache(Arc::clone(&db));
 
         // Create a binary tree structure with controlled keys
         // Tree structure:
@@ -958,7 +974,7 @@ mod tests {
         use sha2::{Digest, Sha256};
 
         let db = create_test_db();
-        let cache = Cache::new(Arc::clone(&db));
+        let cache = create_test_cache(Arc::clone(&db));
 
         // Generate 1000 unique leaf nodes with deterministic but varied keys
         let num_nodes = 1000;
@@ -1037,7 +1053,7 @@ mod tests {
         use super::super::InteriorNode;
 
         let db = create_test_db();
-        let cache = Cache::new(Arc::clone(&db));
+        let cache = create_test_cache(Arc::clone(&db));
 
         // Create a simple 3-level tree with explicit structure:
         //           root
@@ -1148,7 +1164,7 @@ mod tests {
         use super::super::InteriorNode;
 
         let db = create_test_db();
-        let cache = Cache::new(Arc::clone(&db));
+        let cache = create_test_cache(Arc::clone(&db));
 
         // Create keys that share common ancestors
         let mut key1 = [0u8; 32];
@@ -1241,7 +1257,7 @@ mod tests {
         use super::super::InteriorNode;
 
         let db = create_test_db();
-        let cache = Cache::new(Arc::clone(&db));
+        let cache = create_test_cache(Arc::clone(&db));
 
         // Create a small tree
         let mut key1 = [0u8; 32];
@@ -1294,7 +1310,7 @@ mod tests {
         use super::super::InteriorNode;
 
         let db = create_test_db();
-        let cache = Cache::new(Arc::clone(&db));
+        let cache = create_test_cache(Arc::clone(&db));
 
         // Create an unbalanced tree where leaves are at different depths
         // Level 0: root
@@ -1373,7 +1389,7 @@ mod tests {
         use super::super::InteriorNode;
 
         let db = create_test_db();
-        let cache = Cache::new(Arc::clone(&db));
+        let cache = create_test_cache(Arc::clone(&db));
 
         // Create a path: root -> left -> right (to leaf)
         // This means we go left at root, then right at the next level
@@ -1478,7 +1494,7 @@ mod tests {
         use sha2::{Digest, Sha256};
 
         let db = create_test_db();
-        let cache = Cache::new(Arc::clone(&db));
+        let cache = create_test_cache(Arc::clone(&db));
 
         // Build a larger tree with 100 leaves
         let num_leaves = 100;
@@ -1547,7 +1563,7 @@ mod tests {
         use super::super::InteriorNode;
 
         let db = create_test_db();
-        let cache = Cache::new(Arc::clone(&db));
+        let cache = create_test_cache(Arc::clone(&db));
 
         // Create a 3-level tree
         let mut key1 = [0u8; 32];
@@ -1675,10 +1691,10 @@ mod tests {
         use super::super::LeafNode;
 
         let db = create_test_db();
-        let cache = Cache::new(db);
+        let cache = create_test_cache(db);
 
         let entry_size = super::CACHE_ENTRY_SIZE_BYTES;
-        let limit = super::CACHE_MEMORY_LIMIT_BYTES;
+        let limit = cache.cache_memory_limit_bytes();
 
         let total_entries = (limit / entry_size) + 6;
         let mut prefixes = Vec::new();
@@ -1723,7 +1739,7 @@ mod tests {
         use super::super::{InteriorNode, LeafNode};
 
         let db = create_test_db();
-        let cache = Cache::new(db);
+        let cache = create_test_cache(db);
 
         let left_key = [0xAA; 32];
         let right_key = [0xBB; 32];
@@ -1731,6 +1747,8 @@ mod tests {
         let right_leaf = LeafNode::new(right_key, [0x22; 32]);
         let left_prefix = Prefix::from(left_key);
         let right_prefix = Prefix::from(right_key);
+
+        let limit = cache.cache_memory_limit_bytes();
 
         cache.set(left_prefix, Node::Leaf(left_leaf.clone()));
         cache.set(right_prefix, Node::Leaf(right_leaf.clone()));
@@ -1782,10 +1800,10 @@ mod tests {
 
         let usage = cache.len() * super::CACHE_ENTRY_SIZE_BYTES;
         assert!(
-            usage <= super::CACHE_MEMORY_LIMIT_BYTES,
+            usage <= limit,
             "cache usage {} should not exceed limit {}",
             usage,
-            super::CACHE_MEMORY_LIMIT_BYTES
+            limit
         );
     }
 
@@ -1794,7 +1812,7 @@ mod tests {
         use super::super::InteriorNode;
 
         let db = create_test_db();
-        let cache = Cache::new(db);
+        let cache = create_test_cache(db);
 
         let key1 = [1u8; 32];
         let prefix1 = Prefix::from(key1);
@@ -1819,7 +1837,7 @@ mod tests {
         cache.set(prefix2, Node::Leaf(leaf2));
 
         let entry_size = super::CACHE_ENTRY_SIZE_BYTES;
-        let limit = super::CACHE_MEMORY_LIMIT_BYTES;
+        let limit = cache.cache_memory_limit_bytes();
 
         let additional_entries = (limit / entry_size) + 6;
         for i in 0..additional_entries {
@@ -1845,7 +1863,7 @@ mod tests {
     #[test]
     fn test_pre_advise_transaction_management() {
         let db = create_test_db();
-        let cache = Cache::new(Arc::clone(&db));
+        let cache = create_test_cache(Arc::clone(&db));
 
         // Create and flush a simple node
         let key = [1u8; 32];
@@ -1890,7 +1908,7 @@ mod tests {
         use super::super::InteriorNode;
 
         let db = create_test_db();
-        let cache = Cache::new(Arc::clone(&db));
+        let cache = create_test_cache(Arc::clone(&db));
 
         // Build a simpler deep tree with 4 levels
         // Structure:
