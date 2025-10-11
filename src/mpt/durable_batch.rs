@@ -25,6 +25,7 @@ impl DurableBatchMPT {
     pub fn new_with_path(db_path: &str) -> SqliteResult<Self> {
         let conn = Connection::open(db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "fullfsync", true)?; //Andrew Ayer's advice
         // Configure SQLite for durability and robustness
         // WAL mode provides better concurrency and crash resilience
         // conn.execute("PRAGMA journal_mode = WAL", [])?;
