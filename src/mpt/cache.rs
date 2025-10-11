@@ -418,12 +418,20 @@ impl Cache {
                         if interior.left.prefix_of(nk) {
                             current_frontier.insert(interior.left);
                         } else {
-                            siblings_to_load.push(interior.left);
+                            if self.map.contains_key(&interior.left) {
+                                continue;
+                            } else {
+                                siblings_to_load.push(interior.left);
+                            }
                         }
                         if interior.right.prefix_of(nk) {
                             current_frontier.insert(interior.right);
                         } else {
-                            siblings_to_load.push(interior.right);
+                            if self.map.contains_key(&interior.right) {
+                                continue;
+                            } else {
+                                siblings_to_load.push(interior.right);
+                            }
                         }
                     }
                 }
@@ -434,13 +442,8 @@ impl Cache {
                 siblings_to_load.len(),
                 current_frontier.len()
             );
-            let siblings = siblings_to_load
-                .iter()
-                .filter(|p| !self.map.contains_key(p))
-                .cloned()
-                .collect::<Vec<Prefix>>();
 
-            let siblings = self.batch_query_nodes(&db, &siblings)?;
+            let siblings = self.batch_query_nodes(&db, &siblings_to_load)?;
 
             // Insert all queried nodes into cache
             for (prefix, node) in siblings {
