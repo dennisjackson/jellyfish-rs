@@ -507,67 +507,52 @@ impl Cache {
                 db.execute("COMMIT", [])?;
                 *in_tx = false;
             } else {
-                const PARAMS_PER_INSERT: usize = 4;
-                let max_variables = db.limit(Limit::SQLITE_LIMIT_VARIABLE_NUMBER);
-                let max_inserts_per_tx = std::cmp::max(
-                    1,
-                    if max_variables <= 0 {
-                        0
-                    } else {
-                        (max_variables as usize) / PARAMS_PER_INSERT
-                    },
-                );
-                let total_chunks = dirty_keys.len().div_ceil(max_inserts_per_tx);
+                if !*in_tx {
+                    db.execute("BEGIN DEFERRED TRANSACTION", [])?;
+                    *in_tx = true;
+                }
 
                 debug!(
-                    "Flushing {} dirty nodes to database in {} transaction chunk(s)",
-                    dirty_keys.len(),
-                    total_chunks
+                    "Flushing {} dirty nodes to database in a single transaction",
+                    dirty_keys.len()
                 );
 
-                for (chunk_index, chunk) in dirty_keys.chunks(max_inserts_per_tx).enumerate() {
-                    if !*in_tx {
-                        db.execute("BEGIN DEFERRED TRANSACTION", [])?;
-                        *in_tx = true;
-                    }
+                {
+                    let mut stmt = db.prepare(
+                        "INSERT OR REPLACE INTO nodes (prefix_hash, prefix_length, node_type, node_data) VALUES (?1, ?2, ?3, ?4)"
+                    )?;
 
-                    {
-                        let mut stmt = db.prepare(
-                            "INSERT OR REPLACE INTO nodes (prefix_hash, prefix_length, node_type, node_data) VALUES (?1, ?2, ?3, ?4)"
-                        )?;
+                    for key in &dirty_keys {
+                        if let Some(node) = self.map.get(key) {
+                            debug!("Flushing dirty key {:?}", key);
+                            let (node_type, node_data) = node
+                                .value()
+                                .serialize()
+                                .map_err(|_| rusqlite::Error::InvalidQuery)?;
 
-                        for key in chunk {
-                            if let Some(node) = self.map.get(key) {
-                                debug!("Flushing dirty key {:?}", key);
-                                let (node_type, node_data) = node
-                                    .value()
-                                    .serialize()
-                                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
-
-                                stmt.execute(params![
-                                    &key.hash[..],
-                                    key.length,
-                                    node_type,
-                                    node_data
-                                ])?;
-                            } else {
-                                // This should not happen - dirty key must be in cache
-                                log::warn!(
-                                    "Warning: Dirty key {:?} not found in cache during flush",
-                                    key
-                                );
-                            }
+                            stmt.execute(params![
+                                &key.hash[..],
+                                key.length,
+                                node_type,
+                                node_data
+                            ])?;
+                        } else {
+                            // This should not happen - dirty key must be in cache
+                            log::warn!(
+                                "Warning: Dirty key {:?} not found in cache during flush",
+                                key
+                            );
                         }
                     }
-
-                    if root_dirty && chunk_index == total_chunks - 1 {
-                        self.persist_root_metadata(&db)?;
-                        cleared_root_dirty = true;
-                    }
-
-                    db.execute("COMMIT", [])?;
-                    *in_tx = false;
                 }
+
+                if root_dirty {
+                    self.persist_root_metadata(&db)?;
+                    cleared_root_dirty = true;
+                }
+
+                db.execute("COMMIT", [])?;
+                *in_tx = false;
             }
         }
 
