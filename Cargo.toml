@@ -21,6 +21,21 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [lib]
 bench = false
 
+[[bin]]
+name = "build-durable-tree"
+path = "src/bin/build_durable_tree.rs"
+bench = false
+
+[[bin]]
+name = "dump-sqlite"
+path = "src/bin/dump_sqlite.rs"
+bench = false
+
+[[bin]]
+name = "test-mermaid"
+path = "src/bin/test_mermaid.rs"
+bench = false
+
 [[bench]]
 name = "mpt_benchmark"
 harness = false

@@ -518,7 +518,7 @@ impl Cache {
                 );
 
                 {
-                    let mut stmt = db.prepare(
+                    let mut stmt = db.prepare_cached(
                         "INSERT OR REPLACE INTO nodes (prefix_hash, prefix_length, node_type, node_data) VALUES (?1, ?2, ?3, ?4)"
                     )?;
 
@@ -537,7 +537,6 @@ impl Cache {
                                 node_data
                             ])?;
                         } else {
-                            // This should not happen - dirty key must be in cache
                             log::warn!(
                                 "Warning: Dirty key {:?} not found in cache during flush",
                                 key
