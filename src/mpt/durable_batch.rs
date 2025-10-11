@@ -1,4 +1,4 @@
-use log::{info, warn};
+use log::{debug, info, warn};
 use rusqlite::{Connection, Result as SqliteResult};
 use std::env;
 use std::sync::{Arc, Mutex};
@@ -95,7 +95,7 @@ impl DurableBatchMPT {
             return;
         }
 
-        info!("Batch upserting {} entries", entries.len());
+        debug!("Batch upserting {} entries", entries.len());
 
         // Convert to sorted vector for efficient partitioning
         let mut entries_vec: Vec<(Hash, Hash)> = entries.to_vec();

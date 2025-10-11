@@ -458,10 +458,6 @@ impl Cache {
             .collect();
 
         if !remaining_to_query.is_empty() {
-            warn!(
-                "After pre-advise traversal, still need to load {} keys directly",
-                remaining_to_query.len()
-            );
             let remaining_nodes = self.batch_query_nodes(&db, &remaining_to_query)?;
             for (prefix, node) in remaining_nodes {
                 self.map.insert(prefix, node);
