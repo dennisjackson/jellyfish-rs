@@ -10,7 +10,7 @@ use std::{
 };
 
 use super::Node;
-use crate::Prefix;
+use crate::{InteriorNode, Prefix};
 
 /// A cache structure that wraps DashMap and provides SQLite-backed persistent storage.
 /// This cache allows preloading keys from disk and batch writing keys back to disk.
@@ -233,13 +233,16 @@ impl Cache {
             return;
         }
 
-        info!("Releasing keys to maintain cache limit");
+
         let mut candidates: Vec<(Prefix, u16)> = Vec::new();
         {
             for entry in self.map.iter() {
                 let key = *entry.key();
-                if needed.contains(&key) {
-                    continue;
+                for n in needed.iter() {
+                    if key.prefix_of(&n) || n == &key {
+                        // Key is needed, skip it
+                        continue;
+                    }
                 }
                 candidates.push((key, key.length));
             }
@@ -254,12 +257,20 @@ impl Cache {
             other => other,
         });
 
+        let mut ints = 0;
+        let mut leaves = 0;
         for (key, _) in candidates {
             if current_usage <= self.cache_memory_limit_bytes {
                 break;
             }
-            if self.map.remove(&key).is_some() {
+            if let Some(n) = self.map.remove(&key) {
+                debug!("Released key {:?} from cache", key.short_hex());
                 current_usage = current_usage.saturating_sub(CACHE_ENTRY_SIZE_BYTES);
+                if let Node::Interior(_) = n.1 {
+                    ints += 1;
+                } else {
+                    leaves += 1;
+                }
             }
         }
 
@@ -269,6 +280,10 @@ impl Cache {
                 current_usage, self.cache_memory_limit_bytes
             );
         }
+        info!(
+            "Released {} internal nodes and {} leaf nodes",
+            ints, leaves
+        );
     }
 
     /// Helper function to batch query multiple nodes from the database.
@@ -346,7 +361,7 @@ impl Cache {
     /// Begins a durable transaction that will remain active until flush() is called.
     pub fn pre_advise(&self, _keys: &[Prefix]) -> SqliteResult<()> {
         let db = self.db.lock().unwrap();
-
+        let mut queried_nodes = 0;
         //TODO: This makes things fail because we aren't correctly reloading the
         //keys that we need.
         // self.release_keys(_keys);
@@ -400,7 +415,7 @@ impl Cache {
                 .batch_query_nodes(&db, &prefixes_to_query)?
                 .into_iter()
                 .collect();
-
+            queried_nodes += new_nodes.len();
             for (p, n) in new_nodes.iter() {
                 self.map.insert(*p, n.clone());
             }
@@ -424,21 +439,14 @@ impl Cache {
             for node in &frontier_nodes {
                 if let Node::Interior(interior) = node {
                     for nk in needed_keys.iter() {
-                        let mut nk_prefix = Prefix::from(nk.hash);
                         if interior.left.prefix_of(nk) {
                             current_frontier.insert(interior.left);
-                        } else if self.map.contains_key(&interior.left) {
-                            nk_prefix.length = interior.left.length;
-                            debug!("nk_prefix {} is not a prefix of {}", nk_prefix.short_hex(), interior.left.short_hex());
-                        } else {
+                        } else if !self.map.contains_key(&interior.left) {
                             siblings_to_load.push(interior.left);
                         }
                         if interior.right.prefix_of(nk) {
                             current_frontier.insert(interior.right);
-                        } else if self.map.contains_key(&interior.right) {
-                            nk_prefix.length = interior.left.length;
-                            debug!("nk_prefix {} is not a prefix of {}", nk_prefix.short_hex(), interior.right.short_hex());
-                        } else {
+                        } else if !self.map.contains_key(&interior.right) {
                             siblings_to_load.push(interior.right);
                         }
                     }
@@ -453,7 +461,7 @@ impl Cache {
             );
 
             let siblings = self.batch_query_nodes(&db, &siblings_to_load)?;
-
+            queried_nodes += siblings.len();
             // Insert all queried nodes into cache
             for (prefix, node) in siblings {
                 self.map.insert(prefix, node.clone());
@@ -471,12 +479,13 @@ impl Cache {
 
         if !remaining_to_query.is_empty() {
             let remaining_nodes = self.batch_query_nodes(&db, &remaining_to_query)?;
+            queried_nodes += remaining_nodes.len();
             for (prefix, node) in remaining_nodes {
                 self.map.insert(prefix, node);
             }
         }
 
-        debug!("Pre-advise complete. Cache size: {}", self.len());
+        info!("Pre-advise complete. Loaded nodes: {}, Cache size: {}", queried_nodes, self.len());
         Ok(())
     }
 
