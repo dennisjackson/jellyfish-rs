@@ -417,21 +417,17 @@ impl Cache {
                     for nk in needed_keys.iter() {
                         if interior.left.prefix_of(nk) {
                             current_frontier.insert(interior.left);
+                        } else if self.map.contains_key(&interior.left) {
+                            continue;
                         } else {
-                            if self.map.contains_key(&interior.left) {
-                                continue;
-                            } else {
-                                siblings_to_load.push(interior.left);
-                            }
+                            siblings_to_load.push(interior.left);
                         }
                         if interior.right.prefix_of(nk) {
                             current_frontier.insert(interior.right);
+                        } else if self.map.contains_key(&interior.right) {
+                            continue;
                         } else {
-                            if self.map.contains_key(&interior.right) {
-                                continue;
-                            } else {
-                                siblings_to_load.push(interior.right);
-                            }
+                            siblings_to_load.push(interior.right);
                         }
                     }
                 }
@@ -530,12 +526,7 @@ impl Cache {
                                 .serialize()
                                 .map_err(|_| rusqlite::Error::InvalidQuery)?;
 
-                            stmt.execute(params![
-                                &key.hash[..],
-                                key.length,
-                                node_type,
-                                node_data
-                            ])?;
+                            stmt.execute(params![&key.hash[..], key.length, node_type, node_data])?;
                         } else {
                             log::warn!(
                                 "Warning: Dirty key {:?} not found in cache during flush",

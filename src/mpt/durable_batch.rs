@@ -1,4 +1,4 @@
-use log::{debug, info, warn};
+use log::{debug, warn};
 use rusqlite::{Connection, Result as SqliteResult};
 use std::env;
 use std::sync::{Arc, Mutex};
