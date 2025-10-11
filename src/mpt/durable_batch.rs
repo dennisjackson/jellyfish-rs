@@ -1,4 +1,4 @@
-use log::{debug, info, warn};
+use log::{debug, warn};
 use rusqlite::{Connection, Result as SqliteResult};
 use std::env;
 use std::sync::{Arc, Mutex};
@@ -77,6 +77,13 @@ impl DurableBatchMPT {
         Ok(())
     }
 
+    fn sorted_unique_entries(entries: &[(Hash, Hash)]) -> Vec<(Hash, Hash)> {
+        let mut sorted = entries.to_vec();
+        sorted.sort_by_key(|(key, _)| *key);
+        sorted.dedup_by_key(|(key, _)| *key);
+        sorted
+    }
+
     /// Write all dirty nodes back to SQLite.
     fn flush_to_disk(&self) -> SqliteResult<()> {
         // Use Cache::flush to write all dirty nodes
@@ -115,10 +122,7 @@ impl DurableBatchMPT {
         debug!("Batch upserting {} entries", entries.len());
 
         // Convert to sorted vector for efficient partitioning
-        let mut entries_vec: Vec<(Hash, Hash)> = entries.to_vec();
-        entries_vec.sort_by_key(|(k, _)| *k);
-        // Remove duplicates, keeping the last occurrence (latest value)
-        entries_vec.dedup_by_key(|(k, _)| *k);
+        let entries_vec = Self::sorted_unique_entries(entries);
 
         let batch_nodes = entries_vec.len();
         let limit_bytes = self.cache.cache_memory_limit_bytes();
@@ -187,46 +191,50 @@ impl DurableBatchMPT {
     }
 
     /// Insert all entries into an empty tree.
-    fn batch_insert_into_empty(&self, mut entries: Vec<(Hash, Hash)>) -> Prefix {
-        if entries.is_empty() {
+    fn batch_insert_into_empty(&self, entries: Vec<(Hash, Hash)>) -> Prefix {
+        let mut entries_iter = entries.into_iter();
+        let Some((first_key, first_value)) = entries_iter.next() else {
             return Prefix::root();
-        }
-
-        // Start with the first entry
-        let (first_key, first_value) = entries.remove(0);
+        };
 
         let first_prefix = Prefix::from(first_key);
         let first_leaf = LeafNode::new(first_key, first_value);
         self.cache.set(first_prefix, Node::Leaf(first_leaf));
 
         // Recursively insert remaining entries
-        self.recursive_batch_upsert(first_prefix, entries)
+        self.recursive_batch_upsert(first_prefix, entries_iter.collect())
     }
 
     /// Batch upsert at a leaf node.
-    fn batch_upsert_at_leaf(&self, leaf: LeafNode, mut entries: Vec<(Hash, Hash)>) -> Prefix {
+    fn batch_upsert_at_leaf(&self, leaf: LeafNode, entries: Vec<(Hash, Hash)>) -> Prefix {
         let leaf_prefix = Prefix::from(leaf.key);
 
-        // Check if any entry updates this leaf (using binary search since entries are sorted)
-        if let Ok(idx) = entries.binary_search_by_key(&leaf.key, |(k, _)| *k) {
-            let (_, new_value) = entries.remove(idx);
+        // Partition entries into updates for this leaf and remaining inserts
+        let (mut updates, remaining): (Vec<_>, Vec<_>) =
+            entries.into_iter().partition(|(key, _)| *key == leaf.key);
+
+        if let Some((_, new_value)) = updates.pop() {
             let updated_leaf = LeafNode::new(leaf.key, new_value);
             self.cache.set(leaf_prefix, Node::Leaf(updated_leaf));
 
-            if entries.is_empty() {
+            if remaining.is_empty() {
                 return leaf_prefix;
             }
             // Continue inserting remaining entries
-            return self.recursive_batch_upsert(leaf_prefix, entries);
+            return self.recursive_batch_upsert(leaf_prefix, remaining);
         }
 
-        if entries.is_empty() {
+        if remaining.is_empty() {
             return leaf_prefix;
         }
 
         // Split: need to create interior node(s) and distribute entries
         // Start with the first non-matching entry
-        let (first_key, first_value) = entries.remove(0);
+        let mut remaining_iter = remaining.into_iter();
+        let (first_key, first_value) = remaining_iter
+            .next()
+            .expect("remaining is non-empty so first element must exist");
+        let remaining = remaining_iter.collect();
 
         let new_leaf = LeafNode::new(first_key, first_value);
         let new_prefix = Prefix::from(first_key);
@@ -255,7 +263,7 @@ impl DurableBatchMPT {
         self.cache.set(new_prefix, Node::Leaf(new_leaf));
 
         // Continue with remaining entries
-        self.recursive_batch_upsert(merged_prefix, entries)
+        self.recursive_batch_upsert(merged_prefix, remaining)
     }
 
     /// Batch upsert at an interior node.
@@ -265,22 +273,14 @@ impl DurableBatchMPT {
         entries: Vec<(Hash, Hash)>,
     ) -> Prefix {
         // Partition entries: those that belong under this node vs. those that diverge
-        let mut contained_entries = Vec::new();
-        let mut divergent_entries = Vec::new();
-
-        for &(key, value) in entries.iter() {
-            if interior.prefix.contains(&key) {
-                contained_entries.push((key, value));
-            } else {
-                divergent_entries.push((key, value));
-            }
-        }
+        let (mut contained_entries, divergent_entries): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .partition(|(key, _)| interior.prefix.contains(key));
 
         // Handle divergent entries first (they require creating a new parent)
-        if !divergent_entries.is_empty() {
+        let mut divergent_iter = divergent_entries.into_iter();
+        if let Some((first_key, first_value)) = divergent_iter.next() {
             // Create new parent(s) for divergent entries
-            let (first_key, first_value) = divergent_entries.remove(0);
-
             let new_leaf = LeafNode::new(first_key, first_value);
             let new_leaf_prefix = Prefix::from(first_key);
             let common = Prefix::common_prefix(&interior.prefix, &new_leaf_prefix);
@@ -301,22 +301,15 @@ impl DurableBatchMPT {
             self.cache.set(new_leaf_prefix, Node::Leaf(new_leaf));
 
             // Merge remaining entries and continue
-            contained_entries.extend(divergent_entries);
+            contained_entries.extend(divergent_iter);
             return self.recursive_batch_upsert(common, contained_entries);
         }
 
         // All entries belong under this interior node
         // Partition them by left/right
-        let mut left_entries = Vec::new();
-        let mut right_entries = Vec::new();
-
-        for &(key, value) in contained_entries.iter() {
-            if interior.prefix.key_goes_right(key) {
-                right_entries.push((key, value));
-            } else {
-                left_entries.push((key, value));
-            }
-        }
+        let (left_entries, right_entries): (Vec<_>, Vec<_>) = contained_entries
+            .into_iter()
+            .partition(|(key, _)| !interior.prefix.key_goes_right(*key));
 
         // Recursively process left and right subtrees in parallel using rayon
         let (new_left, new_right) = rayon::join(
@@ -426,9 +419,7 @@ impl MerklePatriciaTree for DurableBatchMPT {
         }
 
         // Sort entries by key so chunk boundaries follow key order
-        let mut sorted_entries = entries.to_vec();
-        sorted_entries.sort_by_key(|(key, _)| *key);
-        sorted_entries.dedup_by_key(|(key, _)| *key);
+        let sorted_entries = Self::sorted_unique_entries(entries);
 
         // Determine chunk size based on cache memory limit; fall back to whole batch if unlimited
         let limit_bytes = self.cache.cache_memory_limit_bytes();
@@ -584,11 +575,6 @@ mod tests {
         initial_entries.push((key2, [20u8; 32]));
         initial_entries.push((key3, [30u8; 32]));
         mpt.batch_upsert(&initial_entries);
-
-        let prefixes: Vec<Prefix> = initial_entries
-            .iter()
-            .map(|(key, _)| Prefix::from(*key))
-            .collect();
 
         mpt.cache.release_keys(&[]);
 

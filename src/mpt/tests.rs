@@ -102,7 +102,7 @@ test_all_impls!(test_two_inserts, {
     mpt.upsert(key2, value2);
 
     // Should have interior node + 2 leaf nodes = 3 nodes
-    for (prefix, node) in mpt.enumerate_nodes() {
+    for (prefix, _node) in mpt.enumerate_nodes() {
         println!("Node prefix: {:?}", prefix);
     }
     assert_eq!(count_nodes(&mpt), 3);
