@@ -110,12 +110,16 @@ impl Prefix {
         if self.length > other.length {
             return false;
         }
-        for i in 0..self.length {
-            if self.hash.get_bit(i) != other.hash.get_bit(i) {
-                return false;
-            }
+        let full_bytes = (self.length / 8) as usize;
+        if self.hash[..full_bytes] != other.hash[..full_bytes] {
+            return false;
         }
-        true
+        let remaining_bits = (self.length % 8) as u8;
+        if remaining_bits == 0 {
+            return true;
+        }
+        let mask = 0xFF << (8 - remaining_bits);
+        (self.hash[full_bytes] & mask) == (other.hash[full_bytes] & mask)
     }
 
     pub fn contains(&self, key: &Hash) -> bool {

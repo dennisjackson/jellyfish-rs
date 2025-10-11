@@ -34,7 +34,7 @@ pub struct Cache {
 
 const ROOT_METADATA_KEY: &str = "root_prefix";
 
-pub(crate) const DEFAULT_CACHE_MEMORY_LIMIT_BYTES: usize = 1024*1024*10; //8 * 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_CACHE_MEMORY_LIMIT_BYTES: usize = 1024*1024*10; //10 MB
 
 const CACHE_ENTRY_SIZE_BYTES: usize = std::mem::size_of::<Prefix>() + std::mem::size_of::<Node>();
 
@@ -464,7 +464,7 @@ impl Cache {
             queried_nodes += siblings.len();
             // Insert all queried nodes into cache
             for (prefix, node) in siblings {
-                self.map.insert(prefix, node.clone());
+                self.map.insert(prefix, node);
             }
         }
 
