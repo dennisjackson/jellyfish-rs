@@ -1,5 +1,5 @@
 use dashmap::{DashMap, DashSet, mapref::one::Ref as DashMapRef};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use rusqlite::{
     Connection, OptionalExtension, Result as SqliteResult, limits::Limit, params, types::Type,
 };
@@ -34,7 +34,7 @@ pub struct Cache {
 
 const ROOT_METADATA_KEY: &str = "root_prefix";
 
-pub(crate) const DEFAULT_CACHE_MEMORY_LIMIT_BYTES: usize = 8 * 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_CACHE_MEMORY_LIMIT_BYTES: usize = 1024*1024*10; //8 * 1024 * 1024 * 1024;
 
 const CACHE_ENTRY_SIZE_BYTES: usize = std::mem::size_of::<Prefix>() + std::mem::size_of::<Node>();
 
@@ -233,6 +233,7 @@ impl Cache {
             return;
         }
 
+        info!("Releasing keys to maintain cache limit");
         let mut candidates: Vec<(Prefix, u16)> = Vec::new();
         {
             for entry in self.map.iter() {
@@ -263,7 +264,7 @@ impl Cache {
         }
 
         if current_usage > self.cache_memory_limit_bytes {
-            debug!(
+            warn!(
                 "release_keys: cache remains above limit (usage={} bytes, limit={} bytes)",
                 current_usage, self.cache_memory_limit_bytes
             );
@@ -365,12 +366,18 @@ impl Cache {
             "Pre-advise for {} keys, starting from root",
             needed_keys.len()
         );
+        for x in needed_keys.iter() {
+            debug!("  Needed key: {:?}", x.short_hex());
+        }
         while !needed_keys.is_empty() && !current_frontier.is_empty() {
             debug!(
                 "Iterating. Need {} keys, frontier size {}",
                 needed_keys.len(),
                 current_frontier.len()
             );
+            for x in &current_frontier {
+                debug!("  Frontier node: {:?}", x.short_hex());
+            }
             let mut frontier_nodes: Vec<Node> = Vec::new();
 
             // Separate frontier into cached and uncached nodes
@@ -401,7 +408,9 @@ impl Cache {
             // At this point, all frontier nodes are in the cache.
             frontier_nodes.extend(new_nodes.iter().map(|(_, n)| n.clone()));
             current_frontier.clear();
-
+            for x in frontier_nodes.iter() {
+                debug!("  Loaded frontier node: {}", x);
+            }
             //Now we can remove any nodes we just loaded from the needed keys.
             for node in &frontier_nodes {
                 if let Node::Leaf(leaf) = node {
@@ -415,17 +424,20 @@ impl Cache {
             for node in &frontier_nodes {
                 if let Node::Interior(interior) = node {
                     for nk in needed_keys.iter() {
+                        let mut nk_prefix = Prefix::from(nk.hash);
                         if interior.left.prefix_of(nk) {
                             current_frontier.insert(interior.left);
                         } else if self.map.contains_key(&interior.left) {
-                            continue;
+                            nk_prefix.length = interior.left.length;
+                            debug!("nk_prefix {} is not a prefix of {}", nk_prefix.short_hex(), interior.left.short_hex());
                         } else {
                             siblings_to_load.push(interior.left);
                         }
                         if interior.right.prefix_of(nk) {
                             current_frontier.insert(interior.right);
                         } else if self.map.contains_key(&interior.right) {
-                            continue;
+                            nk_prefix.length = interior.left.length;
+                            debug!("nk_prefix {} is not a prefix of {}", nk_prefix.short_hex(), interior.right.short_hex());
                         } else {
                             siblings_to_load.push(interior.right);
                         }
@@ -434,9 +446,10 @@ impl Cache {
             }
 
             debug!(
-                "Identified {} siblings to load and {} next frontier nodes",
+                "Identified {} siblings to load and {} next frontier nodes for {} needed keys",
                 siblings_to_load.len(),
-                current_frontier.len()
+                current_frontier.len(),
+                needed_keys.len()
             );
 
             let siblings = self.batch_query_nodes(&db, &siblings_to_load)?;
@@ -474,7 +487,7 @@ impl Cache {
     pub fn flush(&self) -> SqliteResult<()> {
         let dirty_keys: Vec<Prefix> = self.dirty.iter().map(|entry| *entry).collect();
         let root_dirty = self.root_dirty.load(Ordering::SeqCst);
-
+        info!("Flushing {} dirty nodes", dirty_keys.len());
         if dirty_keys.is_empty() && !root_dirty {
             // Even if no dirty keys, commit the transaction if one is active
             let mut in_tx = self.in_transaction.lock().unwrap();
@@ -520,7 +533,7 @@ impl Cache {
 
                     for key in &dirty_keys {
                         if let Some(node) = self.map.get(key) {
-                            debug!("Flushing dirty key {:?}", key);
+                            debug!("Flushing dirty key {:?}", key.short_hex());
                             let (node_type, node_data) = node
                                 .value()
                                 .serialize()

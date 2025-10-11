@@ -1,6 +1,8 @@
+use std::fmt;
+
 use sha2::Digest;
 
-use crate::{Hash, Prefix};
+use crate::{prefix::HashExt, Hash, Prefix};
 
 mod simple;
 pub use simple::SimpleMPT;
@@ -39,6 +41,18 @@ impl LeafNode {
     }
 }
 
+impl fmt::Display for LeafNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Leaf(key={}, value={}, hash={})",
+            self.key.short_hex(),
+            self.value.short_hex(),
+            self.merkle_hash.short_hex()
+        )
+    }
+}
+
 #[derive(Clone)]
 pub struct InteriorNode {
     pub prefix: Prefix,
@@ -71,6 +85,19 @@ impl InteriorNode {
         hasher.update(left_hash);
         hasher.update(right_hash);
         hasher.finalize().into()
+    }
+}
+
+impl fmt::Display for InteriorNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Interior(prefix={}, left={}, right={}, hash={})",
+            self.prefix.short_hex(),
+            self.left.short_hex(),
+            self.right.short_hex(),
+            self.merkle_hash.short_hex()
+        )
     }
 }
 
@@ -142,6 +169,15 @@ impl Node {
                 }))
             }
             _ => Err(format!("Unknown node type: {}", node_type)),
+        }
+    }
+}
+
+impl fmt::Display for Node {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Node::Leaf(leaf) => write!(f, "{leaf}"),
+            Node::Interior(interior) => write!(f, "{interior}"),
         }
     }
 }

@@ -519,6 +519,50 @@ mod tests {
     }
 
     #[test]
+    fn test_release_pre_advise_then_batch_upsert() {
+        let _ = env_logger::builder().is_test(true).filter(None, log::LevelFilter::Debug).try_init();
+        let mut mpt = DurableBatchMPT::new();
+
+        let key1 = [1u8; 32];
+        let key2 = [2u8; 32];
+        let key3 = [3u8; 32];
+
+        let mut initial_entries: Vec<(Hash, Hash)> = Vec::new();
+        for i in 0..100_000 {
+            let mut key = [0u8; 32];
+            let mut value = [0u8; 32];
+            key[0] = (i / 256) as u8;
+            key[1] = (i % 256) as u8;
+            value[0] = (i % 128) as u8;
+            initial_entries.push((key, value));
+        }
+
+        initial_entries.push((key1, [10u8; 32]));
+        initial_entries.push((key2, [20u8; 32]));
+        initial_entries.push((key3, [30u8; 32]));
+        mpt.batch_upsert(&initial_entries);
+
+        let prefixes: Vec<Prefix> = initial_entries
+            .iter()
+            .map(|(key, _)| Prefix::from(*key))
+            .collect();
+
+        mpt.cache.release_keys(&[]);
+
+        let updated_value_for_key2 = [200u8; 32];
+        let key4 = [4u8; 32];
+        let value4 = [40u8; 32];
+
+        let second_batch: Vec<(Hash, Hash)> = vec![(key2, updated_value_for_key2), (key4, value4)];
+        mpt.batch_upsert(&second_batch);
+
+        assert_eq!(mpt.get_leaf_value(key1), Some([10u8; 32]));
+        assert_eq!(mpt.get_leaf_value(key2), Some(updated_value_for_key2));
+        assert_eq!(mpt.get_leaf_value(key3), Some([30u8; 32]));
+        assert_eq!(mpt.get_leaf_value(key4), Some(value4));
+    }
+
+    #[test]
     fn test_root_persisted_across_restarts() {
         let temp_dir = env::temp_dir();
         let pid = std::process::id();
