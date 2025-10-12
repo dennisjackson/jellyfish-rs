@@ -25,26 +25,14 @@ impl DurableBatchMPT {
     /// Create a new durable MPT with the given SQLite database path.
     pub fn new_with_path(db_path: &str) -> SqliteResult<Self> {
         let conn = Connection::open(db_path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
         Self::configure_safety_pragmas(&conn, true)?;
 
-        // Enable foreign key constraints for referential integrity
-        // conn.execute("PRAGMA foreign_keys = ON", [])?;
-
-        // Set a reasonable busy timeout (5 seconds) for handling concurrent access
-        // conn.execute("PRAGMA busy_timeout = 5000", [])?;
-
-        // Enable auto_vacuum to reclaim disk space when data is deleted
-        // conn.execute("PRAGMA auto_vacuum = INCREMENTAL", [])?;
-
-        // Initialize database schema
         Cache::initialize_database(&conn)?;
 
         let db = Arc::new(Mutex::new(conn));
         let cache = Cache::new(Arc::clone(&db));
 
         let root = cache.get_root();
-        // Ensure the cached root node is available if it exists on disk.
         cache.get_or_load(root)?;
 
         Ok(Self { cache, db, root })
@@ -65,6 +53,8 @@ impl DurableBatchMPT {
     }
 
     fn configure_safety_pragmas(conn: &Connection, enable: bool) -> SqliteResult<()> {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+
         // Andrew Ayer's advice: rely on PRAGMA fullfsync for durable SQLite WAL writes.
         conn.pragma_update(None, "fullfsync", enable)?;
         if enable {
@@ -82,17 +72,6 @@ impl DurableBatchMPT {
         sorted.sort_by_key(|(key, _)| *key);
         sorted.dedup_by_key(|(key, _)| *key);
         sorted
-    }
-
-    /// Write all dirty nodes back to SQLite.
-    fn flush_to_disk(&self) -> SqliteResult<()> {
-        // Use Cache::flush to write all dirty nodes
-        self.cache.flush()?;
-
-        // Note: tree_size metadata could be updated here if needed
-        // For now, we track it separately in memory
-
-        Ok(())
     }
 
     /// Helper to order two children based on whether the key goes right at the split point
@@ -356,11 +335,6 @@ impl DurableBatchMPT {
     pub fn clear_cache(&mut self) {
         self.cache.clear();
     }
-
-    /// Get cache statistics.
-    pub fn cache_stats(&self) -> (usize, usize) {
-        (self.cache.len(), self.cache.dirty_len())
-    }
 }
 
 impl MerklePatriciaTree for DurableBatchMPT {
@@ -449,7 +423,7 @@ impl MerklePatriciaTree for DurableBatchMPT {
             self.cache.release_keys(&prefix_buffer);
             self.cache.pre_advise(&prefix_buffer).unwrap();
             self.batch_upsert_optimized(chunk);
-            self.flush_to_disk().ok();
+            self.cache.flush().unwrap();
             start = end;
         }
     }

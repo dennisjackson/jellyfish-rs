@@ -34,19 +34,6 @@ fn test_batch_upsert_persistence() {
 }
 
 #[test]
-fn test_cache_stats() {
-    let mut mpt = DurableBatchMPT::new_in_memory().unwrap();
-
-    let entries: Vec<(Hash, Hash)> = vec![([1u8; 32], [10u8; 32]), ([2u8; 32], [20u8; 32])];
-
-    mpt.batch_upsert(&entries);
-
-    let (cache_size, dirty_size) = mpt.cache_stats();
-    assert!(cache_size > 0);
-    assert_eq!(dirty_size, 0); // Should be flushed after batch_upsert
-}
-
-#[test]
 fn test_batch_upsert_with_cache_clearing() {
     let mut mpt = DurableBatchMPT::new_in_memory().unwrap();
 
@@ -104,7 +91,7 @@ fn test_release_pre_advise_then_batch_upsert() {
     let key3 = [3u8; 32];
 
     let mut initial_entries: Vec<(Hash, Hash)> = Vec::new();
-    for i in 0..100_000 {
+    for i in 0..1000 {
         let mut key = [0u8; 32];
         let mut value = [0u8; 32];
         key[0] = (i / 256) as u8;

@@ -51,9 +51,6 @@ fn main() {
     println!("\nInserting {} entries into MPT...", entries.len());
     mpt.batch_upsert(&entries[1..2]);
 
-    println!("Entries inserted successfully!");
-    println!("Cache stats: {:?}", mpt.cache_stats());
-
     // Now open the database directly and dump all tables
     println!("\n=== SQLite Database Dump ===\n");
 
