@@ -409,7 +409,7 @@ impl Cache {
 
         // Begin a durable transaction
         let mut in_tx = self.in_transaction.lock().unwrap();
-        self.ensure_transaction(&db, &mut *in_tx)?;
+        self.ensure_transaction(&db, &mut in_tx)?;
         drop(in_tx); // Release lock before querying
 
         //Currently pretty inefficient. O(n^2) so we limit the max we process at once
@@ -527,7 +527,7 @@ impl Cache {
             // Even if no dirty keys, commit the transaction if one is active
             let db = self.db.lock().unwrap();
             let mut in_tx = self.in_transaction.lock().unwrap();
-            self.commit_transaction(&db, &mut *in_tx)?;
+            self.commit_transaction(&db, &mut in_tx)?;
             return Ok(());
         }
 
@@ -539,12 +539,12 @@ impl Cache {
 
             if dirty_keys.is_empty() {
                 // Only the root metadata needs to be persisted.
-                self.ensure_transaction(&db, &mut *in_tx)?;
+                self.ensure_transaction(&db, &mut in_tx)?;
                 self.persist_root_metadata(&db)?;
                 cleared_root_dirty = true;
-                self.commit_transaction(&db, &mut *in_tx)?;
+                self.commit_transaction(&db, &mut in_tx)?;
             } else {
-                self.ensure_transaction(&db, &mut *in_tx)?;
+                self.ensure_transaction(&db, &mut in_tx)?;
                 debug!(
                     "Flushing {} dirty nodes to database in a single transaction",
                     dirty_keys.len()
@@ -583,7 +583,7 @@ impl Cache {
                     cleared_root_dirty = true;
                 }
 
-                self.commit_transaction(&db, &mut *in_tx)?;
+                self.commit_transaction(&db, &mut in_tx)?;
                 for key in newly_persisted {
                     self.new_nodes.remove(&key);
                 }
