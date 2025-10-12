@@ -33,28 +33,31 @@ fn generate_range_test_data(start: u32, count: usize) -> Vec<(Hash, Hash)> {
 struct FreshScenario {
     group_name: &'static str,
     element_count: usize,
-    sample_size: Option<usize>,
+    sample_size: usize,
 }
 
-const FRESH_SCENARIOS: [FreshScenario; 2] = [
+const FRESH_SCENARIOS: [FreshScenario; 3] = [
     FreshScenario {
-        group_name: "fresh_1000_nodes",
+        group_name: "fresh_1k_nodes",
         element_count: 1_000,
-        sample_size: None,
+        sample_size: 10,
     },
     FreshScenario {
-        group_name: "fresh_10_000_nodes",
+        group_name: "fresh_10k_nodes",
         element_count: 10_000,
-        sample_size: None,
+        sample_size: 10,
+    },
+    FreshScenario {
+        group_name: "fresh_100k_nodes",
+        element_count: 100_000,
+        sample_size: 10,
     },
 ];
 
 fn benchmark_fresh(c: &mut Criterion) {
     for scenario in FRESH_SCENARIOS {
         let mut group = c.benchmark_group(scenario.group_name);
-        if let Some(sample_size) = scenario.sample_size {
-            group.sample_size(sample_size);
-        }
+        group.sample_size(scenario.sample_size);
         group.throughput(Throughput::Elements(scenario.element_count as u64));
 
         let data = Arc::new(generate_test_data(scenario.element_count));
@@ -100,63 +103,49 @@ fn benchmark_fresh(c: &mut Criterion) {
 }
 
 struct DurableBatchScenario {
-    group_name: &'static str,
     sample_size: usize,
     base_tree_size: usize,
     incremental_count: usize,
     safety_mode_enabled: bool,
 }
 
-const DURABLE_BATCH_SCENARIOS: [DurableBatchScenario; 6] = [
+const DURABLE_BATCH_SCENARIOS: [DurableBatchScenario; 4] = [
     DurableBatchScenario {
-        group_name: "durable_batch_sizes_10k_nodes",
         sample_size: 10,
         base_tree_size: 0,
-        incremental_count: 10_000,
+        incremental_count: 100_000,
         safety_mode_enabled: true,
     },
     DurableBatchScenario {
-        group_name: "durable_batch_sizes_100k_nodes",
-        sample_size: 10,
-        base_tree_size: 100_000,
-        incremental_count: 10_000,
-        safety_mode_enabled: true,
-    },
-    DurableBatchScenario {
-        group_name: "durable_batch_sizes_1m_nodes",
         sample_size: 10,
         base_tree_size: 1_000_000,
-        incremental_count: 10_000,
+        incremental_count: 100_000,
         safety_mode_enabled: true,
     },
     DurableBatchScenario {
-        group_name: "durable_batch_sizes_10k_nodes_no_safety_mode",
         sample_size: 10,
         base_tree_size: 0,
-        incremental_count: 10_000,
+        incremental_count: 100_000,
         safety_mode_enabled: false,
     },
     DurableBatchScenario {
-        group_name: "durable_batch_sizes_100k_nodes_no_safety_mode",
-        sample_size: 10,
-        base_tree_size: 100_000,
-        incremental_count: 10_000,
-        safety_mode_enabled: false,
-    },
-    DurableBatchScenario {
-        group_name: "durable_batch_sizes_1m_nodes_no_safety_mode",
         sample_size: 10,
         base_tree_size: 1_000_000,
-        incremental_count: 10_000,
+        incremental_count: 100_000,
         safety_mode_enabled: false,
     },
 ];
 
-const BATCH_SIZES: [usize; 3] = [500, 1000, 10_000];
+const BATCH_SIZES: [usize; 3] = [1_000, 5_000, 10_000];
 
 fn benchmark_durable_batch_sizes(c: &mut Criterion) {
     for scenario in DURABLE_BATCH_SCENARIOS {
-        let mut group = c.benchmark_group(scenario.group_name);
+        let mut group = c.benchmark_group(format!(
+            "durable_batch_base_{}_incremental_{}_safety_{}",
+            scenario.base_tree_size,
+            scenario.incremental_count,
+            scenario.safety_mode_enabled
+        ));
         group.sample_size(scenario.sample_size);
         group.throughput(Throughput::Elements(scenario.incremental_count as u64));
 
