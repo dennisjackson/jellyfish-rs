@@ -156,3 +156,75 @@ fn test_root_persisted_across_restarts() {
     let _ = std::fs::remove_file(wal_path);
     let _ = std::fs::remove_file(shm_path);
 }
+
+#[test]
+fn test_new_existing_with_path_requires_initialized_database() {
+    let temp_dir = env::temp_dir();
+    let pid = std::process::id();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let db_path = temp_dir.join(format!(
+        "durable_batch_existing_missing_{}_{}.db",
+        pid, timestamp
+    ));
+    let db_path_str = db_path.to_string_lossy().to_string();
+
+    let result = DurableBatchMPT::new_existing_with_path(&db_path_str);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_new_existing_with_path_rejects_uninitialized_file() {
+    let temp_dir = env::temp_dir();
+    let pid = std::process::id();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let db_path = temp_dir.join(format!(
+        "durable_batch_existing_uninit_{}_{}.db",
+        pid, timestamp
+    ));
+    let db_path_str = db_path.to_string_lossy().to_string();
+
+    std::fs::File::create(&db_path).unwrap();
+
+    let result = DurableBatchMPT::new_existing_with_path(&db_path_str);
+    assert!(result.is_err());
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_new_existing_with_path_succeeds_for_seeded_database() {
+    let temp_dir = env::temp_dir();
+    let pid = std::process::id();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let db_path = temp_dir.join(format!(
+        "durable_batch_existing_seeded_{}_{}.db",
+        pid, timestamp
+    ));
+    let db_path_str = db_path.to_string_lossy().to_string();
+
+    let key = [7u8; 32];
+    let value = [9u8; 32];
+
+    {
+        let mut builder = DurableBatchMPT::new_with_path(&db_path_str).unwrap();
+        builder.upsert(key, value);
+        assert_eq!(builder.get_leaf_value(key), Some(value));
+    }
+
+    let loaded = DurableBatchMPT::new_existing_with_path(&db_path_str).unwrap();
+    assert_eq!(loaded.get_leaf_value(key), Some(value));
+    drop(loaded);
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+}

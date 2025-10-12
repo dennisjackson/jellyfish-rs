@@ -41,7 +41,7 @@ pub struct Cache {
     cache_memory_limit_bytes: usize,
 }
 
-const ROOT_METADATA_KEY: &str = "root_prefix";
+pub(crate) const ROOT_METADATA_KEY: &str = "root_prefix";
 
 pub(crate) const DEFAULT_CACHE_MEMORY_LIMIT_BYTES: usize = 1024 * 1024 * 1024; //10 MB
 
@@ -371,6 +371,7 @@ impl Cache {
         } else {
             std::cmp::max(1, (max_variables as usize) / PARAMS_PER_PREFIX)
         };
+        let chunk_size = std::cmp::min(chunk_size, 1000);
 
         let mut results: Vec<(Prefix, Node)> = Vec::with_capacity(prefixes.len());
         let mut query_buffer = String::new();
@@ -384,18 +385,26 @@ impl Cache {
                 param_buffer.push(BatchQueryParam::Length(prefix.length as i64));
             }
 
-            let mut stmt = db.prepare_cached(query_buffer.as_str())?;
-
-            let rows = stmt.query_map(
-                params_from_iter(param_buffer.iter().copied()),
-                read_node_from_row,
-            )?;
-
-            for node in rows {
-                results.push(node?);
-            }
+            if chunk.len() == chunk_size {
+                let mut stmt = db.prepare_cached(query_buffer.as_str())?;
+                let rows = stmt.query_map(
+                    params_from_iter(param_buffer.iter().copied()),
+                    read_node_from_row,
+                )?;
+                for node in rows {
+                    results.push(node?);
+                }
+            } else {
+                let mut stmt = db.prepare(query_buffer.as_str())?;
+                let rows = stmt.query_map(
+                    params_from_iter(param_buffer.iter().copied()),
+                    read_node_from_row,
+                )?;
+                for node in rows {
+                    results.push(node?);
+                }
+            };
         }
-
         Ok(results)
     }
 

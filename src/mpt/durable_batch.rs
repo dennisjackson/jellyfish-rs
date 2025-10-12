@@ -1,12 +1,15 @@
 use log::{debug, warn};
-use rusqlite::{Connection, Result as SqliteResult};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Result as SqliteResult};
 use std::env;
 use std::sync::{Arc, Mutex};
 
 use crate::mpt::MerklePatriciaTree;
 use crate::{Hash, Prefix};
 
-use super::{Cache, InteriorNode, LeafNode, Node, cache::DEFAULT_CACHE_MEMORY_LIMIT_BYTES};
+use super::{
+    Cache, InteriorNode, LeafNode, Node,
+    cache::{DEFAULT_CACHE_MEMORY_LIMIT_BYTES, ROOT_METADATA_KEY},
+};
 
 /// A durable batch-optimized Merkle Patricia Tree implementation backed by SQLite.
 /// This implementation performs batch upserts by:
@@ -27,22 +30,25 @@ impl DurableBatchMPT {
         db_path: &str,
         cache_memory_limit_bytes: usize,
     ) -> SqliteResult<Self> {
-        let conn = Connection::open(db_path)?;
-        Self::configure_safety_pragmas(&conn, true)?;
-
-        Cache::initialize_database(&conn)?;
-
-        let db = Arc::new(Mutex::new(conn));
-        let cache = Cache::new_with_limit(Arc::clone(&db), cache_memory_limit_bytes);
-
-        let root = cache.get_root();
-
-        Ok(Self { cache, db, root })
+        Self::new_with_path_internal(db_path, cache_memory_limit_bytes, false)
     }
 
     /// Create a new durable MPT with the given SQLite database path.
     pub fn new_with_path(db_path: &str) -> SqliteResult<Self> {
         Self::new_with_path_and_cache_limit(db_path, DEFAULT_CACHE_MEMORY_LIMIT_BYTES)
+    }
+
+    /// Open an existing durable MPT, verifying that the database has already been initialized.
+    pub fn new_existing_with_path(db_path: &str) -> SqliteResult<Self> {
+        Self::new_existing_with_path_and_cache_limit(db_path, DEFAULT_CACHE_MEMORY_LIMIT_BYTES)
+    }
+
+    /// Open an existing durable MPT with the given SQLite database path and cache limit.
+    pub fn new_existing_with_path_and_cache_limit(
+        db_path: &str,
+        cache_memory_limit_bytes: usize,
+    ) -> SqliteResult<Self> {
+        Self::new_with_path_internal(db_path, cache_memory_limit_bytes, true)
     }
 
     /// Create a new in-memory durable MPT (for testing).
@@ -66,6 +72,34 @@ impl DurableBatchMPT {
         Self::configure_safety_pragmas(&conn, enable).expect("Failed to set safety pragmas");
     }
 
+    fn new_with_path_internal(
+        db_path: &str,
+        cache_memory_limit_bytes: usize,
+        require_existing: bool,
+    ) -> SqliteResult<Self> {
+        let conn = if require_existing {
+            Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?
+        } else {
+            Connection::open_with_flags(
+                db_path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            )?
+        };
+
+        if require_existing {
+            Self::validate_existing_database(&conn)?;
+        }
+
+        Self::configure_safety_pragmas(&conn, true)?;
+        Cache::initialize_database(&conn)?;
+
+        let db = Arc::new(Mutex::new(conn));
+        let cache = Cache::new_with_limit(Arc::clone(&db), cache_memory_limit_bytes);
+        let root = cache.get_root();
+
+        Ok(Self { cache, db, root })
+    }
+
     fn configure_safety_pragmas(conn: &Connection, enable: bool) -> SqliteResult<()> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
 
@@ -79,6 +113,54 @@ impl DurableBatchMPT {
             conn.execute("PRAGMA synchronous = NORMAL", [])?;
         }
         Ok(())
+    }
+
+    fn validate_existing_database(conn: &Connection) -> SqliteResult<()> {
+        if !Self::table_exists(conn, "metadata")? {
+            return Err(Self::existing_database_error(
+                "DurableBatch database is missing the metadata table",
+            ));
+        }
+
+        if !Self::table_exists(conn, "nodes")? {
+            return Err(Self::existing_database_error(
+                "DurableBatch database is missing the nodes table",
+            ));
+        }
+
+        let mut stmt = conn.prepare("SELECT 1 FROM metadata WHERE key = ?1 LIMIT 1")?;
+        let has_root_metadata = stmt
+            .query_row([ROOT_METADATA_KEY], |_| Ok(()))
+            .optional()?
+            .is_some();
+
+        if !has_root_metadata {
+            return Err(Self::existing_database_error(
+                "DurableBatch database is missing the persisted root metadata entry",
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn table_exists(conn: &Connection, table_name: &str) -> SqliteResult<bool> {
+        let mut stmt =
+            conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1 LIMIT 1")?;
+
+        Ok(stmt
+            .query_row([table_name], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    fn existing_database_error(message: impl Into<String>) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseCorrupt,
+                extended_code: rusqlite::ErrorCode::DatabaseCorrupt as i32,
+            },
+            Some(message.into()),
+        )
     }
 
     fn sorted_unique_entries(entries: &[(Hash, Hash)]) -> Vec<(Hash, Hash)> {

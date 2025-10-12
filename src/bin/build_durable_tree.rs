@@ -49,14 +49,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         "Building durable MPT with tree_size={} and batch_size={}",
         tree_size, batch_size
     );
-
+    let mut offset = rand::random::<u32>();
     let mut inserted = 0usize;
     let mut batches = 0usize;
     let mut total_duration = Duration::ZERO;
     while inserted < tree_size {
         let remaining = tree_size - inserted;
         let current_batch = remaining.min(batch_size);
-        let entries = generate_batch(inserted, current_batch);
+        let entries = generate_batch(offset, inserted, current_batch);
         let batch_start = Instant::now();
         tree.batch_upsert(&entries);
         let batch_duration = batch_start.elapsed();
@@ -119,8 +119,8 @@ fn ensure_parent(path_str: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn generate_batch(start: usize, count: usize) -> Vec<(Hash, Hash)> {
-    (start..start + count)
+fn generate_batch(offset: u32, start: usize, count: usize) -> Vec<(Hash, Hash)> {
+    (offset as usize + start..offset as usize + start + count)
         .map(|i| {
             let mut key_hasher = Sha256::new();
             key_hasher.update(b"key");
