@@ -188,7 +188,7 @@ fn benchmark_durable_batch_sizes(c: &mut Criterion) {
             .map(|path| Arc::new(path.clone()));
 
         for &chunk_size in &BATCH_SIZES {
-            let incremental_data = Arc::new(generate_test_data(chunk_size));
+            let incremental_data = Arc::new(generate_test_data(chunk_size*5));
             group.throughput(Throughput::Elements(chunk_size as u64));
             let bench_name = format!("batch_size_{}", chunk_size);
             let incremental_data = Arc::clone(&incremental_data);
