@@ -104,26 +104,51 @@ struct DurableBatchScenario {
     sample_size: usize,
     base_tree_size: usize,
     incremental_count: usize,
+    safety_mode_enabled: bool,
 }
 
-const DURABLE_BATCH_SCENARIOS: [DurableBatchScenario; 3] = [
+const DURABLE_BATCH_SCENARIOS: [DurableBatchScenario; 6] = [
     DurableBatchScenario {
         group_name: "durable_batch_sizes_10k_nodes",
         sample_size: 10,
         base_tree_size: 0,
         incremental_count: 10_000,
+        safety_mode_enabled: true,
     },
     DurableBatchScenario {
         group_name: "durable_batch_sizes_100k_nodes",
         sample_size: 10,
         base_tree_size: 100_000,
         incremental_count: 10_000,
+        safety_mode_enabled: true,
     },
     DurableBatchScenario {
         group_name: "durable_batch_sizes_1m_nodes",
         sample_size: 10,
         base_tree_size: 1_000_000,
         incremental_count: 10_000,
+        safety_mode_enabled: true,
+    },
+    DurableBatchScenario {
+        group_name: "durable_batch_sizes_10k_nodes_no_safety_mode",
+        sample_size: 10,
+        base_tree_size: 0,
+        incremental_count: 10_000,
+        safety_mode_enabled: false,
+    },
+    DurableBatchScenario {
+        group_name: "durable_batch_sizes_100k_nodes_no_safety_mode",
+        sample_size: 10,
+        base_tree_size: 100_000,
+        incremental_count: 10_000,
+        safety_mode_enabled: false,
+    },
+    DurableBatchScenario {
+        group_name: "durable_batch_sizes_1m_nodes_no_safety_mode",
+        sample_size: 10,
+        base_tree_size: 1_000_000,
+        incremental_count: 10_000,
+        safety_mode_enabled: false,
     },
 ];
 
@@ -146,21 +171,24 @@ fn benchmark_durable_batch_sizes(c: &mut Criterion) {
             let bench_name = format!("batch_size_{}", chunk_size);
             let incremental_data = Arc::clone(&incremental_data);
             let base_data = base_data.as_ref().map(Arc::clone);
+            let safety_mode_enabled = scenario.safety_mode_enabled;
 
             group.bench_function(bench_name, move |b| {
                 let incremental_data = Arc::clone(&incremental_data);
                 let base_data = base_data.as_ref().map(Arc::clone);
+                let safety_mode_enabled = safety_mode_enabled;
 
                 b.iter_batched(
                     {
                         let base_data = base_data.clone();
+                        let safety_mode_enabled = safety_mode_enabled;
                         move || {
                             let mut tree = DurableBatchMPT::new();
                             if let Some(base_data) = base_data.as_ref() {
                                 tree.set_safety_mode(false);
                                 tree.batch_upsert(base_data.as_slice());
-                                tree.set_safety_mode(true);
                             }
+                            tree.set_safety_mode(safety_mode_enabled);
                             tree
                         }
                     },
@@ -182,10 +210,6 @@ fn benchmark_durable_batch_sizes(c: &mut Criterion) {
     }
 }
 
-criterion_group!(
-    benches,
-    benchmark_fresh,
-    benchmark_durable_batch_sizes,
-);
+criterion_group!(benches, benchmark_fresh, benchmark_durable_batch_sizes,);
 
 criterion_main!(benches);
