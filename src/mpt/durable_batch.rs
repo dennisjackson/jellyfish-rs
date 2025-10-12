@@ -33,7 +33,6 @@ impl DurableBatchMPT {
         let cache = Cache::new(Arc::clone(&db));
 
         let root = cache.get_root();
-        cache.get_or_load(root)?;
 
         Ok(Self { cache, db, root })
     }
@@ -147,20 +146,7 @@ impl DurableBatchMPT {
 
         let node = match self.cache.get(&current_prefix) {
             Some(node) => node.value().clone(),
-            None => match self.cache.get_or_load(current_prefix) {
-                Ok(Some(node)) => node.value().clone(),
-                Ok(None) => {
-                    // Empty tree: insert all entries
-                    return self.batch_insert_into_empty(entries);
-                }
-                Err(err) => {
-                    warn!(
-                        "Failed to load node {:?} from cache during batch upsert: {}",
-                        current_prefix, err
-                    );
-                    return self.batch_insert_into_empty(entries);
-                }
-            },
+            None => return self.batch_insert_into_empty(entries),
         };
 
         match node {
@@ -364,14 +350,8 @@ impl MerklePatriciaTree for DurableBatchMPT {
     }
 
     fn get_root_hash(&self) -> Option<Hash> {
-        match self.cache.get_or_load(self.root) {
-            Ok(Some(node)) => Some(node.value().merkle_hash()),
-            Ok(None) => None,
-            Err(err) => {
-                warn!("Failed to load root node from cache: {}", err);
-                None
-            }
-        }
+        self.cache.pre_advise(&[self.root]).unwrap();
+        self.cache.get(&self.root).map(|node| node.value().merkle_hash())
     }
 
     fn get_leaf_value(&self, key: Hash) -> Option<Hash> {

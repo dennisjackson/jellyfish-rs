@@ -157,25 +157,6 @@ impl Cache {
         self.map.get(key)
     }
 
-    /// Retrieve a node, loading it from the database if necessary.
-    pub fn get_or_load(&self, key: Prefix) -> SqliteResult<Option<NodeReadGuard<'_>>> {
-        if let Some(node) = self.map.get(&key) {
-            return Ok(Some(node));
-        }
-
-        let mut nodes = {
-            let db = self.db.lock().unwrap();
-            self.batch_query_nodes(&db, &[key])?
-        };
-
-        if let Some((_, node)) = nodes.pop() {
-            self.map.insert(key, node);
-            Ok(self.map.get(&key))
-        } else {
-            Ok(None)
-        }
-    }
-
     /// Insert or update a node in the cache.
     /// Automatically marks the key as dirty for later flushing.
     pub fn set(&self, key: Prefix, value: Node) {
