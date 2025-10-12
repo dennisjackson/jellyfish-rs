@@ -61,9 +61,9 @@ impl DurableBatchMPT {
     /// Enabling these settings maximizes crash safety at the cost of write throughput.
     /// Disabling them trades some durability for speed, which can be useful when the caller
     /// provides its own durability guarantees or during bulk imports.
-    pub fn set_safety_mode(&self, enable: bool) -> SqliteResult<()> {
+    pub fn set_safety_mode(&self, enable: bool) {
         let conn = self.db.lock().unwrap();
-        Self::configure_safety_pragmas(&conn, enable)
+        Self::configure_safety_pragmas(&conn, enable).expect("Failed to set safety pragmas");
     }
 
     fn configure_safety_pragmas(conn: &Connection, enable: bool) -> SqliteResult<()> {
