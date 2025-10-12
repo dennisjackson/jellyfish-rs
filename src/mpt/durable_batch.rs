@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use crate::mpt::MerklePatriciaTree;
 use crate::{Hash, Prefix};
 
-use super::{Cache, InteriorNode, LeafNode, Node};
+use super::{Cache, InteriorNode, LeafNode, Node, cache::DEFAULT_CACHE_MEMORY_LIMIT_BYTES};
 
 /// A durable batch-optimized Merkle Patricia Tree implementation backed by SQLite.
 /// This implementation performs batch upserts by:
@@ -22,24 +22,39 @@ pub struct DurableBatchMPT {
 }
 
 impl DurableBatchMPT {
-    /// Create a new durable MPT with the given SQLite database path.
-    pub fn new_with_path(db_path: &str) -> SqliteResult<Self> {
+    /// Create a new durable MPT with the given SQLite database path and cache limit.
+    pub fn new_with_path_and_cache_limit(
+        db_path: &str,
+        cache_memory_limit_bytes: usize,
+    ) -> SqliteResult<Self> {
         let conn = Connection::open(db_path)?;
         Self::configure_safety_pragmas(&conn, true)?;
 
         Cache::initialize_database(&conn)?;
 
         let db = Arc::new(Mutex::new(conn));
-        let cache = Cache::new(Arc::clone(&db));
+        let cache = Cache::new_with_limit(Arc::clone(&db), cache_memory_limit_bytes);
 
         let root = cache.get_root();
 
         Ok(Self { cache, db, root })
     }
 
+    /// Create a new durable MPT with the given SQLite database path.
+    pub fn new_with_path(db_path: &str) -> SqliteResult<Self> {
+        Self::new_with_path_and_cache_limit(db_path, DEFAULT_CACHE_MEMORY_LIMIT_BYTES)
+    }
+
     /// Create a new in-memory durable MPT (for testing).
     pub fn new_in_memory() -> SqliteResult<Self> {
         Self::new_with_path(":memory:")
+    }
+
+    /// Create a new in-memory durable MPT with a very small cache (tests only).
+    #[cfg(test)]
+    pub fn new_in_memory_with_small_cache() -> SqliteResult<Self> {
+        const TEST_CACHE_LIMIT_BYTES: usize = 10 * 1024;
+        Self::new_with_path_and_cache_limit(":memory:", TEST_CACHE_LIMIT_BYTES)
     }
 
     /// Toggle SQLite durability-related safety settings (fullfsync and synchronous).
@@ -351,7 +366,9 @@ impl MerklePatriciaTree for DurableBatchMPT {
 
     fn get_root_hash(&self) -> Option<Hash> {
         self.cache.pre_advise(&[self.root]).unwrap();
-        self.cache.get(&self.root).map(|node| node.value().merkle_hash())
+        self.cache
+            .get(&self.root)
+            .map(|node| node.value().merkle_hash())
     }
 
     fn get_leaf_value(&self, key: Hash) -> Option<Hash> {

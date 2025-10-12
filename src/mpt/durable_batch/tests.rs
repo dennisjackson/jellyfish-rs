@@ -3,7 +3,7 @@ use std::env;
 
 #[test]
 fn test_basic_insert_and_retrieve() {
-    let mut mpt = DurableBatchMPT::new_in_memory().unwrap();
+    let mut mpt = DurableBatchMPT::new_in_memory_with_small_cache().unwrap();
 
     let key = [1u8; 32];
     let value = [2u8; 32];
@@ -15,7 +15,7 @@ fn test_basic_insert_and_retrieve() {
 
 #[test]
 fn test_batch_upsert_persistence() {
-    let mut mpt = DurableBatchMPT::new_in_memory().unwrap();
+    let mut mpt = DurableBatchMPT::new_in_memory_with_small_cache().unwrap();
 
     let entries: Vec<(Hash, Hash)> = vec![
         ([1u8; 32], [10u8; 32]),
@@ -35,7 +35,7 @@ fn test_batch_upsert_persistence() {
 
 #[test]
 fn test_batch_upsert_with_cache_clearing() {
-    let mut mpt = DurableBatchMPT::new_in_memory().unwrap();
+    let mut mpt = DurableBatchMPT::new_in_memory_with_small_cache().unwrap();
 
     // Insert enough entries to create a tree with multiple levels
     // Use diverse keys to spread across the tree
@@ -56,7 +56,7 @@ fn test_batch_upsert_with_cache_clearing() {
     // Verify tree size is tracked
     let tree_size = mpt.cache.tree_size();
     assert!(tree_size > 0);
-    assert_eq!(tree_size, mpt.cache.len());
+    assert!(tree_size > 100);
 
     // Clear cache to test loading from disk
     mpt.clear_cache();

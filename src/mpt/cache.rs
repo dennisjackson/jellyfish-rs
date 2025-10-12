@@ -1,7 +1,7 @@
 use dashmap::{DashMap, DashSet, mapref::one::Ref as DashMapRef};
 use log::{debug, info, warn};
 use rusqlite::{
-    Connection, OptionalExtension, Result as SqliteResult,
+    Connection, OptionalExtension, Result as SqliteResult, Row,
     limits::Limit,
     params, params_from_iter,
     types::{ToSqlOutput, Type, ValueRef},
@@ -194,6 +194,57 @@ impl Cache {
         self.tree_size_known.store(true, Ordering::SeqCst);
     }
 
+    fn ensure_transaction(&self, db: &Connection, in_tx: &mut bool) -> SqliteResult<()> {
+        if !*in_tx {
+            db.execute("BEGIN DEFERRED TRANSACTION", [])?;
+            *in_tx = true;
+        }
+        Ok(())
+    }
+
+    fn commit_transaction(&self, db: &Connection, in_tx: &mut bool) -> SqliteResult<()> {
+        if *in_tx {
+            db.execute("COMMIT", [])?;
+            *in_tx = false;
+        }
+        Ok(())
+    }
+
+    fn collect_protected_prefixes(&self, needed_keys: &[Prefix]) -> HashSet<Prefix> {
+        let mut protected = HashSet::with_capacity(needed_keys.len().saturating_mul(8) + 16);
+        protected.insert(self.get_root());
+
+        for mut key in needed_keys.iter().copied() {
+            loop {
+                protected.insert(key);
+                match parent_prefix(key) {
+                    Some(parent) => key = parent,
+                    None => break,
+                }
+            }
+        }
+
+        protected
+    }
+
+    fn load_and_cache_nodes(
+        &self,
+        db: &Connection,
+        prefixes: &[Prefix],
+        queried_nodes: &mut usize,
+    ) -> SqliteResult<Vec<(Prefix, Node)>> {
+        if prefixes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let nodes = self.batch_query_nodes(db, prefixes)?;
+        *queried_nodes += nodes.len();
+        for (prefix, node) in &nodes {
+            self.map.insert(*prefix, node.clone());
+        }
+        Ok(nodes)
+    }
+
     fn refresh_tree_size_with_conn(&self, conn: &Connection) -> SqliteResult<usize> {
         let base = Self::query_tree_size(conn)?;
         let unflushed = self.new_nodes.len();
@@ -260,59 +311,35 @@ impl Cache {
             return;
         }
 
-        let mut protected: HashSet<Prefix> =
-            HashSet::with_capacity(needed_keys.len().saturating_mul(8) + 16);
-        protected.insert(self.get_root());
-
-        for key in needed_keys.iter().copied() {
-            let mut current = key;
-            loop {
-                protected.insert(current);
-                if current.length == 0 {
-                    break;
-                }
-                let parent_length = current.length - 1;
-                let parent_hash = current.hash.zero_bits_from(parent_length);
-                current = Prefix {
-                    hash: parent_hash,
-                    length: parent_length,
-                };
-            }
-        }
-
-        let mut candidates: Vec<(Prefix, u16)> = Vec::new();
-        {
-            for entry in self.map.iter() {
-                let key = *entry.key();
-                if protected.contains(&key) {
-                    continue;
-                }
-                candidates.push((key, key.length));
-            }
-        }
+        let protected = self.collect_protected_prefixes(needed_keys);
+        let mut candidates: Vec<Prefix> = self
+            .map
+            .iter()
+            .map(|entry| *entry.key())
+            .filter(|key| !protected.contains(key))
+            .collect();
 
         if candidates.is_empty() {
             return;
         }
 
-        candidates.sort_by(|a, b| match b.1.cmp(&a.1) {
-            std::cmp::Ordering::Equal => b.0.cmp(&a.0),
+        candidates.sort_by(|a, b| match b.length.cmp(&a.length) {
+            std::cmp::Ordering::Equal => b.cmp(a),
             other => other,
         });
 
-        let mut ints = 0;
-        let mut leaves = 0;
-        for (key, _) in candidates {
+        let (mut ints, mut leaves) = (0, 0);
+        for key in candidates {
             if current_usage <= self.cache_memory_limit_bytes {
                 break;
             }
-            if let Some(n) = self.map.remove(&key) {
+
+            if let Some((_, node)) = self.map.remove(&key) {
                 debug!("Released key {:?} from cache", key.short_hex());
                 current_usage = current_usage.saturating_sub(CACHE_ENTRY_SIZE_BYTES);
-                if let Node::Interior(_) = n.1 {
-                    ints += 1;
-                } else {
-                    leaves += 1;
+                match node {
+                    Node::Interior(_) => ints += 1,
+                    _ => leaves += 1,
                 }
             }
         }
@@ -359,28 +386,14 @@ impl Cache {
 
             let mut stmt = db.prepare_cached(query_buffer.as_str())?;
 
-            let nodes = stmt
-                .query_map(params_from_iter(param_buffer.iter().copied()), |row| {
-                    let prefix_hash: Vec<u8> = row.get(0)?;
-                    let prefix_length: u16 = row.get::<_, i64>(1)? as u16;
-                    let node_type: String = row.get(2)?;
-                    let node_data: Vec<u8> = row.get(3)?;
+            let rows = stmt.query_map(
+                params_from_iter(param_buffer.iter().copied()),
+                read_node_from_row,
+            )?;
 
-                    let mut hash = [0u8; 32];
-                    hash.copy_from_slice(&prefix_hash);
-                    let prefix = Prefix {
-                        hash,
-                        length: prefix_length,
-                    };
-
-                    let node = Node::deserialize(&node_type, &node_data)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?;
-
-                    Ok((prefix, node))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-
-            results.extend(nodes);
+            for node in rows {
+                results.push(node?);
+            }
         }
 
         Ok(results)
@@ -396,15 +409,12 @@ impl Cache {
 
         // Begin a durable transaction
         let mut in_tx = self.in_transaction.lock().unwrap();
-        if !*in_tx {
-            db.execute("BEGIN DEFERRED TRANSACTION", [])?;
-            *in_tx = true;
-        }
+        self.ensure_transaction(&db, &mut *in_tx)?;
         drop(in_tx); // Release lock before querying
 
         //Currently pretty inefficient. O(n^2) so we limit the max we process at once
         for (chunk_idx, keys_chunk) in _keys.chunks(100).enumerate() {
-            let mut needed_keys: HashSet<Prefix> = keys_chunk.iter().cloned().collect();
+            let mut needed_keys: HashSet<Prefix> = keys_chunk.iter().copied().collect();
             if needed_keys.is_empty() {
                 continue;
             }
@@ -419,6 +429,7 @@ impl Cache {
             for x in needed_keys.iter() {
                 debug!("  Needed key: {:?}", x.short_hex());
             }
+
             while !needed_keys.is_empty() && !current_frontier.is_empty() {
                 debug!(
                     "Iterating chunk {}. Need {} keys, frontier size {}",
@@ -429,42 +440,25 @@ impl Cache {
                 for x in &current_frontier {
                     debug!("  Frontier node: {:?}", x.short_hex());
                 }
-                let mut frontier_nodes: Vec<Node> = Vec::new();
 
-                // Separate frontier into cached and uncached nodes
-                let (cached_prefixes, prefixes_to_query): (Vec<Prefix>, Vec<Prefix>) =
-                    current_frontier
-                        .iter()
-                        .partition(|p| self.map.contains_key(p));
-                debug!(
-                    "Frontier has {} cached, {} to query",
-                    cached_prefixes.len(),
-                    prefixes_to_query.len()
-                );
-
-                for p in cached_prefixes {
-                    if let Some(node) = self.get(&p) {
-                        frontier_nodes.push(node.value().clone());
+                let mut frontier_nodes = Vec::new();
+                let mut prefixes_to_query = Vec::new();
+                for prefix in &current_frontier {
+                    match self.map.get(prefix) {
+                        Some(node) => frontier_nodes.push(node.value().clone()),
+                        None => prefixes_to_query.push(*prefix),
                     }
                 }
 
-                let new_nodes: Vec<(Prefix, Node)> = self
-                    .batch_query_nodes(&db, &prefixes_to_query)?
-                    .into_iter()
-                    .collect();
-                queried_nodes += new_nodes.len();
-                for (p, n) in new_nodes.iter() {
-                    self.map.insert(*p, n.clone());
+                for (_, node) in
+                    self.load_and_cache_nodes(&db, &prefixes_to_query, &mut queried_nodes)?
+                {
+                    frontier_nodes.push(node);
                 }
 
-                // At this point, all frontier nodes are in the cache.
-                frontier_nodes.extend(new_nodes.iter().map(|(_, n)| n.clone()));
                 current_frontier.clear();
-                for x in frontier_nodes.iter() {
-                    debug!("  Loaded frontier node: {}", x);
-                }
-                //Now we can remove any nodes we just loaded from the needed keys.
                 for node in &frontier_nodes {
+                    debug!("  Loaded frontier node: {}", node);
                     if let Node::Leaf(leaf) = node {
                         let prefix = Prefix::from(leaf.key);
                         debug!("Loaded leaf node {:?}", prefix);
@@ -472,7 +466,7 @@ impl Cache {
                     }
                 }
 
-                let mut siblings_to_load: Vec<Prefix> = Vec::new();
+                let mut siblings_to_load = Vec::new();
                 for node in &frontier_nodes {
                     if let Node::Interior(interior) = node {
                         for nk in needed_keys.iter() {
@@ -481,6 +475,7 @@ impl Cache {
                             } else if !self.map.contains_key(&interior.left) {
                                 siblings_to_load.push(interior.left);
                             }
+
                             if interior.right.prefix_of(nk) {
                                 current_frontier.insert(interior.right);
                             } else if !self.map.contains_key(&interior.right) {
@@ -497,12 +492,7 @@ impl Cache {
                     needed_keys.len()
                 );
 
-                let siblings = self.batch_query_nodes(&db, &siblings_to_load)?;
-                queried_nodes += siblings.len();
-                // Insert all queried nodes into cache
-                for (prefix, node) in siblings {
-                    self.map.insert(prefix, node);
-                }
+                self.load_and_cache_nodes(&db, &siblings_to_load, &mut queried_nodes)?;
             }
 
             // After traversal, directly load any remaining needed keys that weren't found
@@ -511,16 +501,10 @@ impl Cache {
             let remaining_to_query: Vec<Prefix> = needed_keys
                 .iter()
                 .filter(|k| !self.map.contains_key(k))
-                .cloned()
+                .copied()
                 .collect();
 
-            if !remaining_to_query.is_empty() {
-                let remaining_nodes = self.batch_query_nodes(&db, &remaining_to_query)?;
-                queried_nodes += remaining_nodes.len();
-                for (prefix, node) in remaining_nodes {
-                    self.map.insert(prefix, node);
-                }
-            }
+            self.load_and_cache_nodes(&db, &remaining_to_query, &mut queried_nodes)?;
         }
 
         info!(
@@ -541,12 +525,9 @@ impl Cache {
         info!("Flushing {} dirty nodes", dirty_keys.len());
         if dirty_keys.is_empty() && !root_dirty {
             // Even if no dirty keys, commit the transaction if one is active
+            let db = self.db.lock().unwrap();
             let mut in_tx = self.in_transaction.lock().unwrap();
-            if *in_tx {
-                let db = self.db.lock().unwrap();
-                db.execute("COMMIT", [])?;
-                *in_tx = false;
-            }
+            self.commit_transaction(&db, &mut *in_tx)?;
             return Ok(());
         }
 
@@ -558,20 +539,12 @@ impl Cache {
 
             if dirty_keys.is_empty() {
                 // Only the root metadata needs to be persisted.
-                if !*in_tx {
-                    db.execute("BEGIN DEFERRED TRANSACTION", [])?;
-                    *in_tx = true;
-                }
+                self.ensure_transaction(&db, &mut *in_tx)?;
                 self.persist_root_metadata(&db)?;
                 cleared_root_dirty = true;
-                db.execute("COMMIT", [])?;
-                *in_tx = false;
+                self.commit_transaction(&db, &mut *in_tx)?;
             } else {
-                if !*in_tx {
-                    db.execute("BEGIN DEFERRED TRANSACTION", [])?;
-                    *in_tx = true;
-                }
-
+                self.ensure_transaction(&db, &mut *in_tx)?;
                 debug!(
                     "Flushing {} dirty nodes to database in a single transaction",
                     dirty_keys.len()
@@ -610,8 +583,7 @@ impl Cache {
                     cleared_root_dirty = true;
                 }
 
-                db.execute("COMMIT", [])?;
-                *in_tx = false;
+                self.commit_transaction(&db, &mut *in_tx)?;
                 for key in newly_persisted {
                     self.new_nodes.remove(&key);
                 }
@@ -638,24 +610,7 @@ impl Cache {
             db.prepare("SELECT prefix_hash, prefix_length, node_type, node_data FROM nodes")?;
 
         let nodes = stmt
-            .query_map([], |row| {
-                let prefix_hash: Vec<u8> = row.get(0)?;
-                let prefix_length: u16 = row.get::<_, i64>(1)? as u16;
-                let node_type: String = row.get(2)?;
-                let node_data: Vec<u8> = row.get(3)?;
-
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(&prefix_hash);
-                let prefix = Prefix {
-                    hash,
-                    length: prefix_length,
-                };
-
-                let node = Node::deserialize(&node_type, &node_data)
-                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
-
-                Ok((prefix, node))
-            })?
+            .query_map([], read_node_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(nodes)
@@ -666,6 +621,37 @@ impl Cache {
 enum BatchQueryParam<'a> {
     Hash(&'a [u8]),
     Length(i64),
+}
+
+fn parent_prefix(prefix: Prefix) -> Option<Prefix> {
+    if prefix.length == 0 {
+        return None;
+    }
+
+    let parent_length = prefix.length - 1;
+    Some(Prefix {
+        hash: prefix.hash.zero_bits_from(parent_length),
+        length: parent_length,
+    })
+}
+
+fn read_node_from_row(row: &Row<'_>) -> SqliteResult<(Prefix, Node)> {
+    let prefix_hash: Vec<u8> = row.get(0)?;
+    let prefix_length: u16 = row.get::<_, i64>(1)? as u16;
+    let node_type: String = row.get(2)?;
+    let node_data: Vec<u8> = row.get(3)?;
+
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&prefix_hash);
+    let prefix = Prefix {
+        hash,
+        length: prefix_length,
+    };
+
+    let node =
+        Node::deserialize(&node_type, &node_data).map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+    Ok((prefix, node))
 }
 
 impl<'a> rusqlite::ToSql for BatchQueryParam<'a> {
