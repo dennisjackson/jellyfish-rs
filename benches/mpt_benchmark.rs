@@ -146,7 +146,7 @@ const DURABLE_BATCH_SCENARIOS: [DurableBatchScenario; 5] = [
     },
 ];
 
-const BATCH_SIZES: [usize; 4] = [1_000, 5_000, 10_000,20_000];
+const BATCH_SIZES: [usize; 4] = [1_000, 5_000, 10_000, 20_000];
 
 fn benchmark_durable_batch_sizes(c: &mut Criterion) {
     let _ = env_logger::builder()
@@ -156,9 +156,7 @@ fn benchmark_durable_batch_sizes(c: &mut Criterion) {
     for scenario in DURABLE_BATCH_SCENARIOS {
         let mut group = c.benchmark_group(format!(
             "durable_batch_base_{}_safety_{}_cold_cache_{}",
-            scenario.base_tree_size,
-            scenario.safety_mode_enabled,
-            scenario.cold_cache
+            scenario.base_tree_size, scenario.safety_mode_enabled, scenario.cold_cache
         ));
         group.sample_size(scenario.sample_size);
 
