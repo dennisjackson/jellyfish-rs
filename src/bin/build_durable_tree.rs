@@ -49,7 +49,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "Building durable MPT with tree_size={} and batch_size={}",
         tree_size, batch_size
     );
-    let mut offset = rand::random::<u32>();
+    let offset = rand::random::<u32>();
     let mut inserted = 0usize;
     let mut batches = 0usize;
     let mut total_duration = Duration::ZERO;
