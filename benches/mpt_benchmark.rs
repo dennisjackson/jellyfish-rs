@@ -7,7 +7,6 @@ use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_mai
 use jellyfish_rs::Hash;
 use jellyfish_rs::mpt::{BatchMPT, DurableBatchMPT, MerklePatriciaTree, SimpleMPT};
 use log::debug;
-use rand;
 use sha2::{Digest, Sha256};
 
 /// Generate deterministic test data

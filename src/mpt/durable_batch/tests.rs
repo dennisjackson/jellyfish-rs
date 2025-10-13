@@ -45,7 +45,7 @@ fn test_batch_upsert_with_cache_clearing() {
             let mut value = [0u8; 32];
             // Spread keys across the hash space
             key[0] = i;
-            key[1] = (i.wrapping_mul(3)) as u8;
+            key[1] = i.wrapping_mul(3);
             value[0] = i * 2;
             (key, value)
         })

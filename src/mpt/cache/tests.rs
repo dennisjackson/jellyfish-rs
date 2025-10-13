@@ -884,7 +884,7 @@ fn test_pre_advise_sparse_keys_efficiency() {
 
     for i in 0..num_leaves {
         let mut hasher = Sha256::new();
-        hasher.update(&(i as u64).to_le_bytes());
+        hasher.update((i as u64).to_le_bytes());
         let hash = hasher.finalize();
         let mut key = [0u8; 32];
         key.copy_from_slice(&hash);
