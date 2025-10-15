@@ -1,7 +1,8 @@
-use log::{debug, warn};
+use log::{debug, info, warn};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Result as SqliteResult};
 use std::env;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::mpt::MerklePatriciaTree;
 use crate::{Hash, Prefix};
@@ -496,13 +497,23 @@ impl MerklePatriciaTree for DurableBatchMPT {
             let end = std::cmp::min(total, start + chunk_capacity);
             let chunk = &sorted_entries[start..end];
 
+            // Idea
+            // Release keys should never release dirty keys
+            // Then we could move committing to happen once per second or whatever?
+
             prefix_buffer.clear();
             prefix_buffer.extend(chunk.iter().map(|(k, _)| Prefix::from(*k)));
-
+            let batch_start = Instant::now();
             self.cache.release_keys(&prefix_buffer);
             self.cache.pre_advise(&prefix_buffer).unwrap();
             self.batch_upsert_optimized(chunk);
             self.cache.flush().unwrap();
+            let batch_duration = batch_start.elapsed();
+            info!(
+                "Upserted batch of {} entries in {:.3} ms ()",
+                chunk.len(),
+                batch_duration.as_secs_f64() * 1_000.0,
+            );
             start = end;
         }
     }

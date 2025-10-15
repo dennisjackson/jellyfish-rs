@@ -13,8 +13,8 @@ macro_rules! test_all_impls {
 
             let _ = env_logger::builder().is_test(true).filter(None, log::LevelFilter::Debug).try_init();
             // Add new implementations here as they're created
-            // test_impl::<SimpleMPT>();
-            // test_impl::<BatchMPT>();
+            test_impl::<SimpleMPT>();
+            test_impl::<BatchMPT>();
             test_impl::<DurableBatchMPT>();
         }
     };
@@ -197,6 +197,65 @@ test_all_impls!(test_merkle_hash_changes_with_data, {
 });
 
 // These tests don't use the trait, so they stay as regular #[test] functions
+#[test]
+fn test_cross_impl_root_hash_consistency() {
+    let entries: Vec<(Hash, Hash)> = (0..10)
+        .map(|i| (create_hash(i), create_hash(i + 100)))
+        .collect();
+
+    let mut simple = SimpleMPT::new();
+    let mut batch = BatchMPT::new();
+    let mut durable = DurableBatchMPT::new();
+
+    for (key, value) in &entries {
+        simple.upsert(*key, *value);
+        batch.upsert(*key, *value);
+        durable.upsert(*key, *value);
+    }
+
+    let simple_root = simple.get_root_hash();
+    let batch_root = batch.get_root_hash();
+    let durable_root = durable.get_root_hash();
+
+    assert!(
+        simple_root.is_some(),
+        "Root hash should exist after inserting entries"
+    );
+    assert_eq!(
+        simple_root, batch_root,
+        "SimpleMPT and BatchMPT roots should match for individual inserts"
+    );
+    assert_eq!(
+        simple_root, durable_root,
+        "SimpleMPT and DurableBatchMPT roots should match for individual inserts"
+    );
+
+    let mut simple_batch = SimpleMPT::new();
+    let mut batch_batch = BatchMPT::new();
+    let mut durable_batch = DurableBatchMPT::new();
+
+    simple_batch.batch_upsert(&entries);
+    batch_batch.batch_upsert(&entries);
+    durable_batch.batch_upsert(&entries);
+
+    let simple_batch_root = simple_batch.get_root_hash();
+    let batch_batch_root = batch_batch.get_root_hash();
+    let durable_batch_root = durable_batch.get_root_hash();
+
+    assert!(
+        simple_batch_root.is_some(),
+        "Root hash should exist after batch upserts"
+    );
+    assert_eq!(
+        simple_batch_root, batch_batch_root,
+        "SimpleMPT and BatchMPT roots should match for batch inserts"
+    );
+    assert_eq!(
+        simple_batch_root, durable_batch_root,
+        "SimpleMPT and DurableBatchMPT roots should match for batch inserts"
+    );
+}
+
 #[test]
 fn test_leaf_node_hash_calculation() {
     let key = create_hash(1);
