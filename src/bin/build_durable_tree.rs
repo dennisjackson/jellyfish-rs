@@ -1,11 +1,47 @@
 use jellyfish_rs::mpt::MerklePatriciaTree;
-use jellyfish_rs::{DurableBatchMPT, Hash};
+use jellyfish_rs::{BatchMPT, DurableBatchMPT, Hash};
 use log::info;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::error::Error;
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+const IN_MEMORY_FLAG: &str = "--in-memory";
+
+enum Tree {
+    Durable(DurableBatchMPT),
+    InMemory(BatchMPT),
+}
+
+impl Tree {
+    fn batch_upsert(&mut self, entries: &[(Hash, Hash)]) {
+        match self {
+            Tree::Durable(tree) => tree.batch_upsert(entries),
+            Tree::InMemory(tree) => tree.batch_upsert(entries),
+        }
+    }
+
+    fn get_root_hash(&self) -> Option<Hash> {
+        match self {
+            Tree::Durable(tree) => tree.get_root_hash(),
+            Tree::InMemory(tree) => tree.get_root_hash(),
+        }
+    }
+}
+
+fn print_usage() {
+    eprintln!(
+        "usage: build_durable_tree [--in-memory] <tree_size> <batch_size> [db_path]\n\
+         tree_size and batch_size must be positive integers\n\
+         when --in-memory is used, db_path cannot be specified"
+    );
+}
+
+fn exit_with_usage(code: i32) -> ! {
+    print_usage();
+    std::process::exit(code);
+}
 
 fn main() {
     if let Err(err) = run() {
@@ -17,17 +53,39 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     init_logging();
 
-    let args: Vec<String> = env::args().skip(1).collect();
-    if args.len() < 2 || args.len() > 3 {
-        eprintln!(
-            "usage: build_durable_tree <tree_size> <batch_size> [db_path]\n\
-             tree_size and batch_size must be positive integers"
-        );
-        std::process::exit(1);
+    let mut use_in_memory = false;
+    let mut positional_args = Vec::new();
+
+    for arg in env::args().skip(1) {
+        match arg.as_str() {
+            IN_MEMORY_FLAG => {
+                use_in_memory = true;
+            }
+            "--help" | "-h" => exit_with_usage(0),
+            _ if arg.starts_with("--") => {
+                eprintln!("Unknown option: {arg}");
+                exit_with_usage(1);
+            }
+            _ => positional_args.push(arg),
+        }
     }
 
-    let tree_size: usize = args[0].parse()?;
-    let batch_size: usize = args[1].parse()?;
+    let positional_len = positional_args.len();
+    if positional_len < 2 {
+        eprintln!("tree_size and batch_size are required");
+        exit_with_usage(1);
+    }
+    if use_in_memory && positional_len > 2 {
+        eprintln!("db_path is not supported when using --in-memory");
+        exit_with_usage(1);
+    }
+    if !use_in_memory && positional_len > 3 {
+        eprintln!("Too many arguments provided");
+        exit_with_usage(1);
+    }
+
+    let tree_size: usize = positional_args[0].parse()?;
+    let batch_size: usize = positional_args[1].parse()?;
     if tree_size == 0 {
         return Err("tree_size must be greater than zero".into());
     }
@@ -35,19 +93,33 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err("batch_size must be greater than zero".into());
     }
 
-    let db_path = args.get(2);
-    let mut tree = if let Some(path) = db_path {
+    let db_path = if use_in_memory {
+        None
+    } else {
+        positional_args.get(2).map(|s| s.as_str())
+    };
+
+    let mut tree = if use_in_memory {
+        info!("Using in-memory BatchMPT implementation");
+        Tree::InMemory(BatchMPT::new())
+    } else if let Some(path) = db_path {
         ensure_parent(path)?;
         info!("Writing durable MPT to {}", path);
-        DurableBatchMPT::new_with_path(path)?
+        Tree::Durable(DurableBatchMPT::new_with_path(path)?)
     } else {
         info!("Using temporary database path for durable MPT");
-        DurableBatchMPT::new()
+        Tree::Durable(DurableBatchMPT::new())
     };
 
     info!(
-        "Building durable MPT with tree_size={} and batch_size={}",
-        tree_size, batch_size
+        "Building {} MPT with tree_size={} and batch_size={}",
+        if use_in_memory {
+            "in-memory"
+        } else {
+            "durable"
+        },
+        tree_size,
+        batch_size
     );
     let offset = rand::random::<u32>();
     let mut inserted = 0usize;
