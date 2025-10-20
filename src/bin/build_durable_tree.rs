@@ -32,8 +32,8 @@ impl Tree {
 
 fn print_usage() {
     eprintln!(
-        "usage: build_durable_tree [--in-memory] <tree_size> <batch_size> [db_path]\n\
-         tree_size and batch_size must be positive integers\n\
+        "usage: build_durable_tree [--in-memory] <tree_size> <window_size> <batch_size> [db_path]\n\
+         tree_size, window_size, and batch_size must be positive integers\n\
          when --in-memory is used, db_path cannot be specified"
     );
 }
@@ -71,23 +71,27 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let positional_len = positional_args.len();
-    if positional_len < 2 {
-        eprintln!("tree_size and batch_size are required");
+    if positional_len < 3 {
+        eprintln!("tree_size, window_size, and batch_size are required");
         exit_with_usage(1);
     }
-    if use_in_memory && positional_len > 2 {
+    if use_in_memory && positional_len > 3 {
         eprintln!("db_path is not supported when using --in-memory");
         exit_with_usage(1);
     }
-    if !use_in_memory && positional_len > 3 {
+    if !use_in_memory && positional_len > 4 {
         eprintln!("Too many arguments provided");
         exit_with_usage(1);
     }
 
     let tree_size: usize = positional_args[0].parse()?;
-    let batch_size: usize = positional_args[1].parse()?;
+    let window_size: usize = positional_args[1].parse()?;
+    let batch_size: usize = positional_args[2].parse()?;
     if tree_size == 0 {
         return Err("tree_size must be greater than zero".into());
+    }
+    if window_size == 0 {
+        return Err("window_size must be greater than zero".into());
     }
     if batch_size == 0 {
         return Err("batch_size must be greater than zero".into());
@@ -96,7 +100,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let db_path = if use_in_memory {
         None
     } else {
-        positional_args.get(2).map(|s| s.as_str())
+        positional_args.get(3).map(|s| s.as_str())
     };
 
     let mut tree = if use_in_memory {
@@ -112,36 +116,43 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     info!(
-        "Building {} MPT with tree_size={} and batch_size={}",
+        "Building {} MPT with tree_size={}, window_size={}, and batch_size={}",
         if use_in_memory {
             "in-memory"
         } else {
             "durable"
         },
         tree_size,
+        window_size,
         batch_size
     );
     let offset = rand::random::<u32>();
-    let mut inserted = 0usize;
+    let mut total_inserted = 0usize;
     let mut batches = 0usize;
     let mut total_duration = Duration::ZERO;
-    while inserted < tree_size {
-        let remaining = tree_size - inserted;
-        let current_batch = remaining.min(batch_size);
-        let entries = generate_batch(offset, inserted, current_batch);
-        let batch_start = Instant::now();
-        tree.batch_upsert(&entries);
-        let batch_duration = batch_start.elapsed();
-        total_duration += batch_duration;
-        inserted += current_batch;
-        batches += 1;
-        info!(
-            "Inserted {} entries in {:.3} ms (total inserted: {}, batches: {})",
-            current_batch,
-            batch_duration.as_secs_f64() * 1_000.0,
-            inserted,
-            batches
-        );
+    while total_inserted < tree_size {
+        let start_index = total_inserted;
+        let remaining = tree_size - start_index;
+        let current_window = remaining.min(window_size);
+        let mut entries = generate_entries(offset, start_index, current_window);
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        for chunk in entries.chunks(batch_size) {
+            let batch_len = chunk.len();
+            let batch_start = Instant::now();
+            tree.batch_upsert(chunk);
+            let batch_duration = batch_start.elapsed();
+            total_duration += batch_duration;
+            total_inserted += batch_len;
+            batches += 1;
+            info!(
+                "Inserted {} entries in {:.3} ms (total inserted: {}, batches: {})",
+                batch_len,
+                batch_duration.as_secs_f64() * 1_000.0,
+                total_inserted,
+                batches
+            );
+        }
     }
 
     let total_secs = total_duration.as_secs_f64();
@@ -191,7 +202,7 @@ fn ensure_parent(path_str: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn generate_batch(offset: u32, start: usize, count: usize) -> Vec<(Hash, Hash)> {
+fn generate_entries(offset: u32, start: usize, count: usize) -> Vec<(Hash, Hash)> {
     (offset as usize + start..offset as usize + start + count)
         .map(|i| {
             let mut key_hasher = Sha256::new();
