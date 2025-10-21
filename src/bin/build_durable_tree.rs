@@ -125,8 +125,12 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     info!(
         "Building {} MPT with tree_size={}), insertions={}, window_size={}, and batch_size={}",
-        if use_in_memory { "in-memory" } else { "durable" },
-         human_count(tree.len()),
+        if use_in_memory {
+            "in-memory"
+        } else {
+            "durable"
+        },
+        human_count(tree.len()),
         human_count(tree_size),
         human_count(window_size),
         human_count(batch_size)
@@ -157,8 +161,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     info!(
-        "Total time: {:.3} s, average per batch: {:.3} ms, throughput: {:.1} entries/s",
-        total_secs, avg_batch_ms, throughput
+        "Total time: {:.3} s, throughput: {:.1} entries/s",
+        total_secs, throughput
     );
 
     if let Some(root_hash) = tree.get_root_hash() {

@@ -1,7 +1,8 @@
 use dashmap::{DashMap, DashSet};
 use log::info;
 use rayon::join;
-use sled::{Batch, Config, Db};
+use sled::transaction::Transactional;
+use sled::{Config, Db};
 use std::path::Path;
 
 use crate::mpt::MerklePatriciaTree;
@@ -25,8 +26,8 @@ impl SledBatchMPT {
         Config::new()
             .flush_every_ms(Some(5000))
             .mode(sled::Mode::HighThroughput)
-        .use_compression(false)
-        .print_profile_on_drop(true)
+            .use_compression(false)
+            .print_profile_on_drop(false)
     }
 
     pub fn new_with_path(path: impl AsRef<Path>) -> sled::Result<Self> {
@@ -302,22 +303,16 @@ impl SledBatchMPT {
 
         std::mem::swap(&mut self.dirty, &mut self.old_dirty);
 
-        let mut wrote_nodes = false;
-        let mut batch = Batch::default();
-        for prefix in self.dirty.iter() {
-            if let Some(node) = self.store.get(&prefix) {
-                batch.insert(prefix_key(&prefix), encode_node(node.value()));
-                wrote_nodes = true;
+        self.db.transaction(|db| {
+            for prefix in self.dirty.iter() {
+                let node = self.store.get(&prefix).unwrap();
+                db.insert(prefix_key(&prefix), encode_node(node.value()))?;
             }
-        }
+            db.insert(ROOT_KEY, encode_prefix(self.root))?;
+            Ok::<(), sled::transaction::ConflictableTransactionError>(())
+        }).expect("trans error");
         self.dirty.clear();
-
-        if wrote_nodes || self.root_dirty {
-            batch.insert(ROOT_KEY, encode_prefix(self.root));
-            self.root_dirty = false;
-            self.db.apply_batch(batch)?;
-            // self.db.flush()?;
-        }
+        // self.db.flush()?;
 
         Ok(())
     }
