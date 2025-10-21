@@ -13,6 +13,9 @@ pub use batch::BatchMPT;
 mod durable_batch;
 pub use durable_batch::DurableBatchMPT;
 
+mod sled_batch;
+pub use sled_batch::SledBatchMPT;
+
 mod cache;
 pub use cache::Cache;
 

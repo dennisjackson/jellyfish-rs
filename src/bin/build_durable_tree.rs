@@ -1,4 +1,5 @@
-use jellyfish_rs::mpt::MerklePatriciaTree;
+use indicatif::ProgressBar;
+use jellyfish_rs::mpt::{MerklePatriciaTree, SledBatchMPT};
 use jellyfish_rs::{BatchMPT, DurableBatchMPT, Hash};
 use log::info;
 use sha2::{Digest, Sha256};
@@ -10,7 +11,7 @@ use std::time::{Duration, Instant};
 const IN_MEMORY_FLAG: &str = "--in-memory";
 
 enum Tree {
-    Durable(DurableBatchMPT),
+    Durable(SledBatchMPT),
     InMemory(BatchMPT),
 }
 
@@ -26,6 +27,13 @@ impl Tree {
         match self {
             Tree::Durable(tree) => tree.get_root_hash(),
             Tree::InMemory(tree) => tree.get_root_hash(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Tree::Durable(tree) => tree.enumerate_nodes().len(),
+            Tree::InMemory(tree) => tree.enumerate_nodes().len(),
         }
     }
 }
@@ -109,27 +117,24 @@ fn run() -> Result<(), Box<dyn Error>> {
     } else if let Some(path) = db_path {
         ensure_parent(path)?;
         info!("Writing durable MPT to {}", path);
-        Tree::Durable(DurableBatchMPT::new_with_path(path)?)
+        Tree::Durable(SledBatchMPT::new_with_path(path)?)
     } else {
         info!("Using temporary database path for durable MPT");
-        Tree::Durable(DurableBatchMPT::new())
+        Tree::Durable(SledBatchMPT::new())
     };
 
     info!(
-        "Building {} MPT with tree_size={}, window_size={}, and batch_size={}",
-        if use_in_memory {
-            "in-memory"
-        } else {
-            "durable"
-        },
-        tree_size,
-        window_size,
-        batch_size
+        "Building {} MPT with tree_size={}), insertions={}, window_size={}, and batch_size={}",
+        if use_in_memory { "in-memory" } else { "durable" },
+         human_count(tree.len()),
+        human_count(tree_size),
+        human_count(window_size),
+        human_count(batch_size)
     );
     let offset = rand::random::<u32>();
     let mut total_inserted = 0usize;
-    let mut batches = 0usize;
-    let mut total_duration = Duration::ZERO;
+    let start = Instant::now();
+    let pb = ProgressBar::new(tree_size as u64);
     while total_inserted < tree_size {
         let start_index = total_inserted;
         let remaining = tree_size - start_index;
@@ -138,29 +143,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
         for chunk in entries.chunks(batch_size) {
-            let batch_len = chunk.len();
-            let batch_start = Instant::now();
+            pb.inc(chunk.len() as u64);
+            total_inserted += chunk.len();
             tree.batch_upsert(chunk);
-            let batch_duration = batch_start.elapsed();
-            total_duration += batch_duration;
-            total_inserted += batch_len;
-            batches += 1;
-            info!(
-                "Inserted {} entries in {:.3} ms (total inserted: {}, batches: {})",
-                batch_len,
-                batch_duration.as_secs_f64() * 1_000.0,
-                total_inserted,
-                batches
-            );
         }
     }
 
-    let total_secs = total_duration.as_secs_f64();
-    let avg_batch_ms = if batches > 0 {
-        (total_secs / batches as f64) * 1_000.0
-    } else {
-        0.0
-    };
+    let total_secs = start.elapsed().as_secs_f64();
     let throughput = if total_secs > 0.0 {
         tree_size as f64 / total_secs
     } else {
@@ -190,6 +179,26 @@ fn init_logging() {
     let mut builder = env_logger::Builder::from_env(Env::default().default_filter_or("info"));
     builder.target(Target::Stdout);
     builder.init();
+}
+
+fn human_count(n: usize) -> String {
+    // Format counts in SI units: K, M, B, T
+    const UNITS: [&str; 5] = ["", "K", "M", "B", "T"];
+    let mut value = n as f64;
+    let mut unit_idx = 0usize;
+    while value >= 1000.0 && unit_idx < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit_idx += 1;
+    }
+    if unit_idx == 0 {
+        format!("{}", n)
+    } else if value < 10.0 {
+        format!("{:.2}{}", value, UNITS[unit_idx])
+    } else if value < 100.0 {
+        format!("{:.1}{}", value, UNITS[unit_idx])
+    } else {
+        format!("{:.0}{}", value, UNITS[unit_idx])
+    }
 }
 
 fn ensure_parent(path_str: &str) -> Result<(), Box<dyn Error>> {
