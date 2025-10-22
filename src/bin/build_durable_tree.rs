@@ -1,12 +1,12 @@
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar, ProgressStyle};
 use jellyfish_rs::mpt::{MerklePatriciaTree, SledBatchMPT};
-use jellyfish_rs::{BatchMPT, DurableBatchMPT, Hash};
+use jellyfish_rs::{BatchMPT, Hash};
 use log::info;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::error::Error;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const IN_MEMORY_FLAG: &str = "--in-memory";
 
@@ -124,7 +124,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     info!(
-        "Building {} MPT with tree_size={}), insertions={}, window_size={}, and batch_size={}",
+        "Building {} MPT with tree_size={}, insertions={}, window_size={}, and batch_size={}",
         if use_in_memory {
             "in-memory"
         } else {
@@ -138,7 +138,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let offset = rand::random::<u32>();
     let mut total_inserted = 0usize;
     let start = Instant::now();
-    let pb = ProgressBar::new(tree_size as u64);
+    let pb = ProgressBar::new(tree_size as u64).with_style(ProgressStyle::with_template("{wide_bar} {human_pos} / {human_len} - {percent}% - {per_sec} - {eta}").unwrap());
     while total_inserted < tree_size {
         let start_index = total_inserted;
         let remaining = tree_size - start_index;

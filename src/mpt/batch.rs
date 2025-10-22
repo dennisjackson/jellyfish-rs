@@ -85,8 +85,10 @@ impl BatchMPT {
         };
 
         match node {
-            Node::Leaf(leaf) => Self::batch_upsert_at_leaf(store, leaf, entries),
-            Node::Interior(interior) => Self::batch_upsert_at_interior(store, interior, entries),
+            Node::Leaf(leaf) => Self::batch_upsert_at_leaf(store, current_prefix, leaf, entries),
+            Node::Interior(interior) => {
+                Self::batch_upsert_at_interior(store, current_prefix, interior, entries)
+            }
         }
     }
 
@@ -113,15 +115,14 @@ impl BatchMPT {
     /// Batch upsert at a leaf node.
     fn batch_upsert_at_leaf(
         store: &Arc<DashMap<Prefix, Node>>,
+        leaf_prefix: Prefix,
         leaf: LeafNode,
         mut entries: Vec<(Hash, Hash)>,
     ) -> Prefix {
-        let leaf_prefix = Prefix::from(leaf.key);
-
         // Check if any entry updates this leaf (using binary search since entries are sorted)
-        if let Ok(idx) = entries.binary_search_by_key(&leaf.key, |(k, _)| *k) {
+        if let Ok(idx) = entries.binary_search_by_key(&leaf_prefix.hash, |(k, _)| *k) {
             let (_, new_value) = entries.remove(idx);
-            let updated_leaf = LeafNode::new(leaf.key, new_value);
+            let updated_leaf = LeafNode::new(leaf_prefix.hash, new_value);
             store.insert(leaf_prefix, Node::Leaf(updated_leaf));
 
             if entries.is_empty() {
@@ -141,7 +142,7 @@ impl BatchMPT {
 
         let new_leaf = LeafNode::new(first_key, first_value);
         let new_prefix = Prefix::from(first_key);
-        let existing_prefix = Prefix::from(leaf.key);
+        let existing_prefix = leaf_prefix;
         let merged_prefix = Prefix::common_prefix(&existing_prefix, &new_prefix);
 
         let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
@@ -172,6 +173,7 @@ impl BatchMPT {
     /// Batch upsert at an interior node.
     fn batch_upsert_at_interior(
         store: &Arc<DashMap<Prefix, Node>>,
+        interior_prefix: Prefix,
         interior: InteriorNode,
         entries: Vec<(Hash, Hash)>,
     ) -> Prefix {
@@ -180,7 +182,7 @@ impl BatchMPT {
         let mut divergent_entries = Vec::new();
 
         for &(key, value) in entries.iter() {
-            if interior.prefix.contains(&key) {
+            if interior_prefix.contains(&key) {
                 contained_entries.push((key, value));
             } else {
                 divergent_entries.push((key, value));
@@ -194,14 +196,14 @@ impl BatchMPT {
 
             let new_leaf = LeafNode::new(first_key, first_value);
             let new_leaf_prefix = Prefix::from(first_key);
-            let common = Prefix::common_prefix(&interior.prefix, &new_leaf_prefix);
+            let common = Prefix::common_prefix(&interior_prefix, &new_leaf_prefix);
 
             let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
                 &common,
                 first_key,
                 new_leaf_prefix,
                 new_leaf.merkle_hash,
-                interior.prefix,
+                interior_prefix,
                 interior.merkle_hash,
             );
 
@@ -222,7 +224,7 @@ impl BatchMPT {
         let mut right_entries = Vec::new();
 
         for &(key, value) in contained_entries.iter() {
-            if interior.prefix.key_goes_right(key) {
+            if interior_prefix.key_goes_right(key) {
                 right_entries.push((key, value));
             } else {
                 left_entries.push((key, value));
@@ -253,10 +255,10 @@ impl BatchMPT {
         let right_hash = store.get(&new_right).unwrap().merkle_hash();
 
         let updated_interior =
-            InteriorNode::new(interior.prefix, new_left, new_right, left_hash, right_hash);
+            InteriorNode::new(interior_prefix, new_left, new_right, left_hash, right_hash);
 
-        store.insert(interior.prefix, Node::Interior(updated_interior));
-        interior.prefix
+        store.insert(interior_prefix, Node::Interior(updated_interior));
+        interior_prefix
     }
 }
 

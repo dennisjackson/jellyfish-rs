@@ -248,8 +248,10 @@ impl DurableBatchMPT {
         };
 
         match node {
-            Node::Leaf(leaf) => self.batch_upsert_at_leaf(leaf, entries),
-            Node::Interior(interior) => self.batch_upsert_at_interior(interior, entries),
+            Node::Leaf(leaf) => self.batch_upsert_at_leaf(current_prefix, leaf, entries),
+            Node::Interior(interior) => {
+                self.batch_upsert_at_interior(current_prefix, interior, entries)
+            }
         }
     }
 
@@ -269,15 +271,19 @@ impl DurableBatchMPT {
     }
 
     /// Batch upsert at a leaf node.
-    fn batch_upsert_at_leaf(&self, leaf: LeafNode, entries: Vec<(Hash, Hash)>) -> Prefix {
-        let leaf_prefix = Prefix::from(leaf.key);
-
+    fn batch_upsert_at_leaf(
+        &self,
+        leaf_prefix: Prefix,
+        leaf: LeafNode,
+        entries: Vec<(Hash, Hash)>,
+    ) -> Prefix {
         // Partition entries into updates for this leaf and remaining inserts
-        let (mut updates, remaining): (Vec<_>, Vec<_>) =
-            entries.into_iter().partition(|(key, _)| *key == leaf.key);
+        let (mut updates, remaining): (Vec<_>, Vec<_>) = entries
+            .into_iter()
+            .partition(|(key, _)| *key == leaf_prefix.hash);
 
         if let Some((_, new_value)) = updates.pop() {
-            let updated_leaf = LeafNode::new(leaf.key, new_value);
+            let updated_leaf = LeafNode::new(leaf_prefix.hash, new_value);
             self.cache.set(leaf_prefix, Node::Leaf(updated_leaf));
 
             if remaining.is_empty() {
@@ -301,7 +307,7 @@ impl DurableBatchMPT {
 
         let new_leaf = LeafNode::new(first_key, first_value);
         let new_prefix = Prefix::from(first_key);
-        let existing_prefix = Prefix::from(leaf.key);
+        let existing_prefix = leaf_prefix;
         let merged_prefix = Prefix::common_prefix(&existing_prefix, &new_prefix);
 
         let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
@@ -332,13 +338,14 @@ impl DurableBatchMPT {
     /// Batch upsert at an interior node.
     fn batch_upsert_at_interior(
         &self,
+        interior_prefix: Prefix,
         interior: InteriorNode,
         entries: Vec<(Hash, Hash)>,
     ) -> Prefix {
         // Partition entries: those that belong under this node vs. those that diverge
         let (mut contained_entries, divergent_entries): (Vec<_>, Vec<_>) = entries
             .into_iter()
-            .partition(|(key, _)| interior.prefix.contains(key));
+            .partition(|(key, _)| interior_prefix.contains(key));
 
         // Handle divergent entries first (they require creating a new parent)
         let mut divergent_iter = divergent_entries.into_iter();
@@ -346,14 +353,14 @@ impl DurableBatchMPT {
             // Create new parent(s) for divergent entries
             let new_leaf = LeafNode::new(first_key, first_value);
             let new_leaf_prefix = Prefix::from(first_key);
-            let common = Prefix::common_prefix(&interior.prefix, &new_leaf_prefix);
+            let common = Prefix::common_prefix(&interior_prefix, &new_leaf_prefix);
 
             let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
                 &common,
                 first_key,
                 new_leaf_prefix,
                 new_leaf.merkle_hash,
-                interior.prefix,
+                interior_prefix,
                 interior.merkle_hash,
             );
 
@@ -372,7 +379,7 @@ impl DurableBatchMPT {
         // Partition them by left/right
         let (left_entries, right_entries): (Vec<_>, Vec<_>) = contained_entries
             .into_iter()
-            .partition(|(key, _)| !interior.prefix.key_goes_right(*key));
+            .partition(|(key, _)| !interior_prefix.key_goes_right(*key));
 
         // Recursively process left and right subtrees in parallel using rayon
         let (new_left, new_right) = rayon::join(
@@ -407,12 +414,12 @@ impl DurableBatchMPT {
             .merkle_hash();
 
         let updated_interior =
-            InteriorNode::new(interior.prefix, new_left, new_right, left_hash, right_hash);
+            InteriorNode::new(interior_prefix, new_left, new_right, left_hash, right_hash);
 
         self.cache
-            .set(interior.prefix, Node::Interior(updated_interior));
+            .set(interior_prefix, Node::Interior(updated_interior));
 
-        interior.prefix
+        interior_prefix
     }
 
     /// Clear the in-memory cache (useful for testing memory constraints).

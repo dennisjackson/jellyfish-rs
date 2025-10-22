@@ -65,27 +65,34 @@ impl SimpleMPT {
         };
 
         match node {
-            Node::Leaf(leaf) => self.base_leaf_upsert(leaf, key, value),
-            Node::Interior(interior) => self.recursive_interior_upsert(interior, key, value),
+            Node::Leaf(leaf) => self.base_leaf_upsert(current_prefix, leaf, key, value),
+            Node::Interior(interior) => {
+                self.recursive_interior_upsert(current_prefix, interior, key, value)
+            }
         }
     }
 
-    fn base_leaf_upsert(&mut self, leaf: LeafNode, key: Hash, value: Hash) -> Prefix {
-        debug!("At leaf node with key {}", leaf.key.short_hex());
+    fn base_leaf_upsert(
+        &mut self,
+        leaf_prefix: Prefix,
+        leaf: LeafNode,
+        key: Hash,
+        value: Hash,
+    ) -> Prefix {
+        debug!("At leaf node with key {}", leaf_prefix.hash.short_hex());
 
-        if leaf.key == key {
+        if leaf_prefix.hash == key {
             // Update existing leaf in place
             debug!("At leaf node with matching key, updating in place");
             let updated_leaf = LeafNode::new(key, value);
-            let lp = Prefix::from(leaf.key);
-            self.insert_node(lp, Node::Leaf(updated_leaf));
-            return lp;
+            self.insert_node(leaf_prefix, Node::Leaf(updated_leaf));
+            return leaf_prefix;
         }
 
         // Split: create new interior node with both leaves as children
         debug!("At leaf node with different key, splitting");
         let new_leaf = LeafNode::new(key, value);
-        let existing_prefix = Prefix::from(leaf.key);
+        let existing_prefix = leaf_prefix;
         let new_prefix = Prefix::from(key);
         let merged_prefix = Prefix::common_prefix(&existing_prefix, &new_prefix);
 
@@ -115,30 +122,31 @@ impl SimpleMPT {
 
     fn recursive_interior_upsert(
         &mut self,
+        interior_prefix: Prefix,
         interior: InteriorNode,
         key: Hash,
         value: Hash,
     ) -> Prefix {
         debug!(
             "At interior node prefix {} left: {} right: {}",
-            interior.prefix.short_hex(),
+            interior_prefix.short_hex(),
             interior.left.short_hex(),
             interior.right.short_hex()
         );
 
-        if !interior.prefix.contains(&key) {
+        if !interior_prefix.contains(&key) {
             // Key diverges before interior's prefix ends: create new parent
             debug!("Key diverges from interior prefix, creating new parent");
             let new_leaf = LeafNode::new(key, value);
             let new_leaf_prefix = Prefix::from(key);
-            let common = Prefix::common_prefix(&interior.prefix, &new_leaf_prefix);
+            let common = Prefix::common_prefix(&interior_prefix, &new_leaf_prefix);
 
             let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
                 &common,
                 key,
                 new_leaf_prefix,
                 new_leaf.merkle_hash,
-                interior.prefix,
+                interior_prefix,
                 interior.merkle_hash,
             );
 
@@ -151,7 +159,7 @@ impl SimpleMPT {
         }
 
         // Key belongs under this interior: descend to appropriate child
-        let goes_right = interior.prefix.key_goes_right(key);
+        let goes_right = interior_prefix.key_goes_right(key);
         let (new_left, new_right) = if goes_right {
             debug!("At interior node, descending right");
             (
@@ -170,26 +178,25 @@ impl SimpleMPT {
         let right_hash = self.store.get(&new_right).unwrap().merkle_hash();
 
         let updated_interior =
-            InteriorNode::new(interior.prefix, new_left, new_right, left_hash, right_hash);
+            InteriorNode::new(interior_prefix, new_left, new_right, left_hash, right_hash);
 
-        self.insert_node(interior.prefix, Node::Interior(updated_interior));
-        interior.prefix
+        self.insert_node(interior_prefix, Node::Interior(updated_interior));
+        interior_prefix
     }
 
     fn insert_node(&mut self, prefix: Prefix, node: Node) {
         match &node {
             Node::Leaf(leaf) => {
                 debug!(
-                    "  Inserting Leaf at {}: key={} value={}",
+                    "  Inserting Leaf at {}: value={}",
                     prefix.short_hex(),
-                    leaf.key.short_hex(),
                     leaf.value.short_hex(),
                 );
             }
             Node::Interior(interior) => {
                 debug!(
                     "  Inserting Interior at {}: left={} right={}",
-                    interior.prefix.short_hex(),
+                    prefix.short_hex(),
                     interior.left.short_hex(),
                     interior.right.short_hex(),
                 );

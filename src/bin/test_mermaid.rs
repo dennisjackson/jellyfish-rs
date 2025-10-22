@@ -1,4 +1,3 @@
-use jellyfish_rs::prefix::HashExt;
 use jellyfish_rs::{Hash, Node, Prefix, SimpleMPT};
 use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
@@ -42,12 +41,8 @@ fn collect_mermaid_node(mpt: &SimpleMPT) -> String {
             return name.clone();
         }
         let name = match node {
-            Node::Leaf(leaf) => format!("leaf_{}", &leaf.key.short_hex()),
-            Node::Interior(interior) => format!(
-                "int_{}_{}",
-                &interior.prefix.length,
-                &interior.prefix.short_hex()
-            ),
+            Node::Leaf(_) => format!("leaf_{}", prefix.short_hex()),
+            Node::Interior(_) => format!("int_{}_{}", prefix.length, prefix.short_hex()),
         };
         name_cache.insert(*prefix, name.clone());
         name
@@ -55,19 +50,11 @@ fn collect_mermaid_node(mpt: &SimpleMPT) -> String {
     for (prefix, node) in mpt.store.iter() {
         let this_name = get_name(prefix, node);
         match node {
-            Node::Leaf(leaf) => {
-                lines.push_str(&format!(
-                    "  {}[\"L:{}\"]\n",
-                    this_name,
-                    &leaf.key.short_hex()
-                ));
+            Node::Leaf(_) => {
+                lines.push_str(&format!("  {}[\"L:{}\"]\n", this_name, &prefix.short_hex()));
             }
             Node::Interior(interior) => {
-                lines.push_str(&format!(
-                    "  {}[\"I:{}\"]\n",
-                    this_name,
-                    &interior.prefix.short_hex()
-                ));
+                lines.push_str(&format!("  {}[\"I:{}\"]\n", this_name, &prefix.short_hex()));
                 // Edges to children
                 if let Some(left_node) = mpt.store.get(&interior.left) {
                     let left_name = get_name(&interior.left, left_node);

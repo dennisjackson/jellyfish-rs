@@ -45,8 +45,11 @@ fn test_get_set() {
 
     match retrieved.value() {
         Node::Leaf(retrieved_leaf) => {
-            assert_eq!(retrieved_leaf.key, key);
             assert_eq!(retrieved_leaf.value, value);
+            assert_eq!(
+                retrieved_leaf.merkle_hash,
+                LeafNode::calculate_hash(key, value)
+            );
         }
         _ => panic!("Expected leaf node"),
     }
@@ -89,8 +92,11 @@ fn test_flush_and_pre_advise() {
 
     match retrieved1.value() {
         Node::Leaf(retrieved_leaf) => {
-            assert_eq!(retrieved_leaf.key, key1);
             assert_eq!(retrieved_leaf.value, value1);
+            assert_eq!(
+                retrieved_leaf.merkle_hash,
+                LeafNode::calculate_hash(key1, value1)
+            );
         }
         _ => panic!("Expected leaf node"),
     }

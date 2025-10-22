@@ -21,7 +21,6 @@ pub use cache::Cache;
 
 #[derive(Clone)]
 pub struct LeafNode {
-    pub key: Hash,
     pub value: Hash,
     pub merkle_hash: Hash,
 }
@@ -29,7 +28,6 @@ pub struct LeafNode {
 impl LeafNode {
     pub fn new(key: Hash, value: Hash) -> Self {
         Self {
-            key,
             value,
             merkle_hash: Self::calculate_hash(key, value),
         }
@@ -48,8 +46,7 @@ impl fmt::Display for LeafNode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Leaf(key={}, value={}, hash={})",
-            self.key.short_hex(),
+            "Leaf(value={}, hash={})",
             self.value.short_hex(),
             self.merkle_hash.short_hex()
         )
@@ -58,7 +55,6 @@ impl fmt::Display for LeafNode {
 
 #[derive(Clone)]
 pub struct InteriorNode {
-    pub prefix: Prefix,
     pub merkle_hash: Hash,
     pub left: Prefix,
     pub right: Prefix,
@@ -73,7 +69,6 @@ impl InteriorNode {
         right_hash: Hash,
     ) -> Self {
         Self {
-            prefix,
             left,
             right,
             merkle_hash: Self::calculate_hash(prefix, left_hash, right_hash),
@@ -95,8 +90,7 @@ impl fmt::Display for InteriorNode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Interior(prefix={}, left={}, right={}, hash={})",
-            self.prefix.short_hex(),
+            "Interior(left={}, right={}, hash={})",
             self.left.short_hex(),
             self.right.short_hex(),
             self.merkle_hash.short_hex()
@@ -123,7 +117,7 @@ impl Node {
         match self {
             Node::Leaf(leaf) => {
                 let data = bincode::encode_to_vec(
-                    (leaf.key, leaf.value, leaf.merkle_hash),
+                    (leaf.value, leaf.merkle_hash),
                     bincode::config::standard(),
                 )
                 .map_err(|e| format!("Failed to encode leaf: {}", e))?;
@@ -131,12 +125,7 @@ impl Node {
             }
             Node::Interior(interior) => {
                 let data = bincode::encode_to_vec(
-                    (
-                        interior.prefix,
-                        interior.merkle_hash,
-                        interior.left,
-                        interior.right,
-                    ),
+                    (interior.merkle_hash, interior.left, interior.right),
                     bincode::config::standard(),
                 )
                 .map_err(|e| format!("Failed to encode interior: {}", e))?;
@@ -149,26 +138,24 @@ impl Node {
     pub fn deserialize(node_type: &str, node_data: &[u8]) -> Result<Self, String> {
         match node_type {
             "leaf" => {
-                let decoded: (Hash, Hash, Hash) =
+                let decoded: (Hash, Hash) =
                     bincode::decode_from_slice(node_data, bincode::config::standard())
                         .map(|(v, _)| v)
                         .map_err(|e| format!("Failed to decode leaf: {}", e))?;
                 Ok(Node::Leaf(LeafNode {
-                    key: decoded.0,
-                    value: decoded.1,
-                    merkle_hash: decoded.2,
+                    value: decoded.0,
+                    merkle_hash: decoded.1,
                 }))
             }
             "interior" => {
-                let decoded: (Prefix, Hash, Prefix, Prefix) =
+                let decoded: (Hash, Prefix, Prefix) =
                     bincode::decode_from_slice(node_data, bincode::config::standard())
                         .map(|(v, _)| v)
                         .map_err(|e| format!("Failed to decode interior: {}", e))?;
                 Ok(Node::Interior(InteriorNode {
-                    prefix: decoded.0,
-                    merkle_hash: decoded.1,
-                    left: decoded.2,
-                    right: decoded.3,
+                    merkle_hash: decoded.0,
+                    left: decoded.1,
+                    right: decoded.2,
                 }))
             }
             _ => Err(format!("Unknown node type: {}", node_type)),

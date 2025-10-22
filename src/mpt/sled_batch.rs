@@ -1,7 +1,5 @@
 use dashmap::{DashMap, DashSet};
-use log::info;
 use rayon::join;
-use sled::transaction::Transactional;
 use sled::{Config, Db};
 use std::path::Path;
 
@@ -111,9 +109,11 @@ impl SledBatchMPT {
         };
 
         match node {
-            Node::Leaf(leaf) => Self::batch_upsert_at_leaf(store, dirty, leaf, entries),
+            Node::Leaf(leaf) => {
+                Self::batch_upsert_at_leaf(store, dirty, current_prefix, leaf, entries)
+            }
             Node::Interior(interior) => {
-                Self::batch_upsert_at_interior(store, dirty, interior, entries)
+                Self::batch_upsert_at_interior(store, dirty, current_prefix, interior, entries)
             }
         }
     }
@@ -138,14 +138,13 @@ impl SledBatchMPT {
     fn batch_upsert_at_leaf(
         store: &DashMap<Prefix, Node>,
         dirty: &DashSet<Prefix>,
+        leaf_prefix: Prefix,
         leaf: LeafNode,
         mut entries: Vec<(Hash, Hash)>,
     ) -> Prefix {
-        let leaf_prefix = Prefix::from(leaf.key);
-
-        if let Ok(idx) = entries.binary_search_by_key(&leaf.key, |(k, _)| *k) {
+        if let Ok(idx) = entries.binary_search_by_key(&leaf_prefix.hash, |(k, _)| *k) {
             let (_, new_value) = entries.remove(idx);
-            let updated_leaf = LeafNode::new(leaf.key, new_value);
+            let updated_leaf = LeafNode::new(leaf_prefix.hash, new_value);
             set_node(store, dirty, leaf_prefix, Node::Leaf(updated_leaf));
 
             if entries.is_empty() {
@@ -162,7 +161,7 @@ impl SledBatchMPT {
 
         let new_leaf = LeafNode::new(first_key, first_value);
         let new_prefix = Prefix::from(first_key);
-        let existing_prefix = Prefix::from(leaf.key);
+        let existing_prefix = leaf_prefix;
         let merged_prefix = Prefix::common_prefix(&existing_prefix, &new_prefix);
 
         let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
@@ -192,6 +191,7 @@ impl SledBatchMPT {
     fn batch_upsert_at_interior(
         store: &DashMap<Prefix, Node>,
         dirty: &DashSet<Prefix>,
+        interior_prefix: Prefix,
         interior: InteriorNode,
         entries: Vec<(Hash, Hash)>,
     ) -> Prefix {
@@ -199,7 +199,7 @@ impl SledBatchMPT {
         let mut divergent_entries = Vec::new();
 
         for &(key, value) in entries.iter() {
-            if interior.prefix.contains(&key) {
+            if interior_prefix.contains(&key) {
                 contained_entries.push((key, value));
             } else {
                 divergent_entries.push((key, value));
@@ -211,14 +211,14 @@ impl SledBatchMPT {
 
             let new_leaf = LeafNode::new(first_key, first_value);
             let new_leaf_prefix = Prefix::from(first_key);
-            let common = Prefix::common_prefix(&interior.prefix, &new_leaf_prefix);
+            let common = Prefix::common_prefix(&interior_prefix, &new_leaf_prefix);
 
             let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
                 &common,
                 first_key,
                 new_leaf_prefix,
                 new_leaf.merkle_hash,
-                interior.prefix,
+                interior_prefix,
                 interior.merkle_hash,
             );
 
@@ -236,7 +236,7 @@ impl SledBatchMPT {
         let mut right_entries = Vec::new();
 
         for &(key, value) in contained_entries.iter() {
-            if interior.prefix.key_goes_right(key) {
+            if interior_prefix.key_goes_right(key) {
                 right_entries.push((key, value));
             } else {
                 left_entries.push((key, value));
@@ -270,15 +270,15 @@ impl SledBatchMPT {
             .merkle_hash();
 
         let updated_interior =
-            InteriorNode::new(interior.prefix, new_left, new_right, left_hash, right_hash);
+            InteriorNode::new(interior_prefix, new_left, new_right, left_hash, right_hash);
 
         set_node(
             store,
             dirty,
-            interior.prefix,
+            interior_prefix,
             Node::Interior(updated_interior),
         );
-        interior.prefix
+        interior_prefix
     }
 
     fn order_children(

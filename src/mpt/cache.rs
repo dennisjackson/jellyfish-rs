@@ -454,29 +454,28 @@ impl Cache {
                 let mut prefixes_to_query = Vec::new();
                 for prefix in &current_frontier {
                     match self.map.get(prefix) {
-                        Some(node) => frontier_nodes.push(node.value().clone()),
+                        Some(node) => frontier_nodes.push((*prefix, node.value().clone())),
                         None => prefixes_to_query.push(*prefix),
                     }
                 }
 
-                for (_, node) in
+                for (prefix, node) in
                     self.load_and_cache_nodes(&db, &prefixes_to_query, &mut queried_nodes)?
                 {
-                    frontier_nodes.push(node);
+                    frontier_nodes.push((prefix, node));
                 }
 
                 current_frontier.clear();
-                for node in &frontier_nodes {
-                    debug!("  Loaded frontier node: {}", node);
-                    if let Node::Leaf(leaf) = node {
-                        let prefix = Prefix::from(leaf.key);
+                for (prefix, node) in &frontier_nodes {
+                    debug!("  Loaded frontier node: {} at {}", node, prefix.short_hex());
+                    if matches!(node, Node::Leaf(_)) {
                         debug!("Loaded leaf node {:?}", prefix);
-                        needed_keys.remove(&prefix);
+                        needed_keys.remove(prefix);
                     }
                 }
 
                 let mut siblings_to_load = Vec::new();
-                for node in &frontier_nodes {
+                for (_, node) in &frontier_nodes {
                     if let Node::Interior(interior) = node {
                         for nk in needed_keys.iter() {
                             if interior.left.prefix_of(nk) {
