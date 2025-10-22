@@ -5,6 +5,7 @@ use log::info;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::error::Error;
+use std::hash::SipHasher;
 use std::path::Path;
 use std::time::Instant;
 
@@ -220,19 +221,14 @@ fn ensure_parent(path_str: &str) -> Result<(), Box<dyn Error>> {
 }
 
 fn generate_entries(offset: u32, start: usize, count: usize) -> Vec<(Hash, Hash)> {
-    (offset as usize + start..offset as usize + start + count)
-        .map(|i| {
-            let mut key_hasher = Sha256::new();
-            key_hasher.update(b"key");
-            key_hasher.update((i as u64).to_le_bytes());
-            let key: Hash = key_hasher.finalize().into();
-
-            let mut value_hasher = Sha256::new();
-            value_hasher.update(b"value");
-            value_hasher.update((i as u64).to_le_bytes());
-            let value: Hash = value_hasher.finalize().into();
-
-            (key, value)
-        })
-        .collect()
+    let mut vec = Vec::with_capacity(count);
+    let mut rng = fastrand::Rng::new();
+    for i in 0..count {
+        let mut key = [0u8; 32];
+        rng.fill(&mut key);
+        let mut value = [0u8; 32];
+        rng.fill(&mut value);
+        vec.push((key, value));
+    }
+    vec
 }
