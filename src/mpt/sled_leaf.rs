@@ -9,11 +9,13 @@ use crate::{Hash, Prefix};
 use super::{InteriorNode, LeafNode, Node};
 
 const ROOT_KEY: &[u8] = b"__mpt_root__";
+const COUNT_KEY: &[u8] = b"__mpt_count__";
 
 pub struct SledLeafMPT {
     db: Db,
     store: DashMap<Prefix, Node>,
     root: Prefix,
+    count: std::sync::atomic::AtomicUsize,
 }
 
 impl SledLeafMPT {
@@ -40,8 +42,13 @@ impl SledLeafMPT {
     }
 
     fn insert_node_with_db(&self, prefix: Prefix, node: Node) {
+        let is_new_leaf = matches!(node, Node::Leaf(_)) && !self.store.contains_key(&prefix);
         self.store.insert(prefix, node.clone());
         self.db.insert(prefix_key(&prefix), encode_node(&node)).expect("DB insert failed");
+        if is_new_leaf {
+            let new_count = self.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            self.db.insert(COUNT_KEY, &new_count.to_be_bytes()).expect("Failed to update count");
+        }
     }
 
     fn insert_node_memory_only(&self, prefix: Prefix, node: Node) {
@@ -59,20 +66,34 @@ impl SledLeafMPT {
             }
         };
 
+        let count = match db.get(COUNT_KEY)? {
+            Some(raw) => {
+                if raw.len() == 8 {
+                    usize::from_be_bytes(raw.as_ref().try_into().unwrap())
+                } else {
+                    0
+                }
+            }
+            None => {
+                db.insert(COUNT_KEY, &0_usize.to_be_bytes())?;
+                0
+            }
+        };
 
         let iter_db = db.clone();
-        let estimated_entries = db.len().saturating_sub(1);
+        let estimated_entries = count.max(1);
         let mut instance = Self {
             db,
             store: DashMap::with_capacity(estimated_entries.saturating_mul(2)),
             root,
+            count: std::sync::atomic::AtomicUsize::new(count),
         };
 
         const RECOVERY_CHUNK: usize = 4096;
         let mut leaf_entries: Vec<(Hash, Hash)> = Vec::with_capacity(RECOVERY_CHUNK);
         for entry in iter_db.iter() {
             let (key, value) = entry?;
-            if key.as_ref() == ROOT_KEY {
+            if key.as_ref() == ROOT_KEY || key.as_ref() == COUNT_KEY {
                 continue;
             }
             let prefix = decode_prefix(key.as_ref()).map_err(sled::Error::Unsupported)?;
@@ -349,6 +370,14 @@ impl SledLeafMPT {
     pub fn flush(&mut self) -> sled::Result<()> {
         self.db.flush()?;
         Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

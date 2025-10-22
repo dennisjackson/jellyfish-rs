@@ -32,7 +32,7 @@ impl Tree {
 
     fn len(&self) -> usize {
         match self {
-            Tree::Durable(tree) => tree.enumerate_nodes().len(),
+            Tree::Durable(tree) => tree.len(),
             Tree::InMemory(tree) => tree.enumerate_nodes().len(),
         }
     }
