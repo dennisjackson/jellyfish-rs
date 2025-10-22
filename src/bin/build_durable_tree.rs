@@ -126,7 +126,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
     let startup_time = start.elapsed().as_secs_f64();
     let current_tree_size = tree.len();
-    info!("Initialized MPT of size {} in {:.3} s. Rate: {} /s", current_tree_size, startup_time, current_tree_size as f64 / startup_time);
+    info!(
+        "Initialized MPT of size {} in {:.3} s. Rate: {} /s",
+        current_tree_size,
+        startup_time,
+        current_tree_size as f64 / startup_time
+    );
 
     info!(
         "Building {} MPT with tree_size={}, insertions={}, window_size={}, and batch_size={}",
@@ -143,7 +148,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     let offset = rand::random::<u32>();
     let mut total_inserted = 0usize;
     let start = Instant::now();
-    let pb = ProgressBar::new(tree_size as u64).with_style(ProgressStyle::with_template("{wide_bar} {human_pos} / {human_len} - {percent}% - {per_sec} - {eta}").unwrap());
+    let pb = ProgressBar::new(tree_size as u64).with_style(
+        ProgressStyle::with_template(
+            "{wide_bar} {human_pos} / {human_len} - {percent}% - {per_sec} - {eta}",
+        )
+        .unwrap(),
+    );
     while total_inserted < tree_size {
         let start_index = total_inserted;
         let remaining = tree_size - start_index;

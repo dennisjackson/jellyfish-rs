@@ -1,4 +1,4 @@
-use dashmap::{DashMap};
+use dashmap::DashMap;
 use rayon::join;
 use sled::{Config, Db};
 use std::path::Path;
@@ -24,7 +24,8 @@ impl SledLeafMPT {
             .flush_every_ms(Some(5000))
             .mode(sled::Mode::HighThroughput)
             .use_compression(false)
-            .print_profile_on_drop(false)
+            .print_profile_on_drop(true)
+            .cache_capacity(1024 * 1024 * 1024 * 8) // 8 GB
     }
 
     pub fn new_with_path(path: impl AsRef<Path>) -> sled::Result<Self> {
@@ -37,17 +38,20 @@ impl SledLeafMPT {
         Self::from_db(db)
     }
 
-    pub fn insert_node(&self, prefix: Prefix, node: Node) {
-        self.insert_node_with_db(prefix, node);
-    }
-
     fn insert_node_with_db(&self, prefix: Prefix, node: Node) {
         let is_new_leaf = matches!(node, Node::Leaf(_)) && !self.store.contains_key(&prefix);
         self.store.insert(prefix, node.clone());
-        self.db.insert(prefix_key(&prefix), encode_node(&node)).expect("DB insert failed");
+        self.db
+            .insert(prefix_key(&prefix), encode_node(&node))
+            .expect("DB insert failed");
         if is_new_leaf {
-            let new_count = self.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            self.db.insert(COUNT_KEY, &new_count.to_be_bytes()).expect("Failed to update count");
+            let new_count = self
+                .count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            self.db
+                .insert(COUNT_KEY, &new_count.to_be_bytes())
+                .expect("Failed to update count");
         }
     }
 
@@ -89,7 +93,7 @@ impl SledLeafMPT {
             count: std::sync::atomic::AtomicUsize::new(count),
         };
 
-        const RECOVERY_CHUNK: usize = 4096;
+        const RECOVERY_CHUNK: usize = 1024 * 1024;
         let mut leaf_entries: Vec<(Hash, Hash)> = Vec::with_capacity(RECOVERY_CHUNK);
         for entry in iter_db.iter() {
             let (key, value) = entry?;
@@ -101,6 +105,7 @@ impl SledLeafMPT {
             if let Node::Leaf(leaf) = node {
                 leaf_entries.push((prefix.hash, leaf.value));
                 if leaf_entries.len() == RECOVERY_CHUNK {
+                    assert!(leaf_entries.is_sorted());
                     instance.batch_upsert_memory_only(&leaf_entries);
                     leaf_entries.clear();
                 }
@@ -123,11 +128,11 @@ impl SledLeafMPT {
         entries_vec.sort_unstable_by_key(|(k, _)| *k);
         entries_vec.dedup_by_key(|(k, _)| *k);
 
-        let new_root =
-            Self::recursive_batch_upsert(self, self.root, entries_vec, false);
+        let new_root = Self::recursive_batch_upsert(self, self.root, entries_vec, false);
         self.root = new_root;
-        self.db.insert(ROOT_KEY, encode_prefix(self.root)).expect("Failed to update root in DB");
-
+        self.db
+            .insert(ROOT_KEY, encode_prefix(self.root))
+            .expect("Failed to update root in DB");
     }
 
     fn batch_upsert_memory_only(&mut self, entries: &[(Hash, Hash)]) {
@@ -139,8 +144,7 @@ impl SledLeafMPT {
         entries_vec.sort_unstable_by_key(|(k, _)| *k);
         entries_vec.dedup_by_key(|(k, _)| *k);
 
-        let new_root =
-            Self::recursive_batch_upsert(self, self.root, entries_vec, true);
+        let new_root = Self::recursive_batch_upsert(self, self.root, entries_vec, true);
         self.root = new_root;
     }
 
@@ -154,7 +158,8 @@ impl SledLeafMPT {
             return current_prefix;
         }
 
-        let node = self.store
+        let node = self
+            .store
             .get(&current_prefix)
             .map(|guard| guard.value().clone());
         let Some(node) = node else {
@@ -171,11 +176,7 @@ impl SledLeafMPT {
         }
     }
 
-    fn batch_insert_into_empty(
-        &self,
-        mut entries: Vec<(Hash, Hash)>,
-        memory_only: bool,
-    ) -> Prefix {
+    fn batch_insert_into_empty(&self, mut entries: Vec<(Hash, Hash)>, memory_only: bool) -> Prefix {
         if entries.is_empty() {
             return Prefix::root();
         }
@@ -245,7 +246,7 @@ impl SledLeafMPT {
             self.insert_node_memory_only(existing_prefix, Node::Leaf(leaf));
             self.insert_node_memory_only(new_prefix, Node::Leaf(new_leaf));
         } else {
-            self.insert_node_with_db(merged_prefix, Node::Interior(new_interior));
+            self.insert_node_memory_only(merged_prefix, Node::Interior(new_interior));
             self.insert_node_with_db(existing_prefix, Node::Leaf(leaf));
             self.insert_node_with_db(new_prefix, Node::Leaf(new_leaf));
         }
@@ -260,16 +261,19 @@ impl SledLeafMPT {
         entries: Vec<(Hash, Hash)>,
         memory_only: bool,
     ) -> Prefix {
-        let mut contained_entries = Vec::new();
-        let mut divergent_entries = Vec::new();
+        let mut contained_entries = Vec::with_capacity(entries.len());
+        let mut divergent_entries = Vec::with_capacity(entries.len());
 
-        for &(key, value) in entries.iter() {
-            if interior_prefix.contains(&key) {
-                contained_entries.push((key, value));
-            } else {
-                divergent_entries.push((key, value));
-            }
-        }
+        (contained_entries, divergent_entries) = entries
+            .into_iter()
+            .partition(|(k, v)| interior_prefix.contains(&k));
+        // for &(key, value) in entries.iter() {
+        //     if interior_prefix.contains(&key) {
+        //         contained_entries.push((key, value));
+        //     } else {
+        //         divergent_entries.push((key, value));
+        //     }
+        // }
 
         if !divergent_entries.is_empty() {
             let (first_key, first_value) = divergent_entries.remove(0);
@@ -294,7 +298,7 @@ impl SledLeafMPT {
                 self.insert_node_memory_only(common, Node::Interior(new_interior));
                 self.insert_node_memory_only(new_leaf_prefix, Node::Leaf(new_leaf));
             } else {
-                self.insert_node_with_db(common, Node::Interior(new_interior));
+                self.insert_node_memory_only(common, Node::Interior(new_interior));
                 self.insert_node_with_db(new_leaf_prefix, Node::Leaf(new_leaf));
             }
 
@@ -305,6 +309,7 @@ impl SledLeafMPT {
         let mut left_entries = Vec::new();
         let mut right_entries = Vec::new();
 
+        //todo partition
         for &(key, value) in contained_entries.iter() {
             if interior_prefix.key_goes_right(key) {
                 right_entries.push((key, value));
@@ -312,23 +317,27 @@ impl SledLeafMPT {
                 left_entries.push((key, value));
             }
         }
+        let count = left_entries.len() + right_entries.len();
+        let l_work = || {
+            if !left_entries.is_empty() {
+                Self::recursive_batch_upsert(self, interior.left, left_entries, memory_only)
+            } else {
+                interior.left
+            }
+        };
+        let r_work = || {
+            if !right_entries.is_empty() {
+                Self::recursive_batch_upsert(self, interior.right, right_entries, memory_only)
+            } else {
+                interior.right
+            }
+        };
 
-        let (new_left, new_right) = join(
-            || {
-                if !left_entries.is_empty() {
-                    Self::recursive_batch_upsert(self, interior.left, left_entries, memory_only)
-                } else {
-                    interior.left
-                }
-            },
-            || {
-                if !right_entries.is_empty() {
-                    Self::recursive_batch_upsert(self, interior.right, right_entries, memory_only)
-                } else {
-                    interior.right
-                }
-            },
-        );
+        let (new_left, new_right) = if count > 256 {
+            join(l_work, r_work)
+        } else {
+            (l_work(), r_work())
+        };
 
         let left_hash = self
             .store
@@ -344,11 +353,7 @@ impl SledLeafMPT {
         let updated_interior =
             InteriorNode::new(interior_prefix, new_left, new_right, left_hash, right_hash);
 
-        if memory_only {
-            self.insert_node_memory_only(interior_prefix, Node::Interior(updated_interior));
-        } else {
-            self.insert_node_with_db(interior_prefix, Node::Interior(updated_interior));
-        }
+        self.insert_node_memory_only(interior_prefix, Node::Interior(updated_interior));
         interior_prefix
     }
 

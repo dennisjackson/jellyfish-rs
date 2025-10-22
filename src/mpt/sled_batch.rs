@@ -303,14 +303,16 @@ impl SledBatchMPT {
 
         std::mem::swap(&mut self.dirty, &mut self.old_dirty);
 
-        self.db.transaction(|db| {
-            for prefix in self.dirty.iter() {
-                let node = self.store.get(&prefix).unwrap();
-                db.insert(prefix_key(&prefix), encode_node(node.value()))?;
-            }
-            db.insert(ROOT_KEY, encode_prefix(self.root))?;
-            Ok::<(), sled::transaction::ConflictableTransactionError>(())
-        }).expect("trans error");
+        self.db
+            .transaction(|db| {
+                for prefix in self.dirty.iter() {
+                    let node = self.store.get(&prefix).unwrap();
+                    db.insert(prefix_key(&prefix), encode_node(node.value()))?;
+                }
+                db.insert(ROOT_KEY, encode_prefix(self.root))?;
+                Ok::<(), sled::transaction::ConflictableTransactionError>(())
+            })
+            .expect("trans error");
         self.dirty.clear();
         // self.db.flush()?;
 
