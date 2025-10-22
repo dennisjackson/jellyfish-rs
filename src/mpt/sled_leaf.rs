@@ -2,6 +2,8 @@ use dashmap::{DashMap};
 use rayon::join;
 use sled::{Config, Db};
 use std::path::Path;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 
 use crate::mpt::MerklePatriciaTree;
 use crate::{Hash, Prefix};
@@ -13,7 +15,7 @@ const ROOT_KEY: &[u8] = b"__mpt_root__";
 pub struct SledLeafMPT {
     db: Db,
     store: DashMap<Prefix, Node>,
-    root: Prefix,
+    root: Mutex<Prefix>,
 }
 
 impl SledLeafMPT {
@@ -62,14 +64,27 @@ impl SledLeafMPT {
 
         let iter_db = db.clone();
         let estimated_entries = db.len().saturating_sub(1);
-        let mut instance = Self {
+        let instance = Self {
             db,
             store: DashMap::with_capacity(estimated_entries.saturating_mul(2)),
-            root,
+            root: Mutex::new(root),
         };
 
         const RECOVERY_CHUNK: usize = 4096;
         let mut leaf_entries: Vec<(Hash, Hash)> = Vec::with_capacity(RECOVERY_CHUNK);
+        
+        // Create channel for sending leaf entries to background thread
+        let (tx, rx) = mpsc::channel::<Vec<(Hash, Hash)>>();
+        let instance_arc = Arc::new(instance);
+        let instance_clone = Arc::clone(&instance_arc);
+        
+        // Spawn a single background thread to process all leaf entries
+        let background_handle = thread::spawn(move || {
+            while let Ok(entries) = rx.recv() {
+                instance_clone.batch_upsert_memory_only(&entries);
+            }
+        });
+        
         for entry in iter_db.iter() {
             let (key, value) = entry?;
             if key.as_ref() == ROOT_KEY {
@@ -80,20 +95,33 @@ impl SledLeafMPT {
             if let Node::Leaf(leaf) = node {
                 leaf_entries.push((prefix.hash, leaf.value));
                 if leaf_entries.len() == RECOVERY_CHUNK {
-                    instance.batch_upsert_memory_only(&leaf_entries);
-                    leaf_entries.clear();
+                    let entries_to_process = std::mem::replace(
+                        &mut leaf_entries,
+                        Vec::with_capacity(RECOVERY_CHUNK)
+                    );
+                    tx.send(entries_to_process)
+                        .map_err(|_| sled::Error::Unsupported("Failed to send to background thread".into()))?;
                 }
             }
         }
 
         if !leaf_entries.is_empty() {
-            instance.batch_upsert_memory_only(&leaf_entries);
+            tx.send(leaf_entries)
+                .map_err(|_| sled::Error::Unsupported("Failed to send final chunk to background thread".into()))?;
         }
 
-        Ok(instance)
+        // Drop the sender to signal the background thread to finish
+        drop(tx);
+        
+        // Wait for the background thread to complete
+        background_handle.join()
+            .map_err(|_| sled::Error::Unsupported("Background thread panicked during recovery".into()))?;
+
+        Arc::try_unwrap(instance_arc)
+            .map_err(|_| sled::Error::Unsupported("Failed to unwrap Arc after recovery".into()))
     }
 
-    fn batch_upsert_optimized(&mut self, entries: &[(Hash, Hash)]) {
+    fn batch_upsert_optimized(&self, entries: &[(Hash, Hash)]) {
         if entries.is_empty() {
             return;
         }
@@ -102,14 +130,15 @@ impl SledLeafMPT {
         entries_vec.sort_unstable_by_key(|(k, _)| *k);
         entries_vec.dedup_by_key(|(k, _)| *k);
 
+        let current_root = *self.root.lock().unwrap();
         let new_root =
-            Self::recursive_batch_upsert(self, self.root, entries_vec, false);
-        self.root = new_root;
-        self.db.insert(ROOT_KEY, encode_prefix(self.root)).expect("Failed to update root in DB");
+            Self::recursive_batch_upsert(self, current_root, entries_vec, false);
+        *self.root.lock().unwrap() = new_root;
+        self.db.insert(ROOT_KEY, encode_prefix(new_root)).expect("Failed to update root in DB");
 
     }
 
-    fn batch_upsert_memory_only(&mut self, entries: &[(Hash, Hash)]) {
+    fn batch_upsert_memory_only(&self, entries: &[(Hash, Hash)]) {
         if entries.is_empty() {
             return;
         }
@@ -118,9 +147,10 @@ impl SledLeafMPT {
         entries_vec.sort_unstable_by_key(|(k, _)| *k);
         entries_vec.dedup_by_key(|(k, _)| *k);
 
+        let current_root = *self.root.lock().unwrap();
         let new_root =
-            Self::recursive_batch_upsert(self, self.root, entries_vec, true);
-        self.root = new_root;
+            Self::recursive_batch_upsert(self, current_root, entries_vec, true);
+        *self.root.lock().unwrap() = new_root;
     }
 
     fn recursive_batch_upsert(
@@ -346,7 +376,7 @@ impl SledLeafMPT {
         }
     }
 
-    pub fn flush(&mut self) -> sled::Result<()> {
+    pub fn flush(&self) -> sled::Result<()> {
         self.db.flush()?;
         Ok(())
     }
@@ -373,8 +403,9 @@ impl MerklePatriciaTree for SledLeafMPT {
     }
 
     fn get_root_hash(&self) -> Option<Hash> {
+        let root = *self.root.lock().unwrap();
         self.store
-            .get(&self.root)
+            .get(&root)
             .map(|node| node.value().merkle_hash())
     }
 
