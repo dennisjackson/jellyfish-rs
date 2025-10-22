@@ -261,19 +261,9 @@ impl SledLeafMPT {
         entries: Vec<(Hash, Hash)>,
         memory_only: bool,
     ) -> Prefix {
-        let mut contained_entries = Vec::with_capacity(entries.len());
-        let mut divergent_entries = Vec::with_capacity(entries.len());
-
-        (contained_entries, divergent_entries) = entries
+        let (mut contained_entries, mut divergent_entries) : (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) = entries
             .into_iter()
             .partition(|(k, v)| interior_prefix.contains(&k));
-        // for &(key, value) in entries.iter() {
-        //     if interior_prefix.contains(&key) {
-        //         contained_entries.push((key, value));
-        //     } else {
-        //         divergent_entries.push((key, value));
-        //     }
-        // }
 
         if !divergent_entries.is_empty() {
             let (first_key, first_value) = divergent_entries.remove(0);
@@ -305,18 +295,10 @@ impl SledLeafMPT {
             contained_entries.extend(divergent_entries);
             return Self::recursive_batch_upsert(self, common, contained_entries, memory_only);
         }
+        let (right_entries, left_entries) : (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) = contained_entries
+            .into_iter()
+            .partition(|(k, v)| interior_prefix.key_goes_right(*k));
 
-        let mut left_entries = Vec::new();
-        let mut right_entries = Vec::new();
-
-        //todo partition
-        for &(key, value) in contained_entries.iter() {
-            if interior_prefix.key_goes_right(key) {
-                right_entries.push((key, value));
-            } else {
-                left_entries.push((key, value));
-            }
-        }
         let count = left_entries.len() + right_entries.len();
         let l_work = || {
             if !left_entries.is_empty() {
@@ -333,7 +315,7 @@ impl SledLeafMPT {
             }
         };
 
-        let (new_left, new_right) = if count > 256 {
+        let (new_left, new_right) = if count > 1024 {
             join(l_work, r_work)
         } else {
             (l_work(), r_work())

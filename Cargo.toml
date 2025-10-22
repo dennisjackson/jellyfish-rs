@@ -13,7 +13,7 @@ rand = "0.9.2"
 rayon = "1.10"
 rusqlite = { version = "0.32", features = ["bundled", "limits"] }
 serde = { version = "1.0", features = ["derive"] }
-sled = { version = "0.34.7", features = ["compression"], default-features=false }
+sled = { version = "0.34.7", features = ["compression"], default-features=true }
 sha2 = "0.10.9"
 indicatif = "0.18.1"
 fastrand = "2.3.0"
