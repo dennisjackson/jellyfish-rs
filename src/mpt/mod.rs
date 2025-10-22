@@ -13,6 +13,9 @@ pub use batch::BatchMPT;
 mod durable_batch;
 pub use durable_batch::DurableBatchMPT;
 
+mod sled_leaf;
+pub use sled_leaf::SledLeafMPT;
+
 mod sled_batch;
 pub use sled_batch::SledBatchMPT;
 

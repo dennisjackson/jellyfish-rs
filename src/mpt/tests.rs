@@ -17,6 +17,7 @@ macro_rules! test_all_impls {
             test_impl::<BatchMPT>();
             test_impl::<DurableBatchMPT>();
             test_impl::<SledBatchMPT>();
+            test_impl::<SledLeafMPT>();
         }
     };
 }

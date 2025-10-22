@@ -1,5 +1,5 @@
 use indicatif::{ProgressBar, ProgressStyle};
-use jellyfish_rs::mpt::{MerklePatriciaTree, SledBatchMPT};
+use jellyfish_rs::mpt::{MerklePatriciaTree, SledBatchMPT, SledLeafMPT};
 use jellyfish_rs::{BatchMPT, Hash};
 use log::info;
 use sha2::{Digest, Sha256};
@@ -11,7 +11,7 @@ use std::time::Instant;
 const IN_MEMORY_FLAG: &str = "--in-memory";
 
 enum Tree {
-    Durable(SledBatchMPT),
+    Durable(SledLeafMPT),
     InMemory(BatchMPT),
 }
 
@@ -111,17 +111,21 @@ fn run() -> Result<(), Box<dyn Error>> {
         positional_args.get(3).map(|s| s.as_str())
     };
 
+    let start = Instant::now();
     let mut tree = if use_in_memory {
         info!("Using in-memory BatchMPT implementation");
         Tree::InMemory(BatchMPT::new())
     } else if let Some(path) = db_path {
         ensure_parent(path)?;
         info!("Writing durable MPT to {}", path);
-        Tree::Durable(SledBatchMPT::new_with_path(path)?)
+        Tree::Durable(SledLeafMPT::new_with_path(path)?)
     } else {
         info!("Using temporary database path for durable MPT");
-        Tree::Durable(SledBatchMPT::new())
+        Tree::Durable(SledLeafMPT::new())
     };
+    let startup_time = start.elapsed().as_secs_f64();
+    let current_tree_size = tree.len();
+    info!("Initialized MPT of size {} in {:.3} s. Rate: {} /s", current_tree_size, startup_time, current_tree_size as f64 / startup_time);
 
     info!(
         "Building {} MPT with tree_size={}, insertions={}, window_size={}, and batch_size={}",
@@ -130,7 +134,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         } else {
             "durable"
         },
-        human_count(tree.len()),
+        human_count(current_tree_size),
         human_count(tree_size),
         human_count(window_size),
         human_count(batch_size)
