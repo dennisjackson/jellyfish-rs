@@ -87,19 +87,6 @@ impl SledAllMPT {
             .expect("Failed to update root in DB");
     }
 
-    fn batch_upsert_memory_only(&mut self, entries: &[(Hash, Hash)]) {
-        if entries.is_empty() {
-            return;
-        }
-
-        let mut entries_vec: Vec<(Hash, Hash)> = entries.to_vec();
-        entries_vec.sort_unstable_by_key(|(k, _)| *k);
-        entries_vec.dedup_by_key(|(k, _)| *k);
-
-        let new_root = Self::recursive_batch_upsert(self, self.root, entries_vec, true);
-        self.root = new_root;
-    }
-
     fn recursive_batch_upsert(
         &self,
         current_prefix: Prefix,
