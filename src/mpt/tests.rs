@@ -18,6 +18,7 @@ macro_rules! test_all_impls {
             test_impl::<DurableBatchMPT>();
             test_impl::<SledBatchMPT>();
             test_impl::<SledLeafMPT>();
+            test_impl::<SledAllMPT>();
         }
     };
 }
@@ -35,10 +36,15 @@ fn count_nodes<T: MerklePatriciaTree>(mpt: &T) -> usize {
 
 // Helper function to count leaf nodes
 fn count_leaf_nodes<T: MerklePatriciaTree>(mpt: &T) -> usize {
-    mpt.enumerate_nodes()
+    let mut count = 0;
+    for x in mpt.enumerate_nodes()
         .iter()
         .filter(|(_, node)| matches!(node, Node::Leaf(_)))
-        .count()
+    {
+        println!("Leaf node: {:?}", x);
+        count += 1;
+    }
+    count
 }
 
 // Helper function to verify interior nodes have valid children
@@ -46,11 +52,20 @@ fn verify_interior_node_structure<T: MerklePatriciaTree>(mpt: &T) -> bool {
     let nodes: std::collections::HashMap<Prefix, Node> =
         mpt.enumerate_nodes().into_iter().collect();
 
-    for node in nodes.values() {
-        if let Node::Interior(interior) = node
-            && (!nodes.contains_key(&interior.left) || !nodes.contains_key(&interior.right))
-        {
-            return false;
+    for (key, node) in nodes.iter() {
+        if let Node::Interior(interior) = node {
+            let missing_left = !nodes.contains_key(&interior.left);
+            let missing_right = !nodes.contains_key(&interior.right);
+            if missing_left || missing_right {
+                log::error!("Interior node {:?} is missing children", key);
+                if missing_left {
+                    log::error!("  Missing left child: {:?}", interior.left);
+                }
+                if missing_right {
+                    log::error!("  Missing right child: {:?}", interior.right);
+                }
+                return false;
+            }
         }
     }
     true

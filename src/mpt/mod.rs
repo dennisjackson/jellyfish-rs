@@ -25,7 +25,7 @@ pub use sled_all::SledAllMPT;
 mod cache;
 pub use cache::Cache;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LeafNode {
     pub value: Hash,
     pub merkle_hash: Hash,
@@ -59,7 +59,7 @@ impl fmt::Display for LeafNode {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct InteriorNode {
     pub merkle_hash: Hash,
     pub left: Prefix,
@@ -104,7 +104,7 @@ impl fmt::Display for InteriorNode {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Node {
     Leaf(LeafNode),
     Interior(InteriorNode),

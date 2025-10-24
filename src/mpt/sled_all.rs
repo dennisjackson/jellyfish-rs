@@ -8,7 +8,6 @@ use crate::{Hash, Prefix};
 use super::{InteriorNode, LeafNode, Node};
 
 const ROOT_KEY: &[u8] = b"__mpt_root__";
-const COUNT_KEY: &[u8] = b"__mpt_count__";
 
 pub struct SledAllMPT {
     db: Db,
@@ -287,10 +286,21 @@ impl MerklePatriciaTree for SledAllMPT {
 
     fn batch_upsert(&mut self, entries: &[(Hash, Hash)]) {
         self.batch_upsert_optimized(entries);
+        self.flush().expect("Failed to flush DB after batch upsert");
     }
 
     fn enumerate_nodes(&self) -> Vec<(Prefix, Node)> {
-        todo!()
+        let mut nodes = Vec::new();
+        for result in self.db.iter() {
+            let (raw_key, raw_value) = result.expect("DB iteration failed");
+            if raw_key.as_ref() == ROOT_KEY {
+                continue;
+            }
+            let prefix = decode_prefix(raw_key.as_ref()).expect("Failed to decode prefix from DB");
+            let node = decode_node(raw_value.as_ref()).expect("Failed to decode node from DB");
+            nodes.push((prefix, node));
+        }
+        nodes
     }
 
     fn get_root_hash(&self) -> Option<Hash> {
@@ -360,6 +370,7 @@ fn decode_prefix(bytes: &[u8]) -> Result<Prefix, String> {
     }
     let mut hash = [0u8; 32];
     hash.copy_from_slice(&bytes[..32]);
+    hash.reverse();
     let length = u16::from_be_bytes([bytes[32], bytes[33]]);
     Ok(Prefix { hash, length })
 }
