@@ -2,9 +2,9 @@ use async_recursion::async_recursion;
 use dashmap::DashMap;
 use sled::{Config, Db};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::runtime::{Builder, Runtime};
-use std::sync::Arc;
 
 use crate::mpt::MerklePatriciaTree;
 use crate::{Hash, Prefix};
@@ -108,8 +108,7 @@ impl SledTransMPT {
                     db.insert(entry.key().as_slice(), entry.value().as_slice())
                         .expect("Failed to insert pending node into DB");
                 }
-                db
-                    .insert(ROOT_KEY, encode_prefix(self.root))
+                db.insert(ROOT_KEY, encode_prefix(self.root))
                     .expect("Failed to update root in DB");
                 Ok(()) as sled::transaction::ConflictableTransactionResult<(), sled::Error>
             })
