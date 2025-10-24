@@ -2,6 +2,7 @@ use dashmap::{DashMap, DashSet};
 use rayon::join;
 use sled::{Config, Db};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::mpt::MerklePatriciaTree;
 use crate::{Hash, Prefix};
@@ -17,6 +18,16 @@ pub struct SledBatchMPT {
     old_dirty: DashSet<Prefix>,
     root: Prefix,
     root_dirty: bool,
+}
+
+fn get_thread_pool() -> &'static rayon::ThreadPool {
+    static THREAD_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    THREAD_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("Failed to create thread pool")
+    })
 }
 
 impl SledBatchMPT {
@@ -79,8 +90,7 @@ impl SledBatchMPT {
         entries_vec.sort_unstable_by_key(|(k, _)| *k);
         entries_vec.dedup_by_key(|(k, _)| *k);
 
-        let new_root =
-            Self::recursive_batch_upsert(&self.store, &self.dirty, self.root, entries_vec);
+        let new_root = get_thread_pool().install( || Self::recursive_batch_upsert(&self.store, &self.dirty, self.root, entries_vec));
         let root_changed = new_root != self.root;
         self.root = new_root;
         if root_changed {
@@ -243,22 +253,25 @@ impl SledBatchMPT {
             }
         }
 
-        let (new_left, new_right) = join(
-            || {
-                if !left_entries.is_empty() {
+        let count = left_entries.len() + right_entries.len();
+        let lf =  || { if !left_entries.is_empty() {
                     Self::recursive_batch_upsert(store, dirty, interior.left, left_entries)
                 } else {
                     interior.left
                 }
-            },
-            || {
-                if !right_entries.is_empty() {
+            };
+        let rf = || { if !right_entries.is_empty() {
                     Self::recursive_batch_upsert(store, dirty, interior.right, right_entries)
                 } else {
                     interior.right
                 }
-            },
-        );
+            };
+
+        let (new_left, new_right) = if count > 128 {
+             join(lf, rf)
+        } else {
+                (lf(), rf())
+        };
 
         let left_hash = store
             .get(&new_left)
