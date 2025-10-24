@@ -1,11 +1,9 @@
 use indicatif::{ProgressBar, ProgressStyle};
-use jellyfish_rs::mpt::{MerklePatriciaTree, SledAllMPT, SledLeafMPT};
+use jellyfish_rs::mpt::{MerklePatriciaTree, SledAllMPT};
 use jellyfish_rs::{BatchMPT, Hash};
 use log::info;
-use sha2::{Digest, Sha256};
 use std::env;
 use std::error::Error;
-use std::hash::SipHasher;
 use std::path::Path;
 use std::time::Instant;
 
@@ -145,7 +143,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         human_count(window_size),
         human_count(batch_size)
     );
-    let offset = rand::random::<u32>();
     let mut total_inserted = 0usize;
     let start = Instant::now();
     let pb = ProgressBar::new(tree_size as u64).with_style(
@@ -158,7 +155,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         let start_index = total_inserted;
         let remaining = tree_size - start_index;
         let current_window = remaining.min(window_size);
-        let mut entries = generate_entries(offset, start_index, current_window);
+        let mut entries = generate_entries(current_window);
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
         for chunk in entries.chunks(batch_size) {
@@ -230,10 +227,10 @@ fn ensure_parent(path_str: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn generate_entries(offset: u32, start: usize, count: usize) -> Vec<(Hash, Hash)> {
+fn generate_entries(count: usize) -> Vec<(Hash, Hash)> {
     let mut vec = Vec::with_capacity(count);
     let mut rng = fastrand::Rng::new();
-    for i in 0..count {
+    for _ in 0..count {
         let mut key = [0u8; 32];
         rng.fill(&mut key);
         let mut value = [0u8; 32];

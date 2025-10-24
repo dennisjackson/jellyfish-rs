@@ -264,7 +264,7 @@ impl SledLeafMPT {
         let (mut contained_entries, mut divergent_entries): (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) =
             entries
                 .into_iter()
-                .partition(|(k, _)| interior_prefix.contains(&k));
+                .partition(|(k, _)| interior_prefix.contains(k));
 
         if !divergent_entries.is_empty() {
             let (first_key, first_value) = divergent_entries.remove(0);

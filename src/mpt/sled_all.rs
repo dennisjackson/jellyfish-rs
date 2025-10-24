@@ -55,10 +55,10 @@ impl SledAllMPT {
     }
 
     fn get_node(&self, prefix: &Prefix) -> Option<Node> {
-        match self.db.get(prefix_key(prefix)).expect("DB get failed") {
-            Some(raw) => Some(decode_node(raw.as_ref()).expect("Failed to decode node from DB")),
-            None => None,
-        }
+        self.db
+            .get(prefix_key(prefix))
+            .expect("DB get failed")
+            .map(|raw| decode_node(raw.as_ref()).expect("Failed to decode node from DB"))
     }
 
     fn from_db(db: Db) -> sled::Result<Self> {
@@ -191,7 +191,7 @@ impl SledAllMPT {
         let (mut contained_entries, mut divergent_entries): (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) =
             entries
                 .into_iter()
-                .partition(|(k, _)| interior_prefix.contains(&k));
+                .partition(|(k, _)| interior_prefix.contains(k));
 
         if !divergent_entries.is_empty() {
             let (first_key, first_value) = divergent_entries.remove(0);
@@ -326,7 +326,7 @@ impl SledAllMPT {
     }
 
     pub fn len(&self) -> usize {
-        return 0; //todo
+        0 //todo
     }
 
     pub fn is_empty(&self) -> bool {
@@ -369,10 +369,8 @@ impl MerklePatriciaTree for SledAllMPT {
     fn get_leaf_value(&self, key: Hash) -> Option<Hash> {
         let prefix = Prefix::from(key);
         match self.get_node(&prefix) {
-            Some(node) => match node {
-                Node::Leaf(leaf) => Some(leaf.value),
-                _ => None,
-            },
+            Some(Node::Leaf(leaf)) => Some(leaf.value),
+            Some(Node::Interior(_)) => panic!("Expected leaf node"),
             None => None,
         }
     }
