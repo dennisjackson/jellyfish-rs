@@ -1,4 +1,3 @@
-use dashmap::DashMap;
 use rayon::join;
 use sled::{Config, Db};
 use std::path::Path;
@@ -42,10 +41,6 @@ impl SledAllMPT {
             .expect("DB insert failed");
     }
 
-    fn insert_node_memory_only(&self, prefix: Prefix, node: Node) {
-        self.insert_node_with_db(prefix, node);
-    }
-
     fn get_node(&self, prefix: &Prefix) -> Option<Node> {
         match self.db.get(prefix_key(prefix)).expect("DB get failed") {
             Some(raw) => Some(decode_node(raw.as_ref()).expect("Failed to decode node from DB")),
@@ -63,7 +58,7 @@ impl SledAllMPT {
                 root
             }
         };
-        let mut instance = Self {
+        let instance = Self {
             db,
             root,
         };
@@ -80,7 +75,7 @@ impl SledAllMPT {
         entries_vec.sort_unstable_by_key(|(k, _)| *k);
         entries_vec.dedup_by_key(|(k, _)| *k);
 
-        let new_root = Self::recursive_batch_upsert(self, self.root, entries_vec, false);
+        let new_root = Self::recursive_batch_upsert(self, self.root, entries_vec);
         self.root = new_root;
         self.db
             .insert(ROOT_KEY, encode_prefix(self.root))
@@ -91,7 +86,6 @@ impl SledAllMPT {
         &self,
         current_prefix: Prefix,
         entries: Vec<(Hash, Hash)>,
-        memory_only: bool,
     ) -> Prefix {
         if entries.is_empty() {
             return current_prefix;
@@ -100,20 +94,20 @@ impl SledAllMPT {
         let node = self
             .get_node(&current_prefix);
         let Some(node) = node else {
-            return Self::batch_insert_into_empty(self, entries, memory_only);
+            return Self::batch_insert_into_empty(self, entries);
         };
 
         match node {
             Node::Leaf(leaf) => {
-                Self::batch_upsert_at_leaf(self, current_prefix, leaf, entries, memory_only)
+                Self::batch_upsert_at_leaf(self, current_prefix, leaf, entries)
             }
             Node::Interior(interior) => {
-                Self::batch_upsert_at_interior(self, current_prefix, interior, entries, memory_only)
+                Self::batch_upsert_at_interior(self, current_prefix, interior, entries)
             }
         }
     }
 
-    fn batch_insert_into_empty(&self, mut entries: Vec<(Hash, Hash)>, memory_only: bool) -> Prefix {
+    fn batch_insert_into_empty(&self, mut entries: Vec<(Hash, Hash)>) -> Prefix {
         if entries.is_empty() {
             return Prefix::root();
         }
@@ -121,12 +115,8 @@ impl SledAllMPT {
         let (first_key, first_value) = entries.remove(0);
         let first_prefix = Prefix::from(first_key);
         let first_leaf = LeafNode::new(first_key, first_value);
-        if memory_only {
-            self.insert_node_memory_only(first_prefix, Node::Leaf(first_leaf));
-        } else {
-            self.insert_node_with_db(first_prefix, Node::Leaf(first_leaf));
-        }
-        Self::recursive_batch_upsert(self, first_prefix, entries, memory_only)
+        self.insert_node_with_db(first_prefix, Node::Leaf(first_leaf));
+        Self::recursive_batch_upsert(self, first_prefix, entries)
     }
 
     fn batch_upsert_at_leaf(
@@ -134,20 +124,15 @@ impl SledAllMPT {
         leaf_prefix: Prefix,
         leaf: LeafNode,
         mut entries: Vec<(Hash, Hash)>,
-        memory_only: bool,
     ) -> Prefix {
         if let Ok(idx) = entries.binary_search_by_key(&leaf_prefix.hash, |(k, _)| *k) {
             let (_, new_value) = entries.remove(idx);
             let updated_leaf = LeafNode::new(leaf_prefix.hash, new_value);
-            if memory_only {
-                self.insert_node_memory_only(leaf_prefix, Node::Leaf(updated_leaf));
-            } else {
-                self.insert_node_with_db(leaf_prefix, Node::Leaf(updated_leaf));
-            }
+            self.insert_node_with_db(leaf_prefix, Node::Leaf(updated_leaf));
             if entries.is_empty() {
                 return leaf_prefix;
             }
-            return Self::recursive_batch_upsert(self, leaf_prefix, entries, memory_only);
+            return Self::recursive_batch_upsert(self, leaf_prefix, entries);
         }
 
         if entries.is_empty() {
@@ -178,17 +163,11 @@ impl SledAllMPT {
             right_hash,
         );
 
-        if memory_only {
-            self.insert_node_memory_only(merged_prefix, Node::Interior(new_interior));
-            self.insert_node_memory_only(existing_prefix, Node::Leaf(leaf));
-            self.insert_node_memory_only(new_prefix, Node::Leaf(new_leaf));
-        } else {
-            self.insert_node_memory_only(merged_prefix, Node::Interior(new_interior));
+            self.insert_node_with_db(merged_prefix, Node::Interior(new_interior));
             self.insert_node_with_db(existing_prefix, Node::Leaf(leaf));
             self.insert_node_with_db(new_prefix, Node::Leaf(new_leaf));
-        }
 
-        Self::recursive_batch_upsert(self, merged_prefix, entries, memory_only)
+        Self::recursive_batch_upsert(self, merged_prefix, entries)
     }
 
     fn batch_upsert_at_interior(
@@ -196,11 +175,10 @@ impl SledAllMPT {
         interior_prefix: Prefix,
         interior: InteriorNode,
         entries: Vec<(Hash, Hash)>,
-        memory_only: bool,
     ) -> Prefix {
         let (mut contained_entries, mut divergent_entries) : (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) = entries
             .into_iter()
-            .partition(|(k, v)| interior_prefix.contains(&k));
+            .partition(|(k, _)| interior_prefix.contains(&k));
 
         if !divergent_entries.is_empty() {
             let (first_key, first_value) = divergent_entries.remove(0);
@@ -221,32 +199,27 @@ impl SledAllMPT {
             let new_interior =
                 InteriorNode::new(common, left_prefix, right_prefix, left_hash, right_hash);
 
-            if memory_only {
-                self.insert_node_memory_only(common, Node::Interior(new_interior));
-                self.insert_node_memory_only(new_leaf_prefix, Node::Leaf(new_leaf));
-            } else {
-                self.insert_node_memory_only(common, Node::Interior(new_interior));
+                self.insert_node_with_db(common, Node::Interior(new_interior));
                 self.insert_node_with_db(new_leaf_prefix, Node::Leaf(new_leaf));
-            }
 
             contained_entries.extend(divergent_entries);
-            return Self::recursive_batch_upsert(self, common, contained_entries, memory_only);
+            return Self::recursive_batch_upsert(self, common, contained_entries);
         }
         let (right_entries, left_entries) : (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) = contained_entries
             .into_iter()
-            .partition(|(k, v)| interior_prefix.key_goes_right(*k));
+            .partition(|(k, _)| interior_prefix.key_goes_right(*k));
 
         let count = left_entries.len() + right_entries.len();
         let l_work = || {
             if !left_entries.is_empty() {
-                Self::recursive_batch_upsert(self, interior.left, left_entries, memory_only)
+                Self::recursive_batch_upsert(self, interior.left, left_entries)
             } else {
                 interior.left
             }
         };
         let r_work = || {
             if !right_entries.is_empty() {
-                Self::recursive_batch_upsert(self, interior.right, right_entries, memory_only)
+                Self::recursive_batch_upsert(self, interior.right, right_entries)
             } else {
                 interior.right
             }
@@ -270,7 +243,7 @@ impl SledAllMPT {
         let updated_interior =
             InteriorNode::new(interior_prefix, new_left, new_right, left_hash, right_hash);
 
-        self.insert_node_memory_only(interior_prefix, Node::Interior(updated_interior));
+        self.insert_node_with_db(interior_prefix, Node::Interior(updated_interior));
         interior_prefix
     }
 
