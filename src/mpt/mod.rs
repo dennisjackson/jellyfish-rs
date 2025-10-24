@@ -25,6 +25,9 @@ pub use sled_all::SledAllMPT;
 mod sled_trans;
 pub use sled_trans::SledTransMPT;
 
+mod sled_chan;
+pub use sled_chan::SledChanMPT;
+
 mod cache;
 pub use cache::Cache;
 
