@@ -19,6 +19,7 @@ macro_rules! test_all_impls {
             test_impl::<SledBatchMPT>();
             test_impl::<SledLeafMPT>();
             test_impl::<SledAllMPT>();
+            test_impl::<SledTransMPT>();
         }
     };
 }
@@ -31,6 +32,7 @@ macro_rules! for_each_impl {
         $macro!(SledBatchMPT);
         $macro!(SledLeafMPT);
         $macro!(SledAllMPT);
+        $macro!(SledTransMPT);
     };
 }
 

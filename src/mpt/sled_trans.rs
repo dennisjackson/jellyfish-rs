@@ -1,8 +1,10 @@
 use async_recursion::async_recursion;
+use dashmap::DashMap;
 use sled::{Config, Db};
 use std::path::Path;
 use std::sync::OnceLock;
 use tokio::runtime::{Builder, Runtime};
+use std::sync::Arc;
 
 use crate::mpt::MerklePatriciaTree;
 use crate::{Hash, Prefix};
@@ -23,12 +25,13 @@ fn mpt_runtime() -> &'static Runtime {
 }
 
 #[derive(Clone)]
-pub struct SledAllMPT {
+pub struct SledTransMPT {
     db: Db,
     root: Prefix,
+    pending: Arc<DashMap<Vec<u8>, Vec<u8>>>,
 }
 
-impl SledAllMPT {
+impl SledTransMPT {
     fn get_default_config() -> Config {
         Config::new()
             .flush_every_ms(Some(5000))
@@ -39,24 +42,26 @@ impl SledAllMPT {
     }
 
     pub fn new_with_path(path: impl AsRef<Path>) -> sled::Result<Self> {
-        let db = SledAllMPT::get_default_config().path(path).open()?;
+        let db = SledTransMPT::get_default_config().path(path).open()?;
         Self::from_db(db)
     }
 
     pub fn new_temporary() -> sled::Result<Self> {
-        let db = SledAllMPT::get_default_config().temporary(true).open()?;
+        let db = SledTransMPT::get_default_config().temporary(true).open()?;
         Self::from_db(db)
     }
 
     fn insert_node_with_db(&self, prefix: Prefix, node: Node) {
-        self.db
-            .insert(prefix_key(&prefix), encode_node(&node))
-            .expect("DB insert failed");
+        self.pending.insert(prefix_key(&prefix), encode_node(&node));
     }
 
     fn get_node(&self, prefix: &Prefix) -> Option<Node> {
+        let prefix_key = prefix_key(prefix);
+        if let Some(raw) = self.pending.get(&prefix_key) {
+            return decode_node(raw.as_ref()).ok();
+        }
         self.db
-            .get(prefix_key(prefix))
+            .get(prefix_key)
             .expect("DB get failed")
             .map(|raw| decode_node(raw.as_ref()).expect("Failed to decode node from DB"))
     }
@@ -71,7 +76,11 @@ impl SledAllMPT {
                 root
             }
         };
-        let instance = Self { db, root };
+        let instance = Self {
+            db,
+            root,
+            pending: Arc::new(DashMap::new()),
+        };
 
         Ok(instance)
     }
@@ -89,9 +98,23 @@ impl SledAllMPT {
         let new_root = mpt_runtime()
             .block_on(async { Self::recursive_batch_upsert(self, root, entries_vec).await });
         self.root = new_root;
+        self.commit_pending();
+    }
+
+    fn commit_pending(&self) {
         self.db
-            .insert(ROOT_KEY, encode_prefix(self.root))
-            .expect("Failed to update root in DB");
+            .transaction(|db| {
+                for entry in self.pending.iter() {
+                    db.insert(entry.key().as_slice(), entry.value().as_slice())
+                        .expect("Failed to insert pending node into DB");
+                }
+                db
+                    .insert(ROOT_KEY, encode_prefix(self.root))
+                    .expect("Failed to update root in DB");
+                Ok(()) as sled::transaction::ConflictableTransactionResult<(), sled::Error>
+            })
+            .expect("Error committing transaction");
+        self.pending.clear();
     }
 
     #[async_recursion]
@@ -334,7 +357,7 @@ impl SledAllMPT {
     }
 }
 
-impl MerklePatriciaTree for SledAllMPT {
+impl MerklePatriciaTree for SledTransMPT {
     fn new() -> Self {
         Self::new_temporary().expect("Failed to create temporary sled database")
     }
