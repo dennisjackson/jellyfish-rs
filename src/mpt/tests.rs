@@ -23,6 +23,17 @@ macro_rules! test_all_impls {
     };
 }
 
+macro_rules! for_each_impl {
+    ($macro:ident) => {
+        $macro!(SimpleMPT);
+        $macro!(BatchMPT);
+        $macro!(DurableBatchMPT);
+        $macro!(SledBatchMPT);
+        $macro!(SledLeafMPT);
+        $macro!(SledAllMPT);
+    };
+}
+
 fn create_hash(value: u8) -> Hash {
     let mut hash = [0u8; 32];
     hash[0] = value;
@@ -220,57 +231,68 @@ fn test_cross_impl_root_hash_consistency() {
         .map(|i| (create_hash(i), create_hash(i + 100)))
         .collect();
 
-    let mut simple = SimpleMPT::new();
-    let mut batch = BatchMPT::new();
-    let mut durable = DurableBatchMPT::new();
-
-    for (key, value) in &entries {
-        simple.upsert(*key, *value);
-        batch.upsert(*key, *value);
-        durable.upsert(*key, *value);
+    fn compute_root_hash<T: MerklePatriciaTree>(entries: &[(Hash, Hash)]) -> Option<Hash> {
+        let mut tree = T::new();
+        for (key, value) in entries {
+            tree.upsert(*key, *value);
+        }
+        tree.get_root_hash()
     }
 
-    let simple_root = simple.get_root_hash();
-    let batch_root = batch.get_root_hash();
-    let durable_root = durable.get_root_hash();
+    fn compute_batch_root<T: MerklePatriciaTree>(entries: &[(Hash, Hash)]) -> Option<Hash> {
+        let mut tree = T::new();
+        tree.batch_upsert(entries);
+        tree.get_root_hash()
+    }
 
-    assert!(
-        simple_root.is_some(),
-        "Root hash should exist after inserting entries"
-    );
-    assert_eq!(
-        simple_root, batch_root,
-        "SimpleMPT and BatchMPT roots should match for individual inserts"
-    );
-    assert_eq!(
-        simple_root, durable_root,
-        "SimpleMPT and DurableBatchMPT roots should match for individual inserts"
-    );
+    let mut sequential_roots = std::collections::BTreeMap::new();
 
-    let mut simple_batch = SimpleMPT::new();
-    let mut batch_batch = BatchMPT::new();
-    let mut durable_batch = DurableBatchMPT::new();
+    macro_rules! collect_sequential_roots {
+        ($ty:ty) => {
+            let name = std::any::type_name::<$ty>();
+            let root = compute_root_hash::<$ty>(&entries)
+                .expect("each implementation should produce a root hash after inserts");
+            sequential_roots.insert(name, root);
+        };
+    }
 
-    simple_batch.batch_upsert(&entries);
-    batch_batch.batch_upsert(&entries);
-    durable_batch.batch_upsert(&entries);
+    for_each_impl!(collect_sequential_roots);
 
-    let simple_batch_root = simple_batch.get_root_hash();
-    let batch_batch_root = batch_batch.get_root_hash();
-    let durable_batch_root = durable_batch.get_root_hash();
+    let mut sequential_iter = sequential_roots.iter();
+    let (first_name, first_root) = sequential_iter
+        .next()
+        .expect("at least one implementation should be tested");
+    for (name, root) in sequential_iter {
+        assert_eq!(
+            first_root, root,
+            "Root mismatch between {} and {} for sequential inserts",
+            first_name, name
+        );
+    }
 
-    assert!(
-        simple_batch_root.is_some(),
-        "Root hash should exist after batch upserts"
-    );
-    assert_eq!(
-        simple_batch_root, batch_batch_root,
-        "SimpleMPT and BatchMPT roots should match for batch inserts"
-    );
-    assert_eq!(
-        simple_batch_root, durable_batch_root,
-        "SimpleMPT and DurableBatchMPT roots should match for batch inserts"
-    );
+    let mut batch_roots = std::collections::BTreeMap::new();
+
+    macro_rules! collect_batch_roots {
+        ($ty:ty) => {
+            let name = std::any::type_name::<$ty>();
+            let root = compute_batch_root::<$ty>(&entries)
+                .expect("each implementation should produce a root hash after batch inserts");
+            batch_roots.insert(name, root);
+        };
+    }
+
+    for_each_impl!(collect_batch_roots);
+
+    for (name, batch_root) in batch_roots.iter() {
+        let sequential_root = sequential_roots
+            .get(name)
+            .expect("batch root should have a corresponding sequential root");
+        assert_eq!(
+            sequential_root, batch_root,
+            "Batch root mismatch for implementation {}",
+            name
+        );
+    }
 }
 
 #[test]
