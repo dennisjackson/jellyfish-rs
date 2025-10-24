@@ -1,6 +1,7 @@
-use rayon::join;
+use rayon::{join, ThreadPoolBuilder};
 use sled::{Config, Db};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::mpt::MerklePatriciaTree;
 use crate::{Hash, Prefix};
@@ -8,6 +9,17 @@ use crate::{Hash, Prefix};
 use super::{InteriorNode, LeafNode, Node};
 
 const ROOT_KEY: &[u8] = b"__mpt_root__";
+
+fn mpt_thread_pool() -> &'static rayon::ThreadPool {
+        static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+        POOL.get_or_init(|| {
+            ThreadPoolBuilder::new()
+                .num_threads(8)
+                .thread_name(|idx| format!("mpt-worker-{idx}"))
+                .build()
+                .expect("Failed to build MPT thread pool")
+        })
+}
 
 pub struct SledAllMPT {
     db: Db,
@@ -71,7 +83,9 @@ impl SledAllMPT {
         entries_vec.sort_unstable_by_key(|(k, _)| *k);
         entries_vec.dedup_by_key(|(k, _)| *k);
 
-        let new_root = Self::recursive_batch_upsert(self, self.root, entries_vec);
+        let root = self.root;
+        let new_root =
+            mpt_thread_pool().install( || Self::recursive_batch_upsert(self, root, entries_vec));
         self.root = new_root;
         self.db
             .insert(ROOT_KEY, encode_prefix(self.root))
@@ -216,7 +230,7 @@ impl SledAllMPT {
             }
         };
 
-        let (new_left, new_right) = if count > 1024 {
+        let (new_left, new_right) = if count > 128 {
             join(l_work, r_work)
         } else {
             (l_work(), r_work())
