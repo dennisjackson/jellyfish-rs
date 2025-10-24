@@ -17,6 +17,8 @@ sled = { version = "0.34.7", features = ["compression"], default-features=true }
 sha2 = "0.10.9"
 indicatif = "0.18.1"
 fastrand = "2.3.0"
+tokio = { version = "1.37", features = ["rt", "rt-multi-thread"] }
+async-recursion = "1.0"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

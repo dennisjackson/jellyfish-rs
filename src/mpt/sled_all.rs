@@ -1,7 +1,8 @@
-use rayon::{join, ThreadPoolBuilder};
+use async_recursion::async_recursion;
 use sled::{Config, Db};
 use std::path::Path;
 use std::sync::OnceLock;
+use tokio::runtime::{Builder, Runtime};
 
 use crate::mpt::MerklePatriciaTree;
 use crate::{Hash, Prefix};
@@ -10,17 +11,18 @@ use super::{InteriorNode, LeafNode, Node};
 
 const ROOT_KEY: &[u8] = b"__mpt_root__";
 
-fn mpt_thread_pool() -> &'static rayon::ThreadPool {
-        static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-        POOL.get_or_init(|| {
-            ThreadPoolBuilder::new()
-                .num_threads(8)
-                .thread_name(|idx| format!("mpt-worker-{idx}"))
-                .build()
-                .expect("Failed to build MPT thread pool")
-        })
+fn mpt_runtime() -> &'static Runtime {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        Builder::new_multi_thread()
+            .worker_threads(8)
+            .thread_name("mpt-worker")
+            .build()
+            .expect("Failed to build MPT async runtime")
+    })
 }
 
+#[derive(Clone)]
 pub struct SledAllMPT {
     db: Db,
     root: Prefix,
@@ -84,33 +86,40 @@ impl SledAllMPT {
         entries_vec.dedup_by_key(|(k, _)| *k);
 
         let root = self.root;
-        let new_root =
-            mpt_thread_pool().install( || Self::recursive_batch_upsert(self, root, entries_vec));
+        let new_root = mpt_runtime()
+            .block_on(async { Self::recursive_batch_upsert(self, root, entries_vec).await });
         self.root = new_root;
         self.db
             .insert(ROOT_KEY, encode_prefix(self.root))
             .expect("Failed to update root in DB");
     }
 
-    fn recursive_batch_upsert(&self, current_prefix: Prefix, entries: Vec<(Hash, Hash)>) -> Prefix {
+    #[async_recursion]
+    async fn recursive_batch_upsert(
+        &self,
+        current_prefix: Prefix,
+        entries: Vec<(Hash, Hash)>,
+    ) -> Prefix {
         if entries.is_empty() {
             return current_prefix;
         }
 
         let node = self.get_node(&current_prefix);
         let Some(node) = node else {
-            return Self::batch_insert_into_empty(self, entries);
+            return Self::batch_insert_into_empty(self, entries).await;
         };
 
         match node {
-            Node::Leaf(leaf) => Self::batch_upsert_at_leaf(self, current_prefix, leaf, entries),
+            Node::Leaf(leaf) => {
+                Self::batch_upsert_at_leaf(self, current_prefix, leaf, entries).await
+            }
             Node::Interior(interior) => {
-                Self::batch_upsert_at_interior(self, current_prefix, interior, entries)
+                Self::batch_upsert_at_interior(self, current_prefix, interior, entries).await
             }
         }
     }
 
-    fn batch_insert_into_empty(&self, mut entries: Vec<(Hash, Hash)>) -> Prefix {
+    async fn batch_insert_into_empty(&self, mut entries: Vec<(Hash, Hash)>) -> Prefix {
         if entries.is_empty() {
             return Prefix::root();
         }
@@ -119,10 +128,10 @@ impl SledAllMPT {
         let first_prefix = Prefix::from(first_key);
         let first_leaf = LeafNode::new(first_key, first_value);
         self.insert_node_with_db(first_prefix, Node::Leaf(first_leaf));
-        Self::recursive_batch_upsert(self, first_prefix, entries)
+        Self::recursive_batch_upsert(self, first_prefix, entries).await
     }
 
-    fn batch_upsert_at_leaf(
+    async fn batch_upsert_at_leaf(
         &self,
         leaf_prefix: Prefix,
         leaf: LeafNode,
@@ -135,7 +144,7 @@ impl SledAllMPT {
             if entries.is_empty() {
                 return leaf_prefix;
             }
-            return Self::recursive_batch_upsert(self, leaf_prefix, entries);
+            return Self::recursive_batch_upsert(self, leaf_prefix, entries).await;
         }
 
         if entries.is_empty() {
@@ -170,10 +179,10 @@ impl SledAllMPT {
         self.insert_node_with_db(existing_prefix, Node::Leaf(leaf));
         self.insert_node_with_db(new_prefix, Node::Leaf(new_leaf));
 
-        Self::recursive_batch_upsert(self, merged_prefix, entries)
+        Self::recursive_batch_upsert(self, merged_prefix, entries).await
     }
 
-    fn batch_upsert_at_interior(
+    async fn batch_upsert_at_interior(
         &self,
         interior_prefix: Prefix,
         interior: InteriorNode,
@@ -207,34 +216,15 @@ impl SledAllMPT {
             self.insert_node_with_db(new_leaf_prefix, Node::Leaf(new_leaf));
 
             contained_entries.extend(divergent_entries);
-            return Self::recursive_batch_upsert(self, common, contained_entries);
+            return Self::recursive_batch_upsert(self, common, contained_entries).await;
         }
         let (right_entries, left_entries): (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) =
             contained_entries
                 .into_iter()
                 .partition(|(k, _)| interior_prefix.key_goes_right(*k));
 
-        let count = left_entries.len() + right_entries.len();
-        let l_work = || {
-            if !left_entries.is_empty() {
-                Self::recursive_batch_upsert(self, interior.left, left_entries)
-            } else {
-                interior.left
-            }
-        };
-        let r_work = || {
-            if !right_entries.is_empty() {
-                Self::recursive_batch_upsert(self, interior.right, right_entries)
-            } else {
-                interior.right
-            }
-        };
-
-        let (new_left, new_right) = if count > 128 {
-            join(l_work, r_work)
-        } else {
-            (l_work(), r_work())
-        };
+        let (new_left, new_right) =
+            Self::process_children(self, &interior, left_entries, right_entries).await;
 
         let left_hash = self
             .get_node(&new_left)
@@ -250,6 +240,69 @@ impl SledAllMPT {
 
         self.insert_node_with_db(interior_prefix, Node::Interior(updated_interior));
         interior_prefix
+    }
+
+    async fn process_children(
+        &self,
+        interior: &InteriorNode,
+        left_entries: Vec<(Hash, Hash)>,
+        right_entries: Vec<(Hash, Hash)>,
+    ) -> (Prefix, Prefix) {
+        let left_is_empty = left_entries.is_empty();
+        let right_is_empty = right_entries.is_empty();
+        let count = left_entries.len() + right_entries.len();
+
+        if count > 128 {
+            let left_prefix = interior.left;
+            let right_prefix = interior.right;
+
+            let left_handle = if !left_is_empty {
+                let entries = left_entries;
+                let worker = self.clone();
+                Some(tokio::spawn(async move {
+                    worker.recursive_batch_upsert(left_prefix, entries).await
+                }))
+            } else {
+                None
+            };
+
+            let right_handle = if !right_is_empty {
+                let entries = right_entries;
+                let worker = self.clone();
+                Some(tokio::spawn(async move {
+                    worker.recursive_batch_upsert(right_prefix, entries).await
+                }))
+            } else {
+                None
+            };
+
+            let new_left = match left_handle {
+                Some(handle) => handle
+                    .await
+                    .expect("Left branch task panicked during async upsert"),
+                None => left_prefix,
+            };
+            let new_right = match right_handle {
+                Some(handle) => handle
+                    .await
+                    .expect("Right branch task panicked during async upsert"),
+                None => right_prefix,
+            };
+
+            (new_left, new_right)
+        } else {
+            let new_left = if !left_is_empty {
+                Self::recursive_batch_upsert(self, interior.left, left_entries).await
+            } else {
+                interior.left
+            };
+            let new_right = if !right_is_empty {
+                Self::recursive_batch_upsert(self, interior.right, right_entries).await
+            } else {
+                interior.right
+            };
+            (new_left, new_right)
+        }
     }
 
     fn order_children(
