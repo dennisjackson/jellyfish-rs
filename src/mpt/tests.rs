@@ -48,7 +48,8 @@ fn count_nodes<T: MerklePatriciaTree>(mpt: &T) -> usize {
 // Helper function to count leaf nodes
 fn count_leaf_nodes<T: MerklePatriciaTree>(mpt: &T) -> usize {
     let mut count = 0;
-    for x in mpt.enumerate_nodes()
+    for x in mpt
+        .enumerate_nodes()
         .iter()
         .filter(|(_, node)| matches!(node, Node::Leaf(_)))
     {

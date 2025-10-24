@@ -1163,7 +1163,7 @@ fn test_release_keys_prefers_deep_nodes_for_eviction() {
     }
 
     // Only keep the shallowest prefix
-    let needed = [prefixes[0],left_prefix];
+    let needed = [prefixes[0], left_prefix];
     cache.release_keys(&needed);
 
     assert!(

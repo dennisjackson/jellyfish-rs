@@ -57,10 +57,7 @@ impl SledAllMPT {
                 root
             }
         };
-        let instance = Self {
-            db,
-            root,
-        };
+        let instance = Self { db, root };
 
         Ok(instance)
     }
@@ -81,25 +78,18 @@ impl SledAllMPT {
             .expect("Failed to update root in DB");
     }
 
-    fn recursive_batch_upsert(
-        &self,
-        current_prefix: Prefix,
-        entries: Vec<(Hash, Hash)>,
-    ) -> Prefix {
+    fn recursive_batch_upsert(&self, current_prefix: Prefix, entries: Vec<(Hash, Hash)>) -> Prefix {
         if entries.is_empty() {
             return current_prefix;
         }
 
-        let node = self
-            .get_node(&current_prefix);
+        let node = self.get_node(&current_prefix);
         let Some(node) = node else {
             return Self::batch_insert_into_empty(self, entries);
         };
 
         match node {
-            Node::Leaf(leaf) => {
-                Self::batch_upsert_at_leaf(self, current_prefix, leaf, entries)
-            }
+            Node::Leaf(leaf) => Self::batch_upsert_at_leaf(self, current_prefix, leaf, entries),
             Node::Interior(interior) => {
                 Self::batch_upsert_at_interior(self, current_prefix, interior, entries)
             }
@@ -162,9 +152,9 @@ impl SledAllMPT {
             right_hash,
         );
 
-            self.insert_node_with_db(merged_prefix, Node::Interior(new_interior));
-            self.insert_node_with_db(existing_prefix, Node::Leaf(leaf));
-            self.insert_node_with_db(new_prefix, Node::Leaf(new_leaf));
+        self.insert_node_with_db(merged_prefix, Node::Interior(new_interior));
+        self.insert_node_with_db(existing_prefix, Node::Leaf(leaf));
+        self.insert_node_with_db(new_prefix, Node::Leaf(new_leaf));
 
         Self::recursive_batch_upsert(self, merged_prefix, entries)
     }
@@ -175,9 +165,10 @@ impl SledAllMPT {
         interior: InteriorNode,
         entries: Vec<(Hash, Hash)>,
     ) -> Prefix {
-        let (mut contained_entries, mut divergent_entries) : (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) = entries
-            .into_iter()
-            .partition(|(k, _)| interior_prefix.contains(&k));
+        let (mut contained_entries, mut divergent_entries): (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) =
+            entries
+                .into_iter()
+                .partition(|(k, _)| interior_prefix.contains(&k));
 
         if !divergent_entries.is_empty() {
             let (first_key, first_value) = divergent_entries.remove(0);
@@ -198,15 +189,16 @@ impl SledAllMPT {
             let new_interior =
                 InteriorNode::new(common, left_prefix, right_prefix, left_hash, right_hash);
 
-                self.insert_node_with_db(common, Node::Interior(new_interior));
-                self.insert_node_with_db(new_leaf_prefix, Node::Leaf(new_leaf));
+            self.insert_node_with_db(common, Node::Interior(new_interior));
+            self.insert_node_with_db(new_leaf_prefix, Node::Leaf(new_leaf));
 
             contained_entries.extend(divergent_entries);
             return Self::recursive_batch_upsert(self, common, contained_entries);
         }
-        let (right_entries, left_entries) : (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) = contained_entries
-            .into_iter()
-            .partition(|(k, _)| interior_prefix.key_goes_right(*k));
+        let (right_entries, left_entries): (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) =
+            contained_entries
+                .into_iter()
+                .partition(|(k, _)| interior_prefix.key_goes_right(*k));
 
         let count = left_entries.len() + right_entries.len();
         let l_work = || {
@@ -304,9 +296,7 @@ impl MerklePatriciaTree for SledAllMPT {
     }
 
     fn get_root_hash(&self) -> Option<Hash> {
-        self.
-            get_node(&self.root)
-            .map(|node| node.merkle_hash())
+        self.get_node(&self.root).map(|node| node.merkle_hash())
     }
 
     fn get_leaf_value(&self, key: Hash) -> Option<Hash> {

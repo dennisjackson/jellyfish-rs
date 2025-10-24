@@ -261,9 +261,10 @@ impl SledLeafMPT {
         entries: Vec<(Hash, Hash)>,
         memory_only: bool,
     ) -> Prefix {
-        let (mut contained_entries, mut divergent_entries) : (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) = entries
-            .into_iter()
-            .partition(|(k, _)| interior_prefix.contains(&k));
+        let (mut contained_entries, mut divergent_entries): (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) =
+            entries
+                .into_iter()
+                .partition(|(k, _)| interior_prefix.contains(&k));
 
         if !divergent_entries.is_empty() {
             let (first_key, first_value) = divergent_entries.remove(0);
@@ -295,9 +296,10 @@ impl SledLeafMPT {
             contained_entries.extend(divergent_entries);
             return Self::recursive_batch_upsert(self, common, contained_entries, memory_only);
         }
-        let (right_entries, left_entries) : (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) = contained_entries
-            .into_iter()
-            .partition(|(k, _)| interior_prefix.key_goes_right(*k));
+        let (right_entries, left_entries): (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) =
+            contained_entries
+                .into_iter()
+                .partition(|(k, _)| interior_prefix.key_goes_right(*k));
 
         let count = left_entries.len() + right_entries.len();
         let l_work = || {
