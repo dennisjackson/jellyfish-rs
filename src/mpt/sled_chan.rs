@@ -2,8 +2,8 @@ use async_recursion::async_recursion;
 use dashmap::DashMap;
 use sled::{Config, Db};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use tokio::runtime::{Builder, Runtime};
 
@@ -16,9 +16,16 @@ const ROOT_KEY: &[u8] = b"__mpt_root__";
 const WORKER_CHANNEL_CAPACITY: usize = 400_000;
 
 enum WorkerCommand {
-    Insert { prefix: Prefix, node: Node },
-    SetRoot { root: Prefix },
-    Commit { respond_to: mpsc::Sender<sled::Result<()>> },
+    Insert {
+        prefix: Prefix,
+        node: Node,
+    },
+    SetRoot {
+        root: Prefix,
+    },
+    Commit {
+        respond_to: mpsc::Sender<sled::Result<()>>,
+    },
     Shutdown,
 }
 
@@ -58,20 +65,28 @@ impl Drop for WorkerHandle {
 
 fn worker_loop(db: Db, receiver: Receiver<WorkerCommand>) {
     let mut batch = sled::Batch::default();
+    let mut node_buf = Vec::with_capacity(128);
+    let mut prefix_buf = Vec::with_capacity(34);
     for command in receiver {
         match command {
             WorkerCommand::Insert { prefix, node } => {
-                batch.insert(prefix_key(&prefix), encode_node(&node));
+                let value = encode_node_into(&node, &mut node_buf);
+                batch.insert(prefix_key(&prefix), value);
             }
             WorkerCommand::SetRoot { root } => {
-                batch.insert(ROOT_KEY, encode_prefix(root));
+                let value = encode_prefix_into(root, &mut prefix_buf);
+                batch.insert(ROOT_KEY, value);
             }
             WorkerCommand::Commit { respond_to } => {
-                let result = db.apply_batch(batch);
-                batch = sled::Batch::default();
+                let to_apply = std::mem::take(&mut batch);
+                let result = db
+                    .apply_batch(to_apply)
+                    .and_then(|_| db.flush().map(|_| ()));
                 let _ = respond_to.send(result);
             }
             WorkerCommand::Shutdown => {
+                let pending = std::mem::take(&mut batch);
+                let _ = db.apply_batch(pending);
                 let _ = db.flush();
                 break;
             }
@@ -120,8 +135,7 @@ impl SledChanMPT {
 
     fn queue_node(&self, prefix: Prefix, node: Node) {
         self.cache.insert(prefix.clone(), node.clone());
-        self.worker
-            .send(WorkerCommand::Insert { prefix, node });
+        self.worker.send(WorkerCommand::Insert { prefix, node });
     }
 
     fn queue_root_update(&self, root: Prefix) {
@@ -143,7 +157,9 @@ impl SledChanMPT {
             Some(raw) => decode_prefix(raw.as_ref()).map_err(sled::Error::Unsupported)?,
             None => {
                 let root = Prefix::root();
-                db.insert(ROOT_KEY, encode_prefix(root))?;
+                let mut buf = Vec::with_capacity(34);
+                let value = encode_prefix_into(root, &mut buf);
+                db.insert(ROOT_KEY, value)?;
                 db.flush()?;
                 root
             }
@@ -174,6 +190,7 @@ impl SledChanMPT {
             .block_on(async { Self::recursive_batch_upsert(self, root, entries_vec).await });
         self.root = new_root;
         self.queue_root_update(self.root);
+        self.flush().expect("Failed to flush DB after batch upsert");
     }
 
     #[async_recursion]
@@ -404,8 +421,7 @@ impl SledChanMPT {
 
     pub fn flush(&mut self) -> sled::Result<()> {
         let (respond_to, wait_for) = mpsc::channel();
-        self.worker
-            .send(WorkerCommand::Commit { respond_to });
+        self.worker.send(WorkerCommand::Commit { respond_to });
         let result = wait_for
             .recv()
             .expect("Commit acknowledgment channel closed unexpectedly");
@@ -435,7 +451,6 @@ impl MerklePatriciaTree for SledChanMPT {
 
     fn batch_upsert(&mut self, entries: &[(Hash, Hash)]) {
         self.batch_upsert_optimized(entries);
-        self.flush().expect("Failed to flush DB after batch upsert");
     }
 
     fn enumerate_nodes(&self) -> Vec<(Prefix, Node)> {
@@ -475,17 +490,17 @@ fn prefix_key(prefix: &Prefix) -> Vec<u8> {
     key
 }
 
-fn encode_node(node: &Node) -> Vec<u8> {
+fn encode_node_into<'a>(node: &Node, buffer: &'a mut Vec<u8>) -> &'a [u8] {
+    buffer.clear();
     let (node_type, data) = node.serialize().expect("Failed to serialize node");
-    let mut encoded = Vec::with_capacity(1 + data.len());
     let discriminator = match node_type {
         "leaf" => 0u8,
         "interior" => 1u8,
         _ => panic!("Unexpected node type {}", node_type),
     };
-    encoded.push(discriminator);
-    encoded.extend_from_slice(&data);
-    encoded
+    buffer.push(discriminator);
+    buffer.extend_from_slice(&data);
+    buffer.as_slice()
 }
 
 fn decode_node(bytes: &[u8]) -> Result<Node, String> {
@@ -501,12 +516,13 @@ fn decode_node(bytes: &[u8]) -> Result<Node, String> {
     Node::deserialize(node_type, data)
 }
 
-fn encode_prefix(mut prefix: Prefix) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(34);
-    prefix.hash.reverse();
-    buf.extend_from_slice(&prefix.hash);
-    buf.extend_from_slice(&prefix.length.to_be_bytes());
-    buf
+fn encode_prefix_into<'a>(prefix: Prefix, buffer: &'a mut Vec<u8>) -> &'a [u8] {
+    buffer.clear();
+    let mut hash = prefix.hash;
+    hash.reverse();
+    buffer.extend_from_slice(&hash);
+    buffer.extend_from_slice(&prefix.length.to_be_bytes());
+    buffer.as_slice()
 }
 
 fn decode_prefix(bytes: &[u8]) -> Result<Prefix, String> {

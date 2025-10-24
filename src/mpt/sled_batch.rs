@@ -90,7 +90,9 @@ impl SledBatchMPT {
         entries_vec.sort_unstable_by_key(|(k, _)| *k);
         entries_vec.dedup_by_key(|(k, _)| *k);
 
-        let new_root = get_thread_pool().install( || Self::recursive_batch_upsert(&self.store, &self.dirty, self.root, entries_vec));
+        let new_root = get_thread_pool().install(|| {
+            Self::recursive_batch_upsert(&self.store, &self.dirty, self.root, entries_vec)
+        });
         let root_changed = new_root != self.root;
         self.root = new_root;
         if root_changed {
@@ -254,23 +256,25 @@ impl SledBatchMPT {
         }
 
         let count = left_entries.len() + right_entries.len();
-        let lf =  || { if !left_entries.is_empty() {
-                    Self::recursive_batch_upsert(store, dirty, interior.left, left_entries)
-                } else {
-                    interior.left
-                }
-            };
-        let rf = || { if !right_entries.is_empty() {
-                    Self::recursive_batch_upsert(store, dirty, interior.right, right_entries)
-                } else {
-                    interior.right
-                }
-            };
+        let lf = || {
+            if !left_entries.is_empty() {
+                Self::recursive_batch_upsert(store, dirty, interior.left, left_entries)
+            } else {
+                interior.left
+            }
+        };
+        let rf = || {
+            if !right_entries.is_empty() {
+                Self::recursive_batch_upsert(store, dirty, interior.right, right_entries)
+            } else {
+                interior.right
+            }
+        };
 
         let (new_left, new_right) = if count > 128 {
-             join(lf, rf)
+            join(lf, rf)
         } else {
-                (lf(), rf())
+            (lf(), rf())
         };
 
         let left_hash = store
