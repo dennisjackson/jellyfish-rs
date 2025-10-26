@@ -1,107 +1,55 @@
 use dashmap::DashMap;
 use rayon::join;
-use sled::{Config, Db};
 use std::path::Path;
 
 use crate::mpt::MerklePatriciaTree;
 use crate::{Hash, Prefix};
 
+use super::sled_storage::SledStorage;
 use super::{InteriorNode, LeafNode, Node};
 
-const ROOT_KEY: &[u8] = b"__mpt_root__";
-const COUNT_KEY: &[u8] = b"__mpt_count__";
-
 pub struct SledLeafMPT {
-    db: Db,
+    storage: SledStorage,
     store: DashMap<Prefix, Node>,
     root: Prefix,
-    count: std::sync::atomic::AtomicUsize,
 }
 
 impl SledLeafMPT {
-    fn get_default_config() -> Config {
-        Config::new()
-            .flush_every_ms(Some(5000))
-            .mode(sled::Mode::HighThroughput)
-            .use_compression(false)
-            .print_profile_on_drop(true)
-            .cache_capacity(1024 * 1024 * 1024 * 8) // 8 GB
-    }
-
     pub fn new_with_path(path: impl AsRef<Path>) -> sled::Result<Self> {
-        let db = SledLeafMPT::get_default_config().path(path).open()?;
-        Self::from_db(db)
+        let storage = SledStorage::new_with_path(path)?;
+        Self::from_storage(storage)
     }
 
     pub fn new_temporary() -> sled::Result<Self> {
-        let db = SledLeafMPT::get_default_config().temporary(true).open()?;
-        Self::from_db(db)
+        let storage = SledStorage::new_temporary()?;
+        Self::from_storage(storage)
     }
 
     fn insert_node_with_db(&self, prefix: Prefix, node: Node) {
-        let is_new_leaf = matches!(node, Node::Leaf(_)) && !self.store.contains_key(&prefix);
         self.store.insert(prefix, node.clone());
-        self.db
-            .insert(prefix_key(&prefix), encode_node(&node))
+        self.storage
+            .put_node(prefix, &node)
             .expect("DB insert failed");
-        if is_new_leaf {
-            let new_count = self
-                .count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1;
-            self.db
-                .insert(COUNT_KEY, &new_count.to_be_bytes())
-                .expect("Failed to update count");
-        }
     }
 
     fn insert_node_memory_only(&self, prefix: Prefix, node: Node) {
         self.store.insert(prefix, node);
     }
 
-    fn from_db(db: Db) -> sled::Result<Self> {
-        let root = match db.get(ROOT_KEY)? {
-            Some(raw) => decode_prefix(raw.as_ref()).map_err(sled::Error::Unsupported)?,
-            None => {
-                let root = Prefix::root();
-                db.insert(ROOT_KEY, encode_prefix(root))?;
-                db.flush()?;
-                root
-            }
-        };
+    fn from_storage(storage: SledStorage) -> sled::Result<Self> {
+        let root = storage.load_root()?;
 
-        let count = match db.get(COUNT_KEY)? {
-            Some(raw) => {
-                if raw.len() == 8 {
-                    usize::from_be_bytes(raw.as_ref().try_into().unwrap())
-                } else {
-                    0
-                }
-            }
-            None => {
-                db.insert(COUNT_KEY, &0_usize.to_be_bytes())?;
-                0
-            }
-        };
-
-        let iter_db = db.clone();
-        let estimated_entries = count.max(1);
+        let estimated_entries = storage.leaf_count().max(1);
         let mut instance = Self {
-            db,
+            storage,
             store: DashMap::with_capacity(estimated_entries.saturating_mul(2)),
             root,
-            count: std::sync::atomic::AtomicUsize::new(count),
         };
 
         const RECOVERY_CHUNK: usize = 1024 * 1024;
         let mut leaf_entries: Vec<(Hash, Hash)> = Vec::with_capacity(RECOVERY_CHUNK);
-        for entry in iter_db.iter() {
-            let (key, value) = entry?;
-            if key.as_ref() == ROOT_KEY || key.as_ref() == COUNT_KEY {
-                continue;
-            }
-            let prefix = decode_prefix(key.as_ref()).map_err(sled::Error::Unsupported)?;
-            let node = decode_node(value.as_ref()).map_err(sled::Error::Unsupported)?;
+        for entry in instance.storage.iter_nodes() {
+            let (prefix, node) = entry?;
             if let Node::Leaf(leaf) = node {
                 leaf_entries.push((prefix.hash, leaf.value));
                 if leaf_entries.len() == RECOVERY_CHUNK {
@@ -130,8 +78,8 @@ impl SledLeafMPT {
 
         let new_root = Self::recursive_batch_upsert(self, self.root, entries_vec, false);
         self.root = new_root;
-        self.db
-            .insert(ROOT_KEY, encode_prefix(self.root))
+        self.storage
+            .persist_root(self.root)
             .expect("Failed to update root in DB");
     }
 
@@ -357,12 +305,12 @@ impl SledLeafMPT {
     }
 
     pub fn flush(&mut self) -> sled::Result<()> {
-        self.db.flush()?;
-        Ok(())
+        self.storage.persist_leaf_count()?;
+        self.storage.flush()
     }
 
     pub fn len(&self) -> usize {
-        self.count.load(std::sync::atomic::Ordering::Relaxed)
+        self.storage.leaf_count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -406,57 +354,4 @@ impl MerklePatriciaTree for SledLeafMPT {
             None => None,
         }
     }
-}
-
-fn prefix_key(prefix: &Prefix) -> Vec<u8> {
-    let mut key = Vec::with_capacity(34);
-    let mut temp = prefix.hash;
-    temp.reverse();
-    key.extend_from_slice(&temp);
-    key.extend_from_slice(&prefix.length.to_be_bytes());
-    key
-}
-
-fn encode_node(node: &Node) -> Vec<u8> {
-    let (node_type, data) = node.serialize().expect("Failed to serialize node");
-    let mut encoded = Vec::with_capacity(1 + data.len());
-    let discriminator = match node_type {
-        "leaf" => 0u8,
-        "interior" => 1u8,
-        _ => panic!("Unexpected node type {}", node_type),
-    };
-    encoded.push(discriminator);
-    encoded.extend_from_slice(&data);
-    encoded
-}
-
-fn decode_node(bytes: &[u8]) -> Result<Node, String> {
-    if bytes.is_empty() {
-        return Err("Node bytes are empty".into());
-    }
-    let (tag, data) = bytes.split_first().unwrap();
-    let node_type = match tag {
-        0 => "leaf",
-        1 => "interior",
-        other => return Err(format!("Unknown node tag {}", other)),
-    };
-    Node::deserialize(node_type, data)
-}
-
-fn encode_prefix(mut prefix: Prefix) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(34);
-    prefix.hash.reverse();
-    buf.extend_from_slice(&prefix.hash);
-    buf.extend_from_slice(&prefix.length.to_be_bytes());
-    buf
-}
-
-fn decode_prefix(bytes: &[u8]) -> Result<Prefix, String> {
-    if bytes.len() != 34 {
-        return Err(format!("Prefix bytes must be 34 long, got {}", bytes.len()));
-    }
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&bytes[..32]);
-    let length = u16::from_be_bytes([bytes[32], bytes[33]]);
-    Ok(Prefix { hash, length })
 }

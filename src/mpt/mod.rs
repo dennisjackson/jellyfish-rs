@@ -19,6 +19,8 @@ pub use sled_leaf::SledLeafMPT;
 mod sled_batch;
 pub use sled_batch::SledBatchMPT;
 
+mod sled_storage;
+
 mod sled_all;
 pub use sled_all::SledAllMPT;
 

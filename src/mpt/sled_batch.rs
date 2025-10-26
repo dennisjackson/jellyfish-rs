@@ -1,18 +1,16 @@
 use dashmap::{DashMap, DashSet};
 use rayon::join;
-use sled::{Config, Db};
 use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::mpt::MerklePatriciaTree;
 use crate::{Hash, Prefix};
 
+use super::sled_storage::SledStorage;
 use super::{InteriorNode, LeafNode, Node};
 
-const ROOT_KEY: &[u8] = b"__mpt_root__";
-
 pub struct SledBatchMPT {
-    db: Db,
+    storage: SledStorage,
     store: DashMap<Prefix, Node>,
     dirty: DashSet<Prefix>,
     old_dirty: DashSet<Prefix>,
@@ -31,48 +29,27 @@ fn get_thread_pool() -> &'static rayon::ThreadPool {
 }
 
 impl SledBatchMPT {
-    fn get_default_config() -> Config {
-        Config::new()
-            .flush_every_ms(Some(5000))
-            .mode(sled::Mode::HighThroughput)
-            .use_compression(false)
-            .print_profile_on_drop(false)
-    }
-
     pub fn new_with_path(path: impl AsRef<Path>) -> sled::Result<Self> {
-        let db = SledBatchMPT::get_default_config().path(path).open()?;
-        Self::from_db(db)
+        let storage = SledStorage::new_with_path(path)?;
+        Self::from_storage(storage)
     }
 
     pub fn new_temporary() -> sled::Result<Self> {
-        let db = SledBatchMPT::get_default_config().temporary(true).open()?;
-        Self::from_db(db)
+        let storage = SledStorage::new_temporary()?;
+        Self::from_storage(storage)
     }
 
-    fn from_db(db: Db) -> sled::Result<Self> {
-        let root = match db.get(ROOT_KEY)? {
-            Some(raw) => decode_prefix(raw.as_ref()).map_err(sled::Error::Unsupported)?,
-            None => {
-                let root = Prefix::root();
-                db.insert(ROOT_KEY, encode_prefix(root))?;
-                db.flush()?;
-                root
-            }
-        };
+    fn from_storage(storage: SledStorage) -> sled::Result<Self> {
+        let root = storage.load_root()?;
 
         let store = DashMap::new();
-        for entry in db.iter() {
-            let (key, value) = entry?;
-            if key.as_ref() == ROOT_KEY {
-                continue;
-            }
-            let prefix = decode_prefix(key.as_ref()).map_err(sled::Error::Unsupported)?;
-            let node = decode_node(value.as_ref()).map_err(sled::Error::Unsupported)?;
+        for entry in storage.iter_nodes() {
+            let (prefix, node) = entry?;
             store.insert(prefix, node);
         }
 
         Ok(Self {
-            db,
+            storage,
             store,
             dirty: DashSet::new(),
             old_dirty: DashSet::new(),
@@ -320,18 +297,20 @@ impl SledBatchMPT {
 
         std::mem::swap(&mut self.dirty, &mut self.old_dirty);
 
-        self.db
-            .transaction(|db| {
-                for prefix in self.dirty.iter() {
-                    let node = self.store.get(&prefix).unwrap();
-                    db.insert(prefix_key(&prefix), encode_node(node.value()))?;
-                }
-                db.insert(ROOT_KEY, encode_prefix(self.root))?;
-                Ok::<(), sled::transaction::ConflictableTransactionError>(())
-            })
-            .expect("trans error");
+        let mut batch = self.storage.start_batch();
+        for prefix in self.dirty.iter() {
+            let prefix = *prefix;
+            let node = self.store.get(&prefix).unwrap();
+            batch.insert_node(prefix, node.value())?;
+        }
+        if self.root_dirty {
+            batch.set_root(self.root);
+        }
+        batch.commit()?;
+
         self.dirty.clear();
-        // self.db.flush()?;
+        self.old_dirty.clear();
+        self.root_dirty = false;
 
         Ok(())
     }
@@ -378,54 +357,4 @@ impl MerklePatriciaTree for SledBatchMPT {
 fn set_node(store: &DashMap<Prefix, Node>, dirty: &DashSet<Prefix>, prefix: Prefix, node: Node) {
     store.insert(prefix, node);
     dirty.insert(prefix);
-}
-
-fn prefix_key(prefix: &Prefix) -> Vec<u8> {
-    let mut key = Vec::with_capacity(34);
-    key.extend_from_slice(&prefix.hash);
-    key.extend_from_slice(&prefix.length.to_be_bytes());
-    key
-}
-
-fn encode_node(node: &Node) -> Vec<u8> {
-    let (node_type, data) = node.serialize().expect("Failed to serialize node");
-    let mut encoded = Vec::with_capacity(1 + data.len());
-    let discriminator = match node_type {
-        "leaf" => 0u8,
-        "interior" => 1u8,
-        _ => panic!("Unexpected node type {}", node_type),
-    };
-    encoded.push(discriminator);
-    encoded.extend_from_slice(&data);
-    encoded
-}
-
-fn decode_node(bytes: &[u8]) -> Result<Node, String> {
-    if bytes.is_empty() {
-        return Err("Node bytes are empty".into());
-    }
-    let (tag, data) = bytes.split_first().unwrap();
-    let node_type = match tag {
-        0 => "leaf",
-        1 => "interior",
-        other => return Err(format!("Unknown node tag {}", other)),
-    };
-    Node::deserialize(node_type, data)
-}
-
-fn encode_prefix(prefix: Prefix) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(34);
-    buf.extend_from_slice(&prefix.hash);
-    buf.extend_from_slice(&prefix.length.to_be_bytes());
-    buf
-}
-
-fn decode_prefix(bytes: &[u8]) -> Result<Prefix, String> {
-    if bytes.len() != 34 {
-        return Err(format!("Prefix bytes must be 34 long, got {}", bytes.len()));
-    }
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&bytes[..32]);
-    let length = u16::from_be_bytes([bytes[32], bytes[33]]);
-    Ok(Prefix { hash, length })
 }

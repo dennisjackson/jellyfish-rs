@@ -1,6 +1,5 @@
 use async_recursion::async_recursion;
 use dashmap::DashMap;
-use sled::{Config, Db};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -10,9 +9,8 @@ use tokio::runtime::{Builder, Runtime};
 use crate::mpt::MerklePatriciaTree;
 use crate::{Hash, Prefix};
 
+use super::sled_storage::SledStorage;
 use super::{InteriorNode, LeafNode, Node};
-
-const ROOT_KEY: &[u8] = b"__mpt_root__";
 const WORKER_CHANNEL_CAPACITY: usize = 400_000;
 
 enum WorkerCommand {
@@ -35,9 +33,9 @@ struct WorkerHandle {
 }
 
 impl WorkerHandle {
-    fn spawn(db: Db) -> Arc<Self> {
+    fn spawn(storage: SledStorage) -> Arc<Self> {
         let (sender, receiver) = mpsc::sync_channel(WORKER_CHANNEL_CAPACITY);
-        let join = thread::spawn(move || worker_loop(db, receiver));
+        let join = thread::spawn(move || worker_loop(storage, receiver));
         Arc::new(Self {
             sender,
             join: Mutex::new(Some(join)),
@@ -63,31 +61,25 @@ impl Drop for WorkerHandle {
     }
 }
 
-fn worker_loop(db: Db, receiver: Receiver<WorkerCommand>) {
-    let mut batch = sled::Batch::default();
-    let mut node_buf = Vec::with_capacity(128);
-    let mut prefix_buf = Vec::with_capacity(34);
+fn worker_loop(storage: SledStorage, receiver: Receiver<WorkerCommand>) {
+    let mut batch = storage.start_batch();
     for command in receiver {
         match command {
             WorkerCommand::Insert { prefix, node } => {
-                let value = encode_node_into(&node, &mut node_buf);
-                batch.insert(prefix_key(&prefix), value);
+                batch
+                    .insert_node(prefix, &node)
+                    .expect("Failed to queue node for sled batch");
             }
             WorkerCommand::SetRoot { root } => {
-                let value = encode_prefix_into(root, &mut prefix_buf);
-                batch.insert(ROOT_KEY, value);
+                batch.set_root(root);
             }
             WorkerCommand::Commit { respond_to } => {
-                let to_apply = std::mem::take(&mut batch);
-                let result = db
-                    .apply_batch(to_apply)
-                    .and_then(|_| db.flush().map(|_| ()));
+                let result = batch.commit_and_flush();
                 let _ = respond_to.send(result);
+                batch = storage.start_batch();
             }
             WorkerCommand::Shutdown => {
-                let pending = std::mem::take(&mut batch);
-                let _ = db.apply_batch(pending);
-                let _ = db.flush();
+                let _ = batch.commit_and_flush();
                 break;
             }
         }
@@ -107,30 +99,21 @@ fn mpt_runtime() -> &'static Runtime {
 
 #[derive(Clone)]
 pub struct SledChanMPT {
-    db: Db,
+    storage: SledStorage,
     root: Prefix,
     worker: Arc<WorkerHandle>,
     cache: Arc<DashMap<Prefix, Node>>,
 }
 
 impl SledChanMPT {
-    fn get_default_config() -> Config {
-        Config::new()
-            .flush_every_ms(Some(5000))
-            .mode(sled::Mode::HighThroughput)
-            .use_compression(false)
-            .print_profile_on_drop(true)
-            .cache_capacity(1024 * 1024 * 1024 * 10) // 8 GB
-    }
-
     pub fn new_with_path(path: impl AsRef<Path>) -> sled::Result<Self> {
-        let db = SledChanMPT::get_default_config().path(path).open()?;
-        Self::from_db(db)
+        let storage = SledStorage::new_with_path(path)?;
+        Self::from_storage(storage)
     }
 
     pub fn new_temporary() -> sled::Result<Self> {
-        let db = SledChanMPT::get_default_config().temporary(true).open()?;
-        Self::from_db(db)
+        let storage = SledStorage::new_temporary()?;
+        Self::from_storage(storage)
     }
 
     fn queue_node(&self, prefix: Prefix, node: Node) {
@@ -146,28 +129,15 @@ impl SledChanMPT {
         if let Some(entry) = self.cache.get(prefix) {
             return Some(entry.value().clone());
         }
-        self.db
-            .get(prefix_key(prefix))
-            .expect("DB get failed")
-            .map(|raw| decode_node(raw.as_ref()).expect("Failed to decode node from DB"))
+        self.storage.fetch_node(prefix).expect("DB get failed")
     }
 
-    fn from_db(db: Db) -> sled::Result<Self> {
-        let root = match db.get(ROOT_KEY)? {
-            Some(raw) => decode_prefix(raw.as_ref()).map_err(sled::Error::Unsupported)?,
-            None => {
-                let root = Prefix::root();
-                let mut buf = Vec::with_capacity(34);
-                let value = encode_prefix_into(root, &mut buf);
-                db.insert(ROOT_KEY, value)?;
-                db.flush()?;
-                root
-            }
-        };
-        let worker = WorkerHandle::spawn(db.clone());
+    fn from_storage(storage: SledStorage) -> sled::Result<Self> {
+        let root = storage.load_root()?;
+        let worker = WorkerHandle::spawn(storage.clone());
         let cache = Arc::new(DashMap::new());
         let instance = Self {
-            db,
+            storage,
             root,
             worker,
             cache,
@@ -425,14 +395,17 @@ impl SledChanMPT {
         let result = wait_for
             .recv()
             .expect("Commit acknowledgment channel closed unexpectedly");
-        if result.is_ok() {
-            self.cache.clear();
+        match result {
+            Ok(()) => {
+                self.cache.clear();
+                Ok(())
+            }
+            Err(err) => Err(err),
         }
-        result
     }
 
     pub fn len(&self) -> usize {
-        0 //todo
+        self.storage.leaf_count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -454,17 +427,9 @@ impl MerklePatriciaTree for SledChanMPT {
     }
 
     fn enumerate_nodes(&self) -> Vec<(Prefix, Node)> {
-        let mut nodes = Vec::new();
-        for result in self.db.iter() {
-            let (raw_key, raw_value) = result.expect("DB iteration failed");
-            if raw_key.as_ref() == ROOT_KEY {
-                continue;
-            }
-            let prefix = decode_prefix(raw_key.as_ref()).expect("Failed to decode prefix from DB");
-            let node = decode_node(raw_value.as_ref()).expect("Failed to decode node from DB");
-            nodes.push((prefix, node));
-        }
-        nodes
+        self.storage
+            .enumerate_nodes()
+            .expect("Failed to enumerate nodes from DB")
     }
 
     fn get_root_hash(&self) -> Option<Hash> {
@@ -479,59 +444,4 @@ impl MerklePatriciaTree for SledChanMPT {
             None => None,
         }
     }
-}
-
-fn prefix_key(prefix: &Prefix) -> Vec<u8> {
-    let mut key = Vec::with_capacity(34);
-    let mut temp = prefix.hash;
-    temp.reverse();
-    key.extend_from_slice(&temp);
-    key.extend_from_slice(&prefix.length.to_be_bytes());
-    key
-}
-
-fn encode_node_into<'a>(node: &Node, buffer: &'a mut Vec<u8>) -> &'a [u8] {
-    buffer.clear();
-    let (node_type, data) = node.serialize().expect("Failed to serialize node");
-    let discriminator = match node_type {
-        "leaf" => 0u8,
-        "interior" => 1u8,
-        _ => panic!("Unexpected node type {}", node_type),
-    };
-    buffer.push(discriminator);
-    buffer.extend_from_slice(&data);
-    buffer.as_slice()
-}
-
-fn decode_node(bytes: &[u8]) -> Result<Node, String> {
-    if bytes.is_empty() {
-        return Err("Node bytes are empty".into());
-    }
-    let (tag, data) = bytes.split_first().unwrap();
-    let node_type = match tag {
-        0 => "leaf",
-        1 => "interior",
-        other => return Err(format!("Unknown node tag {}", other)),
-    };
-    Node::deserialize(node_type, data)
-}
-
-fn encode_prefix_into<'a>(prefix: Prefix, buffer: &'a mut Vec<u8>) -> &'a [u8] {
-    buffer.clear();
-    let mut hash = prefix.hash;
-    hash.reverse();
-    buffer.extend_from_slice(&hash);
-    buffer.extend_from_slice(&prefix.length.to_be_bytes());
-    buffer.as_slice()
-}
-
-fn decode_prefix(bytes: &[u8]) -> Result<Prefix, String> {
-    if bytes.len() != 34 {
-        return Err(format!("Prefix bytes must be 34 long, got {}", bytes.len()));
-    }
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&bytes[..32]);
-    hash.reverse();
-    let length = u16::from_be_bytes([bytes[32], bytes[33]]);
-    Ok(Prefix { hash, length })
 }

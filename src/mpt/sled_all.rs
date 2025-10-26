@@ -1,5 +1,4 @@
 use async_recursion::async_recursion;
-use sled::{Config, Db};
 use std::path::Path;
 use std::sync::OnceLock;
 use tokio::runtime::{Builder, Runtime};
@@ -7,9 +6,8 @@ use tokio::runtime::{Builder, Runtime};
 use crate::mpt::MerklePatriciaTree;
 use crate::{Hash, Prefix};
 
+use super::sled_storage::SledStorage;
 use super::{InteriorNode, LeafNode, Node};
-
-const ROOT_KEY: &[u8] = b"__mpt_root__";
 
 fn mpt_runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -24,56 +22,34 @@ fn mpt_runtime() -> &'static Runtime {
 
 #[derive(Clone)]
 pub struct SledAllMPT {
-    db: Db,
+    storage: SledStorage,
     root: Prefix,
 }
 
 impl SledAllMPT {
-    fn get_default_config() -> Config {
-        Config::new()
-            .flush_every_ms(Some(5000))
-            .mode(sled::Mode::HighThroughput)
-            .use_compression(false)
-            .print_profile_on_drop(true)
-            .cache_capacity(1024 * 1024 * 1024 * 10) // 8 GB
-    }
-
     pub fn new_with_path(path: impl AsRef<Path>) -> sled::Result<Self> {
-        let db = SledAllMPT::get_default_config().path(path).open()?;
-        Self::from_db(db)
+        let storage = SledStorage::new_with_path(path)?;
+        Self::from_storage(storage)
     }
 
     pub fn new_temporary() -> sled::Result<Self> {
-        let db = SledAllMPT::get_default_config().temporary(true).open()?;
-        Self::from_db(db)
+        let storage = SledStorage::new_temporary()?;
+        Self::from_storage(storage)
     }
 
     fn insert_node_with_db(&self, prefix: Prefix, node: Node) {
-        self.db
-            .insert(prefix_key(&prefix), encode_node(&node))
+        self.storage
+            .put_node(prefix, &node)
             .expect("DB insert failed");
     }
 
     fn get_node(&self, prefix: &Prefix) -> Option<Node> {
-        self.db
-            .get(prefix_key(prefix))
-            .expect("DB get failed")
-            .map(|raw| decode_node(raw.as_ref()).expect("Failed to decode node from DB"))
+        self.storage.fetch_node(prefix).expect("DB get failed")
     }
 
-    fn from_db(db: Db) -> sled::Result<Self> {
-        let root = match db.get(ROOT_KEY)? {
-            Some(raw) => decode_prefix(raw.as_ref()).map_err(sled::Error::Unsupported)?,
-            None => {
-                let root = Prefix::root();
-                db.insert(ROOT_KEY, encode_prefix(root))?;
-                db.flush()?;
-                root
-            }
-        };
-        let instance = Self { db, root };
-
-        Ok(instance)
+    fn from_storage(storage: SledStorage) -> sled::Result<Self> {
+        let root = storage.load_root()?;
+        Ok(Self { storage, root })
     }
 
     fn batch_upsert_optimized(&mut self, entries: &[(Hash, Hash)]) {
@@ -89,8 +65,8 @@ impl SledAllMPT {
         let new_root = mpt_runtime()
             .block_on(async { Self::recursive_batch_upsert(self, root, entries_vec).await });
         self.root = new_root;
-        self.db
-            .insert(ROOT_KEY, encode_prefix(self.root))
+        self.storage
+            .persist_root(self.root)
             .expect("Failed to update root in DB");
     }
 
@@ -321,12 +297,12 @@ impl SledAllMPT {
     }
 
     pub fn flush(&mut self) -> sled::Result<()> {
-        self.db.flush()?;
-        Ok(())
+        self.storage.persist_leaf_count()?;
+        self.storage.flush()
     }
 
     pub fn len(&self) -> usize {
-        0 //todo
+        self.storage.leaf_count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -349,17 +325,9 @@ impl MerklePatriciaTree for SledAllMPT {
     }
 
     fn enumerate_nodes(&self) -> Vec<(Prefix, Node)> {
-        let mut nodes = Vec::new();
-        for result in self.db.iter() {
-            let (raw_key, raw_value) = result.expect("DB iteration failed");
-            if raw_key.as_ref() == ROOT_KEY {
-                continue;
-            }
-            let prefix = decode_prefix(raw_key.as_ref()).expect("Failed to decode prefix from DB");
-            let node = decode_node(raw_value.as_ref()).expect("Failed to decode node from DB");
-            nodes.push((prefix, node));
-        }
-        nodes
+        self.storage
+            .enumerate_nodes()
+            .expect("Failed to enumerate nodes from DB")
     }
 
     fn get_root_hash(&self) -> Option<Hash> {
@@ -374,58 +342,4 @@ impl MerklePatriciaTree for SledAllMPT {
             None => None,
         }
     }
-}
-
-fn prefix_key(prefix: &Prefix) -> Vec<u8> {
-    let mut key = Vec::with_capacity(34);
-    let mut temp = prefix.hash;
-    temp.reverse();
-    key.extend_from_slice(&temp);
-    key.extend_from_slice(&prefix.length.to_be_bytes());
-    key
-}
-
-fn encode_node(node: &Node) -> Vec<u8> {
-    let (node_type, data) = node.serialize().expect("Failed to serialize node");
-    let mut encoded = Vec::with_capacity(1 + data.len());
-    let discriminator = match node_type {
-        "leaf" => 0u8,
-        "interior" => 1u8,
-        _ => panic!("Unexpected node type {}", node_type),
-    };
-    encoded.push(discriminator);
-    encoded.extend_from_slice(&data);
-    encoded
-}
-
-fn decode_node(bytes: &[u8]) -> Result<Node, String> {
-    if bytes.is_empty() {
-        return Err("Node bytes are empty".into());
-    }
-    let (tag, data) = bytes.split_first().unwrap();
-    let node_type = match tag {
-        0 => "leaf",
-        1 => "interior",
-        other => return Err(format!("Unknown node tag {}", other)),
-    };
-    Node::deserialize(node_type, data)
-}
-
-fn encode_prefix(mut prefix: Prefix) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(34);
-    prefix.hash.reverse();
-    buf.extend_from_slice(&prefix.hash);
-    buf.extend_from_slice(&prefix.length.to_be_bytes());
-    buf
-}
-
-fn decode_prefix(bytes: &[u8]) -> Result<Prefix, String> {
-    if bytes.len() != 34 {
-        return Err(format!("Prefix bytes must be 34 long, got {}", bytes.len()));
-    }
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&bytes[..32]);
-    hash.reverse();
-    let length = u16::from_be_bytes([bytes[32], bytes[33]]);
-    Ok(Prefix { hash, length })
 }
