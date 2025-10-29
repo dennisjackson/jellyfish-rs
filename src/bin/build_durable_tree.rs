@@ -1,5 +1,5 @@
 use indicatif::{ProgressBar, ProgressStyle};
-use jellyfish_rs::mpt::{MerklePatriciaTree, SledChanMPT};
+use jellyfish_rs::mpt::{MerklePatriciaTree, SledBatchMPT};
 use jellyfish_rs::{BatchMPT, Hash};
 use log::info;
 use std::env;
@@ -10,7 +10,7 @@ use std::time::Instant;
 const IN_MEMORY_FLAG: &str = "--in-memory";
 
 enum Tree {
-    Durable(SledChanMPT),
+    Durable(SledBatchMPT),
     InMemory(BatchMPT),
 }
 
@@ -31,7 +31,7 @@ impl Tree {
 
     fn len(&self) -> usize {
         match self {
-            Tree::Durable(_) => 0,
+            Tree::Durable(x) => x.enumerate_nodes().len(),
             Tree::InMemory(tree) => tree.enumerate_nodes().len(),
         }
     }
@@ -117,10 +117,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     } else if let Some(path) = db_path {
         ensure_parent(path)?;
         info!("Writing durable MPT to {}", path);
-        Tree::Durable(SledChanMPT::new_with_path(path)?)
+        Tree::Durable(SledBatchMPT::new_with_path(path)?)
     } else {
         info!("Using temporary database path for durable MPT");
-        Tree::Durable(SledChanMPT::new())
+        Tree::Durable(SledBatchMPT::new())
     };
     let startup_time = start.elapsed().as_secs_f64();
     let current_tree_size = tree.len();

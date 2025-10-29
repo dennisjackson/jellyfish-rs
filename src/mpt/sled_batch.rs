@@ -1,4 +1,5 @@
 use dashmap::{DashMap, DashSet};
+use log::debug;
 use rayon::join;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -13,7 +14,7 @@ pub struct SledBatchMPT {
     storage: SledStorage,
     store: DashMap<Prefix, Node>,
     dirty: DashSet<Prefix>,
-    old_dirty: DashSet<Prefix>,
+    // old_dirty: DashSet<Prefix>,
     root: Prefix,
     root_dirty: bool,
 }
@@ -52,7 +53,7 @@ impl SledBatchMPT {
             storage,
             store,
             dirty: DashSet::new(),
-            old_dirty: DashSet::new(),
+            // old_dirty: DashSet::new(),
             root,
             root_dirty: false,
         })
@@ -75,7 +76,7 @@ impl SledBatchMPT {
         if root_changed {
             self.root_dirty = true;
         }
-
+        debug!("self.dirty.len() = {}", self.dirty.len());
         self.persist_dirty()
             .expect("Failed to persist sled batch updates");
     }
@@ -292,10 +293,11 @@ impl SledBatchMPT {
 
     fn persist_dirty(&mut self) -> sled::Result<()> {
         if self.dirty.is_empty() && !self.root_dirty {
+            debug!("No dirty nodes to persist");
             return Ok(());
         }
 
-        std::mem::swap(&mut self.dirty, &mut self.old_dirty);
+        // std::mem::swap(&mut self.dirty, &mut self.old_dirty);
 
         let mut batch = self.storage.start_batch();
         for prefix in self.dirty.iter() {
@@ -303,13 +305,14 @@ impl SledBatchMPT {
             let node = self.store.get(&prefix).unwrap();
             batch.insert_node(prefix, node.value())?;
         }
+        debug!("Persisted {} dirty nodes", self.dirty.len());
         if self.root_dirty {
             batch.set_root(self.root);
         }
         batch.commit()?;
 
         self.dirty.clear();
-        self.old_dirty.clear();
+        // self.old_dirty.clear();
         self.root_dirty = false;
 
         Ok(())
@@ -355,6 +358,7 @@ impl MerklePatriciaTree for SledBatchMPT {
 }
 
 fn set_node(store: &DashMap<Prefix, Node>, dirty: &DashSet<Prefix>, prefix: Prefix, node: Node) {
+    // debug!("Inserting node {:?} at prefix {:?}", node, prefix);
     store.insert(prefix, node);
     dirty.insert(prefix);
 }
