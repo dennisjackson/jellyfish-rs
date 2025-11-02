@@ -1,4 +1,9 @@
 use super::*;
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 // Macro to run a test against all MPT implementations
 //
@@ -85,6 +90,66 @@ fn verify_interior_node_structure<T: MerklePatriciaTree>(mpt: &T) -> bool {
         }
     }
     true
+}
+
+fn run_sled_persistence_test<T, F>(
+    label: &str,
+    path: &Path,
+    initial_entries: &[(Hash, Hash)],
+    additional_entries: &[(Hash, Hash)],
+    mut constructor: F,
+) -> Hash
+where
+    T: MerklePatriciaTree,
+    F: FnMut(&Path) -> sled::Result<T>,
+{
+    {
+        let mut tree =
+            constructor(path).unwrap_or_else(|e| panic!("{label} initial open failed: {e}"));
+        for &(key, value) in initial_entries {
+            tree.upsert(key, value);
+        }
+    }
+
+    let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} reopen failed: {e}"));
+    for &(key, value) in additional_entries {
+        tree.upsert(key, value);
+    }
+    let root = tree
+        .get_root_hash()
+        .unwrap_or_else(|| panic!("{label} final root was None"));
+    drop(tree);
+    root
+}
+
+fn run_sqlite_persistence_test<T, F>(
+    label: &str,
+    path: &str,
+    initial_entries: &[(Hash, Hash)],
+    additional_entries: &[(Hash, Hash)],
+    mut constructor: F,
+) -> Hash
+where
+    T: MerklePatriciaTree,
+    F: FnMut(&str) -> rusqlite::Result<T>,
+{
+    {
+        let mut tree =
+            constructor(path).unwrap_or_else(|e| panic!("{label} initial open failed: {e}"));
+        for &(key, value) in initial_entries {
+            tree.upsert(key, value);
+        }
+    }
+
+    let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} reopen failed: {e}"));
+    for &(key, value) in additional_entries {
+        tree.upsert(key, value);
+    }
+    let root = tree
+        .get_root_hash()
+        .unwrap_or_else(|| panic!("{label} final root was None"));
+    drop(tree);
+    root
 }
 
 test_all_impls!(test_empty_tree, {
@@ -612,3 +677,105 @@ test_all_impls!(test_batch_upsert_incremental, {
     assert_eq!(mpt.get_leaf_value(create_hash(4)), Some(create_hash(104)));
     assert_eq!(mpt.get_leaf_value(create_hash(5)), Some(create_hash(105)));
 });
+
+#[test]
+fn test_persistent_reopen_consistency() {
+    let initial_entries = vec![
+        (create_hash(1), create_hash(101)),
+        (create_hash(2), create_hash(102)),
+        (create_hash(3), create_hash(103)),
+    ];
+    let additional_entries = vec![
+        (create_hash(2), create_hash(202)),
+        (create_hash(4), create_hash(104)),
+        (create_hash(5), create_hash(105)),
+    ];
+
+    let pid = std::process::id();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base_dir = env::temp_dir().join(format!("mpt_persistence_reopen_{}_{}", pid, timestamp));
+    fs::create_dir_all(&base_dir).expect("failed to create persistent test directory");
+
+    struct DirCleanup(PathBuf);
+    impl Drop for DirCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let _cleanup = DirCleanup(base_dir.clone());
+
+    let mut roots: Vec<(&'static str, Hash)> = Vec::new();
+
+    let durable_path = base_dir.join("durable.db");
+    let durable_path_str = durable_path.to_string_lossy().to_string();
+    let durable_root = run_sqlite_persistence_test::<DurableBatchMPT, _>(
+        "DurableBatchMPT",
+        &durable_path_str,
+        &initial_entries,
+        &additional_entries,
+        |path| DurableBatchMPT::new_with_path(path),
+    );
+    roots.push(("DurableBatchMPT", durable_root));
+
+    let sled_batch_dir = base_dir.join("sled_batch");
+    let sled_batch_root = run_sled_persistence_test::<SledBatchMPT, _>(
+        "SledBatchMPT",
+        &sled_batch_dir,
+        &initial_entries,
+        &additional_entries,
+        |path| SledBatchMPT::new_with_path(path),
+    );
+    roots.push(("SledBatchMPT", sled_batch_root));
+
+    let sled_leaf_dir = base_dir.join("sled_leaf");
+    let sled_leaf_root = run_sled_persistence_test::<SledLeafMPT, _>(
+        "SledLeafMPT",
+        &sled_leaf_dir,
+        &initial_entries,
+        &additional_entries,
+        |path| SledLeafMPT::new_with_path(path),
+    );
+    roots.push(("SledLeafMPT", sled_leaf_root));
+
+    let sled_all_dir = base_dir.join("sled_all");
+    let sled_all_root = run_sled_persistence_test::<SledAllMPT, _>(
+        "SledAllMPT",
+        &sled_all_dir,
+        &initial_entries,
+        &additional_entries,
+        |path| SledAllMPT::new_with_path(path),
+    );
+    roots.push(("SledAllMPT", sled_all_root));
+
+    let sled_trans_dir = base_dir.join("sled_trans");
+    let sled_trans_root = run_sled_persistence_test::<SledTransMPT, _>(
+        "SledTransMPT",
+        &sled_trans_dir,
+        &initial_entries,
+        &additional_entries,
+        |path| SledTransMPT::new_with_path(path),
+    );
+    roots.push(("SledTransMPT", sled_trans_root));
+
+    let sled_chan_dir = base_dir.join("sled_chan");
+    let sled_chan_root = run_sled_persistence_test::<SledChanMPT, _>(
+        "SledChanMPT",
+        &sled_chan_dir,
+        &initial_entries,
+        &additional_entries,
+        |path| SledChanMPT::new_with_path(path),
+    );
+    roots.push(("SledChanMPT", sled_chan_root));
+
+    let (reference_label, reference_root) = roots[0];
+    for (label, root) in roots.iter().copied() {
+        assert_eq!(
+            root, reference_root,
+            "{label} final root hash diverged from {reference_label}"
+        );
+    }
+}
