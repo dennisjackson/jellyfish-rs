@@ -18,8 +18,8 @@ pub const LEAF_COUNT_KEY: &[u8] = b"__mpt_leaf_count__";
 
 pub fn prefix_key(prefix: &Prefix) -> Vec<u8> {
     let mut key = Vec::with_capacity(34);
-    key.extend_from_slice(&prefix.hash);
     key.extend_from_slice(&prefix.length.to_be_bytes());
+    key.extend_from_slice(&prefix.hash);
     key
 }
 
@@ -30,8 +30,8 @@ pub fn encode_prefix(prefix: Prefix) -> Vec<u8> {
 
 pub fn encode_prefix_into<'a>(prefix: Prefix, buffer: &'a mut Vec<u8>) -> &'a [u8] {
     buffer.clear();
-    buffer.extend_from_slice(&prefix.hash);
     buffer.extend_from_slice(&prefix.length.to_be_bytes());
+    buffer.extend_from_slice(&prefix.hash);
     buffer.as_slice()
 }
 
@@ -39,9 +39,9 @@ pub fn decode_prefix(bytes: &[u8]) -> Result<Prefix, String> {
     if bytes.len() != 34 {
         return Err(format!("Prefix bytes must be 34 long, got {}", bytes.len()));
     }
+    let length = u16::from_be_bytes([bytes[0], bytes[1]]);
     let mut hash = [0u8; 32];
-    hash.copy_from_slice(&bytes[..32]);
-    let length = u16::from_be_bytes([bytes[32], bytes[33]]);
+    hash.copy_from_slice(&bytes[2..34]);
     Ok(Prefix { hash, length })
 }
 
