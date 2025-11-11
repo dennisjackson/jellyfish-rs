@@ -161,6 +161,7 @@ impl RocksStorage {
 
         for entry in iter {
             match entry {
+
                 Ok((key, value)) => {
                     // Decode the prefix from the key
                     let prefix = match decode_prefix(key.as_ref()) {

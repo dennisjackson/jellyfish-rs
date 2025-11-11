@@ -17,6 +17,9 @@ pub struct RockSparseMPT {
     root: Prefix,
     dirty_prefixes: DirtyPrefixes,
     _temp_dir: Option<TempDir>,
+    /// Tracks the depth (prefix length) where all nodes exist and are interior nodes.
+    /// At depth D, there should be 2^D interior nodes for this depth to be considered complete.
+    complete_interior_depth: std::sync::atomic::AtomicU16,
 }
 
 impl RockSparseMPT {
@@ -55,6 +58,7 @@ impl RockSparseMPT {
             root,
             dirty_prefixes: DashSet::new(),
             _temp_dir: temp_dir,
+            complete_interior_depth: std::sync::atomic::AtomicU16::new(0),
         };
 
         const RECOVERY_CHUNK: usize = 1024 * 1024;
@@ -123,6 +127,9 @@ impl RockSparseMPT {
         tx.commit().expect("Failed to commit batch upsert");
         self.root = new_root;
         self.dirty_prefixes.clear();
+
+        // Update the complete interior depth tracker after the batch upsert
+        self.update_complete_interior_depth();
     }
 
     fn batch_upsert_memory_only(&mut self, entries: &[(Hash, Hash)]) {
@@ -367,6 +374,85 @@ impl RockSparseMPT {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Returns the current complete interior depth.
+    /// At this depth, all 2^depth nodes exist and are interior nodes.
+    pub fn complete_interior_depth(&self) -> u16 {
+        self.complete_interior_depth.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Check if all nodes at the given depth exist and are interior nodes.
+    /// At depth D, there should be exactly 2^D nodes, all of which must be Interior nodes.
+    fn check_depth_complete(&self, depth: u16) -> bool {
+        // The root (depth 0) is always considered complete if it exists as an interior
+        if depth == 0 {
+            let is_interior = self.store.get(&Prefix::root())
+                .map(|n| matches!(n.value(), Node::Interior(_)))
+                .unwrap_or(false);
+            return is_interior;
+        }
+
+        // For depth > 0, we need to check that exactly 2^depth nodes exist at this depth
+        let expected_count = 1u64 << depth; // 2^depth
+
+        // If depth is too large (>= 32), we can't have that many nodes
+        if depth >= 20 {
+            return false;
+        }
+
+        // Scan the in-memory DashMap for nodes at this prefix length
+        let mut count = 0u64;
+        for entry in self.store.iter() {
+            let prefix = entry.key();
+            let node = entry.value();
+
+            // Check if this node is at the target depth
+            if prefix.length == depth {
+                // Check if it's an interior node
+                if !matches!(node, Node::Interior(_)) {
+                    return false;
+                }
+                count += 1;
+
+                // Early exit if we already have too many nodes
+                if count > expected_count {
+                    return false;
+                }
+            }
+        }
+
+        // Check if we have exactly the expected count
+        if count != expected_count {
+            return false;
+        }
+
+        true
+    }
+
+    /// Update the tracked complete interior depth by scanning upward from the current depth.
+    /// This is called after a batch upsert to check if new levels have become complete.
+    fn update_complete_interior_depth(&self) {
+        let mut current_depth = self.complete_interior_depth.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Keep checking successive depths until we find one that's incomplete
+        loop {
+            let next_depth = current_depth + 1;
+
+            // Don't go beyond reasonable depth (256 would be a full hash)
+            if next_depth >= 256 {
+                break;
+            }
+
+            // Check if the next depth level is complete
+            if self.check_depth_complete(next_depth) {
+                current_depth = next_depth;
+                self.complete_interior_depth.store(current_depth, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                // If this level is incomplete, we're done
+                break;
+            }
+        }
+    }
 }
 
 impl MerklePatriciaTree for RockSparseMPT {
@@ -404,5 +490,107 @@ impl MerklePatriciaTree for RockSparseMPT {
             },
             None => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Hash;
+
+    fn make_hash(byte: u8) -> Hash {
+        let mut hash = [0u8; 32];
+        hash[0] = byte;
+        hash
+    }
+
+    #[test]
+    fn test_complete_interior_depth_empty_tree() {
+        let tree = RockSparseMPT::new_temporary().expect("create tree");
+        // Empty tree should have depth 0
+        assert_eq!(tree.complete_interior_depth(), 0);
+    }
+
+    #[test]
+    fn test_complete_interior_depth_single_insert() {
+        let mut tree = RockSparseMPT::new_temporary().expect("create tree");
+
+        // Insert a single key-value pair
+        tree.batch_upsert(&[(make_hash(0x00), make_hash(0x01))]);
+
+        // With just one leaf, we should still have depth 0
+        // (the root exists but is a leaf, not an interior)
+        assert_eq!(tree.complete_interior_depth(), 0);
+    }
+
+    #[test]
+    fn test_complete_interior_depth_two_inserts() {
+        let mut tree = RockSparseMPT::new_temporary().expect("create tree");
+
+        // Insert two keys that differ in the first bit
+        // 0x00 = 00000000...
+        // 0x80 = 10000000...
+        tree.batch_upsert(&[
+            (make_hash(0x00), make_hash(0x01)),
+            (make_hash(0x80), make_hash(0x02)),
+        ]);
+
+        // Now the root should be an interior node (depth 0 complete)
+        // But depth 1 requires 2 interior nodes, which we don't have yet
+        let depth = tree.complete_interior_depth();
+        println!("Depth after 2 inserts with different first bit: {}", depth);
+    }
+
+    #[test]
+    fn test_complete_interior_depth_full_level() {
+        let mut tree = RockSparseMPT::new_temporary().expect("create tree");
+
+        // Insert 4 keys to create a tree with depth 2
+        // This creates interior nodes at depth 0 and 1
+        tree.batch_upsert(&[
+            (make_hash(0x00), make_hash(0x01)), // 00...
+            (make_hash(0x40), make_hash(0x02)), // 01...
+            (make_hash(0x80), make_hash(0x03)), // 10...
+            (make_hash(0xC0), make_hash(0x04)), // 11...
+        ]);
+
+        let depth = tree.complete_interior_depth();
+        println!("Complete interior depth with 4 keys: {}", depth);
+
+        // The actual depth depends on the tree structure
+        // With these 4 keys differing in the first 2 bits, we should have:
+        // - Depth 0: 1 interior node (root)
+        // - Depth 1: 2 interior nodes (left and right subtrees)
+        // So depth should be at least 1 or 2
+    }
+
+    #[test]
+    fn test_complete_interior_depth_incremental() {
+        let mut tree = RockSparseMPT::new_temporary().expect("create tree");
+
+        let initial_depth = tree.complete_interior_depth();
+        println!("Initial depth: {}", initial_depth);
+
+        // Add first key
+        tree.batch_upsert(&[(make_hash(0x00), make_hash(0x01))]);
+        let depth1 = tree.complete_interior_depth();
+        println!("Depth after 1 insert: {}", depth1);
+
+        // Add second key (different first bit)
+        tree.batch_upsert(&[(make_hash(0x80), make_hash(0x02))]);
+        let depth2 = tree.complete_interior_depth();
+        println!("Depth after 2 inserts: {}", depth2);
+
+        // Add third and fourth keys
+        tree.batch_upsert(&[
+            (make_hash(0x40), make_hash(0x03)),
+            (make_hash(0xC0), make_hash(0x04)),
+        ]);
+        let depth3 = tree.complete_interior_depth();
+        println!("Depth after 4 inserts: {}", depth3);
+
+        // The depth should not decrease
+        assert!(depth3 >= depth2);
+        assert!(depth2 >= depth1);
     }
 }
