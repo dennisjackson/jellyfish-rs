@@ -30,6 +30,9 @@ pub use sled_trans::SledTransMPT;
 mod sled_chan;
 pub use sled_chan::SledChanMPT;
 
+mod sled_sparse;
+pub use sled_sparse::SledSparseMPT;
+
 mod cache;
 pub use cache::Cache;
 

@@ -26,6 +26,7 @@ macro_rules! test_all_impls {
             test_impl::<SledAllMPT>();
             test_impl::<SledTransMPT>();
             test_impl::<SledChanMPT>();
+            test_impl::<SledSparseMPT>();
         }
     };
 }
@@ -40,6 +41,7 @@ macro_rules! for_each_impl {
         $macro!(SledAllMPT);
         $macro!(SledTransMPT);
         $macro!(SledChanMPT);
+        $macro!(SledSparseMPT);
     };
 }
 
@@ -770,6 +772,16 @@ fn test_persistent_reopen_consistency() {
         |path| SledChanMPT::new_with_path(path),
     );
     roots.push(("SledChanMPT", sled_chan_root));
+
+    let sled_sparse_dir = base_dir.join("sled_sparse");
+    let sled_sparse_root = run_sled_persistence_test::<SledSparseMPT, _>(
+        "SledSparseMPT",
+        &sled_sparse_dir,
+        &initial_entries,
+        &additional_entries,
+        |path| SledSparseMPT::new_with_path(path),
+    );
+    roots.push(("SledSparseMPT", sled_sparse_root));
 
     let (reference_label, reference_root) = roots[0];
     for (label, root) in roots.iter().copied() {
