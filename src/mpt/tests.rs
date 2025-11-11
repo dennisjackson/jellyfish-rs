@@ -28,6 +28,7 @@ macro_rules! test_all_impls {
             test_impl::<SledTransMPT>();
             test_impl::<SledChanMPT>();
             test_impl::<RockLeafMPT>();
+            test_impl::<RockSparseMPT>();
         }
     };
 }
@@ -43,6 +44,7 @@ macro_rules! for_each_impl {
         $macro!(SledTransMPT);
         $macro!(SledChanMPT);
         $macro!(RockLeafMPT);
+        $macro!(RockSparseMPT);
     };
 }
 
@@ -804,15 +806,25 @@ fn test_persistent_reopen_consistency() {
     );
     roots.push(("SledChanMPT", sled_chan_root));
 
-    let rock_sparse_dir = base_dir.join("rock_sparse");
-    let rock_sparse_root = run_rocks_persistence_test::<RockLeafMPT, _>(
+    let rock_leaf_dir = base_dir.join("rock_leaf");
+    let rock_leaf_root = run_rocks_persistence_test::<RockLeafMPT, _>(
         "RockLeafMPT",
-        &rock_sparse_dir,
+        &rock_leaf_dir,
         &initial_entries,
         &additional_entries,
         |path| RockLeafMPT::new_with_path(path),
     );
-    roots.push(("RockLeafMPT", rock_sparse_root));
+    roots.push(("RockLeafMPT", rock_leaf_root));
+
+    let rock_sparse_dir = base_dir.join("rock_sparse");
+    let rock_sparse_root = run_rocks_persistence_test::<RockSparseMPT, _>(
+        "RockSparseMPT",
+        &rock_sparse_dir,
+        &initial_entries,
+        &additional_entries,
+        |path| RockSparseMPT::new_with_path(path),
+    );
+    roots.push(("RockSparseMPT", rock_sparse_root));
 
     let (reference_label, reference_root) = roots[0];
     for (label, root) in roots.iter().copied() {

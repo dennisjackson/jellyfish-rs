@@ -36,6 +36,9 @@ pub use sled_chan::SledChanMPT;
 mod rock_leaf;
 pub use rock_leaf::RockLeafMPT;
 
+mod rock_sparse;
+pub use rock_sparse::RockSparseMPT;
+
 mod cache;
 pub use cache::Cache;
 
