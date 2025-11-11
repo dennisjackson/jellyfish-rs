@@ -1,7 +1,6 @@
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use rayon::join;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 
 use crate::mpt::MerklePatriciaTree;
@@ -10,10 +9,13 @@ use crate::{Hash, Prefix};
 use super::rocks_storage::{RocksResult, RocksStorage};
 use super::{InteriorNode, LeafNode, Node};
 
+type DirtyPrefixes = DashSet<Prefix>;
+
 pub struct RockSparseMPT {
     storage: RocksStorage,
     store: DashMap<Prefix, Node>,
     root: Prefix,
+    dirty_prefixes: DirtyPrefixes,
     _temp_dir: Option<TempDir>,
 }
 
@@ -29,14 +31,9 @@ impl RockSparseMPT {
         Self::from_storage(storage, Some(temp_dir))
     }
 
-    fn insert_node_with_db(&self, prefix: Prefix, node: Node) {
-        let is_leaf = matches!(node, Node::Leaf(_));
-        let previous = self.store.insert(prefix, node.clone());
-
-        let tx = self.storage.start_transaction();
-        tx.batch_write_nodes(&[(prefix, node)])
-            .expect("DB insert failed");
-        tx.commit().expect("DB commit failed");
+    fn insert_node_with_db(&self, dirty_prefixes: &DirtyPrefixes, prefix: Prefix, node: Node) {
+        self.store.insert(prefix, node);
+        dirty_prefixes.insert(prefix);
     }
 
     fn insert_node_memory_only(&self, prefix: Prefix, node: Node) {
@@ -56,12 +53,12 @@ impl RockSparseMPT {
             storage,
             store: DashMap::with_capacity(estimated_entries.saturating_mul(2)),
             root,
+            dirty_prefixes: DashSet::new(),
             _temp_dir: temp_dir,
         };
 
         const RECOVERY_CHUNK: usize = 1024 * 1024;
         let mut leaf_entries: Vec<(Hash, Hash)> = Vec::with_capacity(RECOVERY_CHUNK);
-        let mut total_leaves = 0usize;
         let stored_nodes = instance
             .storage
             .iter_nodes()
@@ -69,7 +66,6 @@ impl RockSparseMPT {
         for (prefix, node) in stored_nodes {
             if let Node::Leaf(leaf) = node {
                 leaf_entries.push((prefix.hash, leaf.value));
-                total_leaves += 1;
                 if leaf_entries.len() == RECOVERY_CHUNK {
                     assert!(leaf_entries.is_sorted());
                     instance.batch_upsert_memory_only(&leaf_entries);
@@ -94,9 +90,39 @@ impl RockSparseMPT {
         entries_vec.sort_unstable_by_key(|(k, _)| *k);
         entries_vec.dedup_by_key(|(k, _)| *k);
 
-        let new_root = Self::recursive_batch_upsert(self, self.root, entries_vec, false);
+        self.dirty_prefixes.clear();
+        let tx = self.storage.start_transaction();
+        let new_root = Self::recursive_batch_upsert(
+            self,
+            self.root,
+            entries_vec,
+            Some(&self.dirty_prefixes),
+        );
+
+        {
+            let mut writes: Vec<(Prefix, Node)> = self.dirty_prefixes
+                .iter()
+                .filter_map(|prefix_ref| {
+                    let prefix = *prefix_ref;
+                    self.store
+                        .get(&prefix)
+                        .map(|node| (prefix, node.value().clone()))
+                })
+                .collect();
+
+            if !writes.is_empty() {
+                // Keep a consistent order for determinism in tests/debugging.
+                writes.sort_unstable_by_key(|(prefix, _)| *prefix);
+                tx.batch_write_nodes(&writes)
+                    .expect("DB batch write failed");
+            }
+        }
+
+        tx.set_root(new_root)
+            .expect("Failed to update root in DB");
+        tx.commit().expect("Failed to commit batch upsert");
         self.root = new_root;
-        self.persist_root_in_db();
+        self.dirty_prefixes.clear();
     }
 
     fn batch_upsert_memory_only(&mut self, entries: &[(Hash, Hash)]) {
@@ -108,7 +134,7 @@ impl RockSparseMPT {
         entries_vec.sort_unstable_by_key(|(k, _)| *k);
         entries_vec.dedup_by_key(|(k, _)| *k);
 
-        let new_root = Self::recursive_batch_upsert(self, self.root, entries_vec, true);
+        let new_root = Self::recursive_batch_upsert(self, self.root, entries_vec, None);
         self.root = new_root;
     }
 
@@ -116,7 +142,7 @@ impl RockSparseMPT {
         &self,
         current_prefix: Prefix,
         entries: Vec<(Hash, Hash)>,
-        memory_only: bool,
+        dirty_prefixes: Option<&DirtyPrefixes>,
     ) -> Prefix {
         if entries.is_empty() {
             return current_prefix;
@@ -127,27 +153,30 @@ impl RockSparseMPT {
             .get(&current_prefix)
             .map(|guard| guard.value().clone());
         let Some(node) = node else {
-            return Self::batch_insert_into_empty(self, entries, memory_only);
+            return Self::batch_insert_into_empty(self, entries, dirty_prefixes);
         };
 
         match node {
             Node::Leaf(leaf) => {
-                Self::batch_upsert_at_leaf(self, current_prefix, leaf, entries, memory_only)
+                Self::batch_upsert_at_leaf(self, current_prefix, leaf, entries, dirty_prefixes)
             }
             Node::Interior(interior) => {
-                Self::batch_upsert_at_interior(self, current_prefix, interior, entries, memory_only)
+                Self::batch_upsert_at_interior(
+                    self,
+                    current_prefix,
+                    interior,
+                    entries,
+                    dirty_prefixes,
+                )
             }
         }
     }
 
-    fn persist_root_in_db(&self) {
-        let tx = self.storage.start_transaction();
-        tx.set_root(self.root)
-            .expect("Failed to update root in DB");
-        tx.commit().expect("Failed to commit root update");
-    }
-
-    fn batch_insert_into_empty(&self, mut entries: Vec<(Hash, Hash)>, memory_only: bool) -> Prefix {
+    fn batch_insert_into_empty(
+        &self,
+        mut entries: Vec<(Hash, Hash)>,
+        dirty_prefixes: Option<&DirtyPrefixes>,
+    ) -> Prefix {
         if entries.is_empty() {
             return Prefix::root();
         }
@@ -155,12 +184,12 @@ impl RockSparseMPT {
         let (first_key, first_value) = entries.remove(0);
         let first_prefix = Prefix::from(first_key);
         let first_leaf = LeafNode::new(first_key, first_value);
-        if memory_only {
-            self.insert_node_memory_only(first_prefix, Node::Leaf(first_leaf));
+        if let Some(dirty) = dirty_prefixes.as_ref() {
+            self.insert_node_with_db(dirty, first_prefix, Node::Leaf(first_leaf));
         } else {
-            self.insert_node_with_db(first_prefix, Node::Leaf(first_leaf));
+            self.insert_node_memory_only(first_prefix, Node::Leaf(first_leaf));
         }
-        Self::recursive_batch_upsert(self, first_prefix, entries, memory_only)
+        Self::recursive_batch_upsert(self, first_prefix, entries, dirty_prefixes)
     }
 
     fn batch_upsert_at_leaf(
@@ -168,20 +197,20 @@ impl RockSparseMPT {
         leaf_prefix: Prefix,
         leaf: LeafNode,
         mut entries: Vec<(Hash, Hash)>,
-        memory_only: bool,
+        dirty_prefixes: Option<&DirtyPrefixes>,
     ) -> Prefix {
         if let Ok(idx) = entries.binary_search_by_key(&leaf_prefix.hash, |(k, _)| *k) {
             let (_, new_value) = entries.remove(idx);
             let updated_leaf = LeafNode::new(leaf_prefix.hash, new_value);
-            if memory_only {
-                self.insert_node_memory_only(leaf_prefix, Node::Leaf(updated_leaf));
+            if let Some(dirty) = dirty_prefixes.as_ref() {
+                self.insert_node_with_db(dirty, leaf_prefix, Node::Leaf(updated_leaf));
             } else {
-                self.insert_node_with_db(leaf_prefix, Node::Leaf(updated_leaf));
+                self.insert_node_memory_only(leaf_prefix, Node::Leaf(updated_leaf));
             }
             if entries.is_empty() {
                 return leaf_prefix;
             }
-            return Self::recursive_batch_upsert(self, leaf_prefix, entries, memory_only);
+            return Self::recursive_batch_upsert(self, leaf_prefix, entries, dirty_prefixes);
         }
 
         if entries.is_empty() {
@@ -212,17 +241,17 @@ impl RockSparseMPT {
             right_hash,
         );
 
-        if memory_only {
+        if let Some(dirty) = dirty_prefixes.as_ref() {
+            self.insert_node_memory_only(merged_prefix, Node::Interior(new_interior));
+            self.insert_node_with_db(dirty, existing_prefix, Node::Leaf(leaf));
+            self.insert_node_with_db(dirty, new_prefix, Node::Leaf(new_leaf));
+        } else {
             self.insert_node_memory_only(merged_prefix, Node::Interior(new_interior));
             self.insert_node_memory_only(existing_prefix, Node::Leaf(leaf));
             self.insert_node_memory_only(new_prefix, Node::Leaf(new_leaf));
-        } else {
-            self.insert_node_memory_only(merged_prefix, Node::Interior(new_interior));
-            self.insert_node_with_db(existing_prefix, Node::Leaf(leaf));
-            self.insert_node_with_db(new_prefix, Node::Leaf(new_leaf));
         }
 
-        Self::recursive_batch_upsert(self, merged_prefix, entries, memory_only)
+        Self::recursive_batch_upsert(self, merged_prefix, entries, dirty_prefixes)
     }
 
     fn batch_upsert_at_interior(
@@ -230,7 +259,7 @@ impl RockSparseMPT {
         interior_prefix: Prefix,
         interior: InteriorNode,
         entries: Vec<(Hash, Hash)>,
-        memory_only: bool,
+        dirty_prefixes: Option<&DirtyPrefixes>,
     ) -> Prefix {
         let (mut contained_entries, mut divergent_entries): (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) =
             entries
@@ -256,16 +285,16 @@ impl RockSparseMPT {
             let new_interior =
                 InteriorNode::new(common, left_prefix, right_prefix, left_hash, right_hash);
 
-            if memory_only {
+            if let Some(dirty) = dirty_prefixes.as_ref() {
                 self.insert_node_memory_only(common, Node::Interior(new_interior));
-                self.insert_node_memory_only(new_leaf_prefix, Node::Leaf(new_leaf));
+                self.insert_node_with_db(dirty, new_leaf_prefix, Node::Leaf(new_leaf));
             } else {
                 self.insert_node_memory_only(common, Node::Interior(new_interior));
-                self.insert_node_with_db(new_leaf_prefix, Node::Leaf(new_leaf));
+                self.insert_node_memory_only(new_leaf_prefix, Node::Leaf(new_leaf));
             }
 
             contained_entries.extend(divergent_entries);
-            return Self::recursive_batch_upsert(self, common, contained_entries, memory_only);
+            return Self::recursive_batch_upsert(self, common, contained_entries, dirty_prefixes);
         }
         let (right_entries, left_entries): (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) =
             contained_entries
@@ -275,14 +304,14 @@ impl RockSparseMPT {
         let count = left_entries.len() + right_entries.len();
         let l_work = || {
             if !left_entries.is_empty() {
-                Self::recursive_batch_upsert(self, interior.left, left_entries, memory_only)
+                Self::recursive_batch_upsert(self, interior.left, left_entries, Some(&self.dirty_prefixes))
             } else {
                 interior.left
             }
         };
         let r_work = || {
             if !right_entries.is_empty() {
-                Self::recursive_batch_upsert(self, interior.right, right_entries, memory_only)
+                Self::recursive_batch_upsert(self, interior.right, right_entries, Some(&self.dirty_prefixes))
             } else {
                 interior.right
             }
