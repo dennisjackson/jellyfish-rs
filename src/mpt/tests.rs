@@ -1,4 +1,5 @@
 use super::*;
+use super::rocks_storage::RocksResult;
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -26,7 +27,7 @@ macro_rules! test_all_impls {
             test_impl::<SledAllMPT>();
             test_impl::<SledTransMPT>();
             test_impl::<SledChanMPT>();
-            test_impl::<SledSparseMPT>();
+            test_impl::<RockSparseMPT>();
         }
     };
 }
@@ -41,7 +42,7 @@ macro_rules! for_each_impl {
         $macro!(SledAllMPT);
         $macro!(SledTransMPT);
         $macro!(SledChanMPT);
-        $macro!(SledSparseMPT);
+        $macro!(RockSparseMPT);
     };
 }
 
@@ -134,6 +135,36 @@ fn run_sqlite_persistence_test<T, F>(
 where
     T: MerklePatriciaTree,
     F: FnMut(&str) -> rusqlite::Result<T>,
+{
+    {
+        let mut tree =
+            constructor(path).unwrap_or_else(|e| panic!("{label} initial open failed: {e}"));
+        for &(key, value) in initial_entries {
+            tree.upsert(key, value);
+        }
+    }
+
+    let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} reopen failed: {e}"));
+    for &(key, value) in additional_entries {
+        tree.upsert(key, value);
+    }
+    let root = tree
+        .get_root_hash()
+        .unwrap_or_else(|| panic!("{label} final root was None"));
+    drop(tree);
+    root
+}
+
+fn run_rocks_persistence_test<T, F>(
+    label: &str,
+    path: &Path,
+    initial_entries: &[(Hash, Hash)],
+    additional_entries: &[(Hash, Hash)],
+    mut constructor: F,
+) -> Hash
+where
+    T: MerklePatriciaTree,
+    F: FnMut(&Path) -> RocksResult<T>,
 {
     {
         let mut tree =
@@ -773,15 +804,15 @@ fn test_persistent_reopen_consistency() {
     );
     roots.push(("SledChanMPT", sled_chan_root));
 
-    let sled_sparse_dir = base_dir.join("sled_sparse");
-    let sled_sparse_root = run_sled_persistence_test::<SledSparseMPT, _>(
-        "SledSparseMPT",
-        &sled_sparse_dir,
+    let rock_sparse_dir = base_dir.join("rock_sparse");
+    let rock_sparse_root = run_rocks_persistence_test::<RockSparseMPT, _>(
+        "RockSparseMPT",
+        &rock_sparse_dir,
         &initial_entries,
         &additional_entries,
-        |path| SledSparseMPT::new_with_path(path),
+        |path| RockSparseMPT::new_with_path(path),
     );
-    roots.push(("SledSparseMPT", sled_sparse_root));
+    roots.push(("RockSparseMPT", rock_sparse_root));
 
     let (reference_label, reference_root) = roots[0];
     for (label, root) in roots.iter().copied() {

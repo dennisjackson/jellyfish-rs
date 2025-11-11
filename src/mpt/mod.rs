@@ -21,6 +21,9 @@ pub use sled_batch::SledBatchMPT;
 
 mod sled_storage;
 
+mod rocks_storage;
+pub use rocks_storage::RocksStorage;
+
 mod sled_all;
 pub use sled_all::SledAllMPT;
 
@@ -30,8 +33,8 @@ pub use sled_trans::SledTransMPT;
 mod sled_chan;
 pub use sled_chan::SledChanMPT;
 
-mod sled_sparse;
-pub use sled_sparse::SledSparseMPT;
+mod rock_sparse;
+pub use rock_sparse::RockSparseMPT;
 
 mod cache;
 pub use cache::Cache;

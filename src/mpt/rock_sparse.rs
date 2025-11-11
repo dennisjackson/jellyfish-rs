@@ -1,57 +1,75 @@
 use dashmap::DashMap;
 use rayon::join;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tempfile::TempDir;
 
 use crate::mpt::MerklePatriciaTree;
 use crate::{Hash, Prefix};
 
-use super::sled_storage::SledStorage;
+use super::rocks_storage::{RocksResult, RocksStorage};
 use super::{InteriorNode, LeafNode, Node};
 
-pub struct SledSparseMPT {
-    storage: SledStorage,
+pub struct RockSparseMPT {
+    storage: RocksStorage,
     store: DashMap<Prefix, Node>,
     root: Prefix,
+    _temp_dir: Option<TempDir>,
 }
 
-impl SledSparseMPT {
-    pub fn new_with_path(path: impl AsRef<Path>) -> sled::Result<Self> {
-        let storage = SledStorage::new_with_path(path)?;
-        Self::from_storage(storage)
+impl RockSparseMPT {
+    pub fn new_with_path(path: impl AsRef<Path>) -> RocksResult<Self> {
+        let storage = RocksStorage::open(path)?;
+        Self::from_storage(storage, None)
     }
 
-    pub fn new_temporary() -> sled::Result<Self> {
-        let storage = SledStorage::new_temporary()?;
-        Self::from_storage(storage)
+    pub fn new_temporary() -> RocksResult<Self> {
+        let temp_dir = TempDir::new()?;
+        let storage = RocksStorage::open(temp_dir.path())?;
+        Self::from_storage(storage, Some(temp_dir))
     }
 
     fn insert_node_with_db(&self, prefix: Prefix, node: Node) {
-        self.store.insert(prefix, node.clone());
-        self.storage
-            .put_node(prefix, &node)
+        let is_leaf = matches!(node, Node::Leaf(_));
+        let previous = self.store.insert(prefix, node.clone());
+
+        let tx = self.storage.start_transaction();
+        tx.batch_write_nodes(&[(prefix, node)])
             .expect("DB insert failed");
+        tx.commit().expect("DB commit failed");
     }
 
     fn insert_node_memory_only(&self, prefix: Prefix, node: Node) {
         self.store.insert(prefix, node);
     }
 
-    fn from_storage(storage: SledStorage) -> sled::Result<Self> {
-        let root = storage.load_root()?;
+    fn from_storage(storage: RocksStorage, temp_dir: Option<TempDir>) -> RocksResult<Self> {
+        let root = {
+            let tx = storage.start_transaction();
+            let root = tx.load_root()?;
+            tx.commit()?;
+            root
+        };
 
-        let estimated_entries = storage.leaf_count().max(1);
+        let estimated_entries = storage.approximate_entry_count().max(1);
         let mut instance = Self {
             storage,
             store: DashMap::with_capacity(estimated_entries.saturating_mul(2)),
             root,
+            _temp_dir: temp_dir,
         };
 
         const RECOVERY_CHUNK: usize = 1024 * 1024;
         let mut leaf_entries: Vec<(Hash, Hash)> = Vec::with_capacity(RECOVERY_CHUNK);
-        for entry in instance.storage.iter_nodes() {
-            let (prefix, node) = entry?;
+        let mut total_leaves = 0usize;
+        let stored_nodes = instance
+            .storage
+            .iter_nodes()
+            .collect::<RocksResult<Vec<_>>>()?;
+        for (prefix, node) in stored_nodes {
             if let Node::Leaf(leaf) = node {
                 leaf_entries.push((prefix.hash, leaf.value));
+                total_leaves += 1;
                 if leaf_entries.len() == RECOVERY_CHUNK {
                     assert!(leaf_entries.is_sorted());
                     instance.batch_upsert_memory_only(&leaf_entries);
@@ -78,9 +96,7 @@ impl SledSparseMPT {
 
         let new_root = Self::recursive_batch_upsert(self, self.root, entries_vec, false);
         self.root = new_root;
-        self.storage
-            .persist_root(self.root)
-            .expect("Failed to update root in DB");
+        self.persist_root_in_db();
     }
 
     fn batch_upsert_memory_only(&mut self, entries: &[(Hash, Hash)]) {
@@ -122,6 +138,13 @@ impl SledSparseMPT {
                 Self::batch_upsert_at_interior(self, current_prefix, interior, entries, memory_only)
             }
         }
+    }
+
+    fn persist_root_in_db(&self) {
+        let tx = self.storage.start_transaction();
+        tx.set_root(self.root)
+            .expect("Failed to update root in DB");
+        tx.commit().expect("Failed to commit root update");
     }
 
     fn batch_insert_into_empty(&self, mut entries: Vec<(Hash, Hash)>, memory_only: bool) -> Prefix {
@@ -304,13 +327,12 @@ impl SledSparseMPT {
         }
     }
 
-    pub fn flush(&mut self) -> sled::Result<()> {
-        self.storage.persist_leaf_count()?;
+    pub fn flush(&mut self) -> RocksResult<()> {
         self.storage.flush()
     }
 
     pub fn len(&self) -> usize {
-        self.storage.leaf_count()
+        self.storage.approximate_entry_count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -318,9 +340,9 @@ impl SledSparseMPT {
     }
 }
 
-impl MerklePatriciaTree for SledSparseMPT {
+impl MerklePatriciaTree for RockSparseMPT {
     fn new() -> Self {
-        Self::new_temporary().expect("Failed to create temporary sled database")
+        Self::new_temporary().expect("Failed to create temporary RocksDB database")
     }
 
     fn upsert(&mut self, key: Hash, value: Hash) {
