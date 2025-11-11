@@ -33,8 +33,8 @@ pub use sled_trans::SledTransMPT;
 mod sled_chan;
 pub use sled_chan::SledChanMPT;
 
-mod rock_sparse;
-pub use rock_sparse::RockSparseMPT;
+mod rock_leaf;
+pub use rock_leaf::RockLeafMPT;
 
 mod cache;
 pub use cache::Cache;

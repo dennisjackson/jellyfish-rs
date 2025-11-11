@@ -11,7 +11,7 @@ use super::{InteriorNode, LeafNode, Node};
 
 type DirtyPrefixes = DashSet<Prefix>;
 
-pub struct RockSparseMPT {
+pub struct RockLeafMPT {
     storage: RocksStorage,
     store: DashMap<Prefix, Node>,
     root: Prefix,
@@ -19,7 +19,7 @@ pub struct RockSparseMPT {
     _temp_dir: Option<TempDir>,
 }
 
-impl RockSparseMPT {
+impl RockLeafMPT {
     pub fn new_with_path(path: impl AsRef<Path>) -> RocksResult<Self> {
         let storage = RocksStorage::open(path)?;
         Self::from_storage(storage, None)
@@ -369,7 +369,7 @@ impl RockSparseMPT {
     }
 }
 
-impl MerklePatriciaTree for RockSparseMPT {
+impl MerklePatriciaTree for RockLeafMPT {
     fn new() -> Self {
         Self::new_temporary().expect("Failed to create temporary RocksDB database")
     }
