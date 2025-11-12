@@ -44,11 +44,12 @@ impl RockSparseMPT {
     }
 
     fn from_storage(storage: RocksStorage, temp_dir: Option<TempDir>) -> RocksResult<Self> {
-        let root = {
+        let (root, complete_depth) = {
             let tx = storage.start_transaction();
             let root = tx.load_root()?;
+            let complete_depth = tx.get_complete_depth()?.unwrap_or(0);
             tx.commit()?;
-            root
+            (root, complete_depth)
         };
 
         let estimated_entries = storage.approximate_entry_count().max(1);
@@ -58,7 +59,7 @@ impl RockSparseMPT {
             root,
             dirty_prefixes: DashSet::new(),
             _temp_dir: temp_dir,
-            complete_interior_depth: std::sync::atomic::AtomicU16::new(0),
+            complete_interior_depth: std::sync::atomic::AtomicU16::new(complete_depth),
         };
 
         const RECOVERY_CHUNK: usize = 1024 * 1024;
@@ -124,12 +125,13 @@ impl RockSparseMPT {
 
         tx.set_root(new_root)
             .expect("Failed to update root in DB");
+
+        // Update and persist the complete interior depth in the same transaction
+        self.update_complete_interior_depth(&tx);
+
         tx.commit().expect("Failed to commit batch upsert");
         self.root = new_root;
         self.dirty_prefixes.clear();
-
-        // Update the complete interior depth tracker after the batch upsert
-        self.update_complete_interior_depth();
     }
 
     fn batch_upsert_memory_only(&mut self, entries: &[(Hash, Hash)]) {
@@ -455,9 +457,9 @@ impl RockSparseMPT {
         Prefix { hash, length: depth }
     }
 
-    /// Persist all interior nodes at a specific depth to the database in a single transaction.
+    /// Persist all interior nodes at a specific depth to the database in the given transaction.
     /// This is called when we discover that a depth has become complete.
-    fn persist_interior_nodes_at_depth(&self, depth: u16) -> RocksResult<()> {
+    fn persist_interior_nodes_at_depth_in_tx(&self, depth: u16, tx: &super::rocks_storage::RocksTransaction) -> RocksResult<()> {
         if depth >= 20 {
             // Too deep, too many nodes to handle
             return Ok(());
@@ -477,11 +479,9 @@ impl RockSparseMPT {
             }
         }
 
-        // Write all nodes in a single transaction
+        // Write all nodes in the given transaction
         if !nodes_to_write.is_empty() {
-            let tx = self.storage.start_transaction();
             tx.batch_write_nodes(&nodes_to_write)?;
-            tx.commit()?;
         }
 
         Ok(())
@@ -489,7 +489,8 @@ impl RockSparseMPT {
 
     /// Update the tracked complete interior depth by scanning upward from the current depth.
     /// This is called after a batch upsert to check if new levels have become complete.
-    fn update_complete_interior_depth(&self) {
+    /// The updated depth is persisted to the database in the provided transaction.
+    fn update_complete_interior_depth(&self, tx: &super::rocks_storage::RocksTransaction) {
         let mut current_depth = self.complete_interior_depth.load(std::sync::atomic::Ordering::Relaxed);
 
         // Keep checking successive depths until we find one that's incomplete
@@ -503,8 +504,8 @@ impl RockSparseMPT {
 
             // Check if the next depth level is complete
             if self.check_depth_complete(next_depth) {
-                // Persist all interior nodes at this newly complete depth
-                if let Err(e) = self.persist_interior_nodes_at_depth(next_depth) {
+                // Persist all interior nodes at this newly complete depth to the database
+                if let Err(e) = self.persist_interior_nodes_at_depth_in_tx(next_depth, tx) {
                     eprintln!("Warning: Failed to persist interior nodes at depth {}: {}", next_depth, e);
                     break;
                 }
@@ -515,6 +516,11 @@ impl RockSparseMPT {
                 // If this level is incomplete, we're done
                 break;
             }
+        }
+
+        // Persist the updated depth to the database
+        if let Err(e) = tx.set_complete_depth(current_depth) {
+            eprintln!("Warning: Failed to persist complete depth {}: {}", current_depth, e);
         }
     }
 }

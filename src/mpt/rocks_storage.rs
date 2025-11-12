@@ -8,7 +8,7 @@ use rocksdb::{
 use crate::Prefix;
 
 use super::sled_storage::{
-    decode_node, decode_prefix, encode_node, encode_prefix, prefix_key, ROOT_KEY,
+    decode_node, decode_prefix, encode_node, encode_prefix, prefix_key, ROOT_KEY, COMPLETE_DEPTH_KEY,
 };
 use super::Node;
 
@@ -241,6 +241,27 @@ impl<'a> RocksTransaction<'a> {
         Ok(())
     }
 
+    pub fn get_complete_depth(&self) -> RocksResult<Option<u16>> {
+        let tx = self.inner()?;
+        match tx.get(COMPLETE_DEPTH_KEY)? {
+            Some(raw) => {
+                if raw.len() != 2 {
+                    return Err(RocksStorageError::Codec(format!(
+                        "Complete depth must be 2 bytes, got {}",
+                        raw.len()
+                    )));
+                }
+                Ok(Some(u16::from_be_bytes([raw[0], raw[1]])))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_complete_depth(&self, depth: u16) -> RocksResult<()> {
+        self.inner()?.put(COMPLETE_DEPTH_KEY, depth.to_be_bytes())?;
+        Ok(())
+    }
+
     pub fn commit(mut self) -> RocksResult<()> {
         if let Some(tx) = self.tx.take() {
             tx.commit()?;
@@ -275,7 +296,7 @@ impl<'a> Iterator for RocksNodeIter<'a> {
         while let Some(entry) = self.iter.next() {
             match entry {
                 Ok((key, value)) => {
-                    if key.as_ref() == ROOT_KEY {
+                    if key.as_ref() == ROOT_KEY || key.as_ref() == COMPLETE_DEPTH_KEY {
                         continue;
                     }
                     let prefix = match decode_prefix(key.as_ref()) {

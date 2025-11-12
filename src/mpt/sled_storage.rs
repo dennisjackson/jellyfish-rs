@@ -15,6 +15,7 @@ const DEFAULT_CACHE_CAPACITY: u64 = 10 * 1024 * 1024 * 1024;
 
 pub const ROOT_KEY: &[u8] = b"__mpt_root__";
 pub const LEAF_COUNT_KEY: &[u8] = b"__mpt_leaf_count__";
+pub const COMPLETE_DEPTH_KEY: &[u8] = b"__mpt_complete_depth__";
 
 pub fn prefix_key(prefix: &Prefix) -> Vec<u8> {
     let mut key = Vec::with_capacity(34);
@@ -273,7 +274,7 @@ impl Iterator for SledNodeIter {
             match entry {
                 Ok((key, value)) => {
                     let key_ref = key.as_ref();
-                    if key_ref == ROOT_KEY || key_ref == LEAF_COUNT_KEY {
+                    if key_ref == ROOT_KEY || key_ref == LEAF_COUNT_KEY || key_ref == COMPLETE_DEPTH_KEY {
                         continue;
                     }
                     let prefix = match decode_prefix(key_ref) {
