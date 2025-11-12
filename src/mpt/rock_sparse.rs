@@ -392,41 +392,53 @@ impl RockSparseMPT {
             return is_interior;
         }
 
-        // For depth > 0, we need to check that exactly 2^depth nodes exist at this depth
-        let expected_count = 1u64 << depth; // 2^depth
-
-        // If depth is too large (>= 32), we can't have that many nodes
+        // If depth is too large (>= 20), we can't have that many nodes
         if depth >= 20 {
             return false;
         }
 
-        // Scan the in-memory DashMap for nodes at this prefix length
-        let mut count = 0u64;
-        for entry in self.store.iter() {
-            let prefix = entry.key();
-            let node = entry.value();
+        // For depth > 0, we need to check that exactly 2^depth nodes exist at this depth
+        let expected_count = 1u64 << depth; // 2^depth
 
-            // Check if this node is at the target depth
-            if prefix.length == depth {
-                // Check if it's an interior node
-                if !matches!(node, Node::Interior(_)) {
-                    return false;
+        // Generate all possible prefixes at this depth and check them directly
+        // This is more efficient than scanning all nodes in the DashMap
+        for i in 0..expected_count {
+            let prefix = Self::prefix_from_depth_and_index(depth, i);
+
+            match self.store.get(&prefix) {
+                Some(node) => {
+                    // Node exists, check if it's an interior node
+                    if !matches!(node.value(), Node::Interior(_)) {
+                        return false;
+                    }
                 }
-                count += 1;
-
-                // Early exit if we already have too many nodes
-                if count > expected_count {
+                None => {
+                    // Node doesn't exist at this prefix
                     return false;
                 }
             }
         }
 
-        // Check if we have exactly the expected count
-        if count != expected_count {
-            return false;
+        true
+    }
+
+    /// Generate a prefix at a specific depth with a given index.
+    /// For depth D, valid indices are 0..2^D.
+    /// The index represents the binary number formed by the first D bits.
+    fn prefix_from_depth_and_index(depth: u16, index: u64) -> Prefix {
+        let mut hash = [0u8; 32];
+
+        // Set bits according to the index
+        for bit_pos in 0..depth {
+            let bit_value = (index >> (depth - 1 - bit_pos)) & 1;
+            if bit_value == 1 {
+                let byte_index = (bit_pos / 8) as usize;
+                let bit_index = 7 - (bit_pos % 8);
+                hash[byte_index] |= 1 << bit_index;
+            }
         }
 
-        true
+        Prefix { hash, length: depth }
     }
 
     /// Update the tracked complete interior depth by scanning upward from the current depth.
