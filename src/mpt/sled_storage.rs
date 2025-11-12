@@ -4,6 +4,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
+use std::thread;
 
 use sled::{Batch, Config, Error};
 
@@ -99,8 +101,33 @@ impl SledStorage {
     }
 
     fn open_config(config: Config) -> sled::Result<Self> {
-        let db = config.open()?;
-        Ok(Self::new(db))
+        // Try to open the database with retries to handle lock contention
+        let max_attempts = 10;
+        let mut delay_ms = 10;
+
+        for attempt in 1..=max_attempts {
+            match config.clone().open() {
+                Ok(db) => return Ok(Self::new(db)),
+                Err(e) => {
+                    // Check if this is a lock error
+                    let is_lock_error = e.to_string().contains("could not acquire lock")
+                        || e.to_string().contains("WouldBlock")
+                        || e.to_string().contains("Resource temporarily unavailable");
+
+                    if is_lock_error && attempt < max_attempts {
+                        // Wait before retrying with exponential backoff
+                        thread::sleep(Duration::from_millis(delay_ms));
+                        delay_ms *= 2; // Exponential backoff
+                        continue;
+                    }
+
+                    // Not a lock error or max attempts reached
+                    return Err(e);
+                }
+            }
+        }
+
+        unreachable!("Loop should have returned before reaching here")
     }
 
     pub fn new_with_path(path: impl AsRef<Path>) -> sled::Result<Self> {

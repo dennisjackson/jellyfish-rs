@@ -102,8 +102,9 @@ fn run_sled_persistence_test<T, F>(
     path: &Path,
     initial_entries: &[(Hash, Hash)],
     additional_entries: &[(Hash, Hash)],
+    further_entries: &[(Hash, Hash)],
     mut constructor: F,
-) -> Hash
+) -> (Hash, usize)
 where
     T: MerklePatriciaTree,
     F: FnMut(&Path) -> sled::Result<T>,
@@ -111,20 +112,22 @@ where
     {
         let mut tree =
             constructor(path).unwrap_or_else(|e| panic!("{label} initial open failed: {e}"));
-        for &(key, value) in initial_entries {
-            tree.upsert(key, value);
-        }
+        tree.batch_upsert(initial_entries);
     }
 
-    let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} reopen failed: {e}"));
-    for &(key, value) in additional_entries {
-        tree.upsert(key, value);
+    {
+        let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} reopen failed: {e}"));
+        tree.batch_upsert(additional_entries);
     }
+
+    let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} third open failed: {e}"));
+    tree.batch_upsert(further_entries);
     let root = tree
         .get_root_hash()
         .unwrap_or_else(|| panic!("{label} final root was None"));
+    let leaf_count = count_leaf_nodes(&tree);
     drop(tree);
-    root
+    (root, leaf_count)
 }
 
 fn run_sqlite_persistence_test<T, F>(
@@ -132,8 +135,9 @@ fn run_sqlite_persistence_test<T, F>(
     path: &str,
     initial_entries: &[(Hash, Hash)],
     additional_entries: &[(Hash, Hash)],
+    further_entries: &[(Hash, Hash)],
     mut constructor: F,
-) -> Hash
+) -> (Hash, usize)
 where
     T: MerklePatriciaTree,
     F: FnMut(&str) -> rusqlite::Result<T>,
@@ -141,20 +145,22 @@ where
     {
         let mut tree =
             constructor(path).unwrap_or_else(|e| panic!("{label} initial open failed: {e}"));
-        for &(key, value) in initial_entries {
-            tree.upsert(key, value);
-        }
+        tree.batch_upsert(initial_entries);
     }
 
-    let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} reopen failed: {e}"));
-    for &(key, value) in additional_entries {
-        tree.upsert(key, value);
+    {
+        let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} reopen failed: {e}"));
+        tree.batch_upsert(additional_entries);
     }
+
+    let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} third open failed: {e}"));
+    tree.batch_upsert(further_entries);
     let root = tree
         .get_root_hash()
         .unwrap_or_else(|| panic!("{label} final root was None"));
+    let leaf_count = count_leaf_nodes(&tree);
     drop(tree);
-    root
+    (root, leaf_count)
 }
 
 fn run_rocks_persistence_test<T, F>(
@@ -162,8 +168,9 @@ fn run_rocks_persistence_test<T, F>(
     path: &Path,
     initial_entries: &[(Hash, Hash)],
     additional_entries: &[(Hash, Hash)],
+    further_entries: &[(Hash, Hash)],
     mut constructor: F,
-) -> Hash
+) -> (Hash, usize)
 where
     T: MerklePatriciaTree,
     F: FnMut(&Path) -> RocksResult<T>,
@@ -171,20 +178,22 @@ where
     {
         let mut tree =
             constructor(path).unwrap_or_else(|e| panic!("{label} initial open failed: {e}"));
-        for &(key, value) in initial_entries {
-            tree.upsert(key, value);
-        }
+        tree.batch_upsert(initial_entries);
     }
 
-    let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} reopen failed: {e}"));
-    for &(key, value) in additional_entries {
-        tree.upsert(key, value);
+    {
+        let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} reopen failed: {e}"));
+        tree.batch_upsert(additional_entries);
     }
+
+    let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} third open failed: {e}"));
+    tree.batch_upsert(further_entries);
     let root = tree
         .get_root_hash()
         .unwrap_or_else(|| panic!("{label} final root was None"));
+    let leaf_count = count_leaf_nodes(&tree);
     drop(tree);
-    root
+    (root, leaf_count)
 }
 
 test_all_impls!(test_empty_tree, {
@@ -715,16 +724,29 @@ test_all_impls!(test_batch_upsert_incremental, {
 
 #[test]
 fn test_persistent_reopen_consistency() {
-    let initial_entries = vec![
-        (create_hash(1), create_hash(101)),
-        (create_hash(2), create_hash(102)),
-        (create_hash(3), create_hash(103)),
-    ];
-    let additional_entries = vec![
-        (create_hash(2), create_hash(202)),
-        (create_hash(4), create_hash(104)),
-        (create_hash(5), create_hash(105)),
-    ];
+    use rand::{RngCore, SeedableRng};
+    use rand::rngs::StdRng;
+
+    let _ = env_logger::builder().is_test(true).filter(None, log::LevelFilter::Debug).try_init();
+
+    // Use a seeded RNG for reproducible random hashes
+    let mut rng = StdRng::seed_from_u64(42);
+
+    let make_random_hash = |rng: &mut StdRng| -> Hash {
+        let mut hash = [0u8; 32];
+        rng.fill_bytes(&mut hash);
+        hash
+    };
+
+    let initial_entries: Vec<(Hash, Hash)> = (0..1000)
+        .map(|_| (make_random_hash(&mut rng), make_random_hash(&mut rng)))
+        .collect();
+    let additional_entries: Vec<(Hash, Hash)> = (0..1000)
+        .map(|_| (make_random_hash(&mut rng), make_random_hash(&mut rng)))
+        .collect();
+    let further_entries: Vec<(Hash, Hash)> = (0..1000)
+        .map(|_| (make_random_hash(&mut rng), make_random_hash(&mut rng)))
+        .collect();
 
     let pid = std::process::id();
     let timestamp = SystemTime::now()
@@ -743,94 +765,85 @@ fn test_persistent_reopen_consistency() {
 
     let _cleanup = DirCleanup(base_dir.clone());
 
-    let mut roots: Vec<(&'static str, Hash)> = Vec::new();
+    let mut roots: Vec<(&'static str, Hash, usize)> = Vec::new();
 
-    let durable_path = base_dir.join("durable.db");
-    let durable_path_str = durable_path.to_string_lossy().to_string();
-    let durable_root = run_sqlite_persistence_test::<DurableBatchMPT, _>(
-        "DurableBatchMPT",
-        &durable_path_str,
-        &initial_entries,
-        &additional_entries,
-        |path| DurableBatchMPT::new_with_path(path),
+    // Macro to reduce repetition for SQLite-based persistent implementations
+    macro_rules! test_sqlite_impl {
+        ($impl_type:ty, $name:expr, $subdir:expr) => {{
+            let path = base_dir.join($subdir);
+            let path_str = path.to_string_lossy().to_string();
+            let (root, leaf_count) = run_sqlite_persistence_test::<$impl_type, _>(
+                $name,
+                &path_str,
+                &initial_entries,
+                &additional_entries,
+                &further_entries,
+                |p| <$impl_type>::new_with_path(p),
+            );
+            roots.push(($name, root, leaf_count));
+        }};
+    }
+
+    // Macro to reduce repetition for Sled-based persistent implementations
+    macro_rules! test_sled_impl {
+        ($impl_type:ty, $name:expr, $subdir:expr) => {{
+            let dir = base_dir.join($subdir);
+            let (root, leaf_count) = run_sled_persistence_test::<$impl_type, _>(
+                $name,
+                &dir,
+                &initial_entries,
+                &additional_entries,
+                &further_entries,
+                |p| <$impl_type>::new_with_path(p),
+            );
+            roots.push(($name, root, leaf_count));
+        }};
+    }
+
+    // Macro to reduce repetition for RocksDB-based persistent implementations
+    macro_rules! test_rocks_impl {
+        ($impl_type:ty, $name:expr, $subdir:expr) => {{
+            let dir = base_dir.join($subdir);
+            let (root, leaf_count) = run_rocks_persistence_test::<$impl_type, _>(
+                $name,
+                &dir,
+                &initial_entries,
+                &additional_entries,
+                &further_entries,
+                |p| <$impl_type>::new_with_path(p),
+            );
+            roots.push(($name, root, leaf_count));
+        }};
+    }
+
+    // Test all implementations
+    test_sqlite_impl!(DurableBatchMPT, "DurableBatchMPT", "durable.db");
+    test_sled_impl!(SledBatchMPT, "SledBatchMPT", "sled_batch");
+    test_sled_impl!(SledLeafMPT, "SledLeafMPT", "sled_leaf");
+    test_sled_impl!(SledAllMPT, "SledAllMPT", "sled_all");
+    test_sled_impl!(SledTransMPT, "SledTransMPT", "sled_trans");
+    test_sled_impl!(SledChanMPT, "SledChanMPT", "sled_chan");
+    test_rocks_impl!(RockLeafMPT, "RockLeafMPT", "rock_leaf");
+    test_rocks_impl!(RockSparseMPT, "RockSparseMPT", "rock_sparse");
+
+    // Verify all implementations produce the same root hash and leaf count
+    let (reference_label, reference_root, reference_leaf_count) = roots[0];
+
+    // With random hashes, we expect the leaf count to be close to 300
+    // (could be less due to hash collisions, but highly unlikely with SHA256)
+    assert!(
+        reference_leaf_count >= 250 && reference_leaf_count <= 300,
+        "{reference_label} has unexpected leaf count: {reference_leaf_count} (expected between 250-300)"
     );
-    roots.push(("DurableBatchMPT", durable_root));
 
-    let sled_batch_dir = base_dir.join("sled_batch");
-    let sled_batch_root = run_sled_persistence_test::<SledBatchMPT, _>(
-        "SledBatchMPT",
-        &sled_batch_dir,
-        &initial_entries,
-        &additional_entries,
-        |path| SledBatchMPT::new_with_path(path),
-    );
-    roots.push(("SledBatchMPT", sled_batch_root));
-
-    let sled_leaf_dir = base_dir.join("sled_leaf");
-    let sled_leaf_root = run_sled_persistence_test::<SledLeafMPT, _>(
-        "SledLeafMPT",
-        &sled_leaf_dir,
-        &initial_entries,
-        &additional_entries,
-        |path| SledLeafMPT::new_with_path(path),
-    );
-    roots.push(("SledLeafMPT", sled_leaf_root));
-
-    let sled_all_dir = base_dir.join("sled_all");
-    let sled_all_root = run_sled_persistence_test::<SledAllMPT, _>(
-        "SledAllMPT",
-        &sled_all_dir,
-        &initial_entries,
-        &additional_entries,
-        |path| SledAllMPT::new_with_path(path),
-    );
-    roots.push(("SledAllMPT", sled_all_root));
-
-    let sled_trans_dir = base_dir.join("sled_trans");
-    let sled_trans_root = run_sled_persistence_test::<SledTransMPT, _>(
-        "SledTransMPT",
-        &sled_trans_dir,
-        &initial_entries,
-        &additional_entries,
-        |path| SledTransMPT::new_with_path(path),
-    );
-    roots.push(("SledTransMPT", sled_trans_root));
-
-    let sled_chan_dir = base_dir.join("sled_chan");
-    let sled_chan_root = run_sled_persistence_test::<SledChanMPT, _>(
-        "SledChanMPT",
-        &sled_chan_dir,
-        &initial_entries,
-        &additional_entries,
-        |path| SledChanMPT::new_with_path(path),
-    );
-    roots.push(("SledChanMPT", sled_chan_root));
-
-    let rock_leaf_dir = base_dir.join("rock_leaf");
-    let rock_leaf_root = run_rocks_persistence_test::<RockLeafMPT, _>(
-        "RockLeafMPT",
-        &rock_leaf_dir,
-        &initial_entries,
-        &additional_entries,
-        |path| RockLeafMPT::new_with_path(path),
-    );
-    roots.push(("RockLeafMPT", rock_leaf_root));
-
-    let rock_sparse_dir = base_dir.join("rock_sparse");
-    let rock_sparse_root = run_rocks_persistence_test::<RockSparseMPT, _>(
-        "RockSparseMPT",
-        &rock_sparse_dir,
-        &initial_entries,
-        &additional_entries,
-        |path| RockSparseMPT::new_with_path(path),
-    );
-    roots.push(("RockSparseMPT", rock_sparse_root));
-
-    let (reference_label, reference_root) = roots[0];
-    for (label, root) in roots.iter().copied() {
+    for (label, root, leaf_count) in roots.iter().copied() {
         assert_eq!(
             root, reference_root,
             "{label} final root hash diverged from {reference_label}"
+        );
+        assert_eq!(
+            leaf_count, reference_leaf_count,
+            "{label} has incorrect leaf count: expected {reference_leaf_count}, got {leaf_count}"
         );
     }
 }
