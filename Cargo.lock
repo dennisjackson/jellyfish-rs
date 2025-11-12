@@ -401,6 +401,7 @@ dependencies = [
  "lock_api",
  "once_cell",
  "parking_lot_core 0.9.12",
+ "rayon",
 ]
 
 [[package]]

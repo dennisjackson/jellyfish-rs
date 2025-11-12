@@ -1,6 +1,6 @@
 use dashmap::{DashMap, DashSet};
 use log::{debug, info, warn};
-use rayon::join;
+use rayon::{join, prelude::*};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -356,9 +356,9 @@ impl RockSparseMPT {
             Self::recursive_batch_upsert(self, self.root, &entries_vec, Some(&self.dirty_prefixes));
 
         {
-            let mut writes: Vec<(Prefix, Node)> = self
+            let writes: Vec<(Prefix, Node)> = self
                 .dirty_prefixes
-                .iter()
+                .par_iter()
                 .filter_map(|prefix_ref| {
                     let prefix = *prefix_ref;
                     self.store
@@ -369,7 +369,7 @@ impl RockSparseMPT {
 
             if !writes.is_empty() {
                 // Keep a consistent order for determinism in tests/debugging.
-                writes.sort_unstable_by_key(|(prefix, _)| *prefix);
+                // writes.sort_unstable_by_key(|(prefix, _)| *prefix);
                 tx.batch_write_nodes(&writes)
                     .expect("DB batch write failed");
             }
@@ -936,7 +936,7 @@ impl MerklePatriciaTree for RockSparseMPT {
     fn enumerate_nodes(&self) -> Vec<(Prefix, Node)> {
         self.ensure_full_tree_loaded();
         self.store
-            .iter()
+            .par_iter()
             .map(|entry| (*entry.key(), entry.value().clone()))
             .collect()
     }

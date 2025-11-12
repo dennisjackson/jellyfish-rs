@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::{fmt, io};
 
+use rayon::{prelude::*};
 use rocksdb::{
     DBIteratorWithThreadMode, Direction, IteratorMode, OptimisticTransactionDB, Options,
     Transaction,
@@ -276,10 +277,19 @@ impl<'a> RocksTransaction<'a> {
     }
 
     pub fn batch_write_nodes(&self, entries: &[(Prefix, Node)]) -> RocksResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        // Encoding keys/values dominates the CPU work, so do that in parallel first.
+        let mut serialized = Vec::with_capacity(entries.len());
+        entries
+            .par_iter()
+            .map(|(prefix, node)| (prefix_key(prefix), encode_node(node)))
+            .collect_into_vec(&mut serialized);
+
         let tx = self.inner()?;
-        for (prefix, node) in entries.iter() {
-            let key = prefix_key(prefix);
-            let value = encode_node(node);
+        for (key, value) in serialized {
             tx.put(key, value)?;
         }
         Ok(())
