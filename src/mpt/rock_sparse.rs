@@ -344,7 +344,21 @@ impl RockSparseMPT {
         let updated_interior =
             InteriorNode::new(interior_prefix, new_left, new_right, left_hash, right_hash);
 
-        self.insert_node_memory_only(interior_prefix, Node::Interior(updated_interior));
+        // Check if this interior node is at or below the complete depth
+        // If so, mark it as dirty so it gets persisted to the database
+        let complete_depth = self.complete_interior_depth.load(std::sync::atomic::Ordering::Relaxed);
+        if interior_prefix.length == complete_depth {
+            // This interior node is at or below the complete depth, so it should be persisted
+            if let Some(dirty) = dirty_prefixes.as_ref() {
+                self.insert_node_with_db(dirty, interior_prefix, Node::Interior(updated_interior));
+            } else {
+                self.insert_node_memory_only(interior_prefix, Node::Interior(updated_interior));
+            }
+        } else {
+            // Above the complete depth, keep it in memory only
+            self.insert_node_memory_only(interior_prefix, Node::Interior(updated_interior));
+        }
+
         interior_prefix
     }
 
@@ -441,6 +455,38 @@ impl RockSparseMPT {
         Prefix { hash, length: depth }
     }
 
+    /// Persist all interior nodes at a specific depth to the database in a single transaction.
+    /// This is called when we discover that a depth has become complete.
+    fn persist_interior_nodes_at_depth(&self, depth: u16) -> RocksResult<()> {
+        if depth >= 20 {
+            // Too deep, too many nodes to handle
+            return Ok(());
+        }
+
+        let expected_count = 1u64 << depth; // 2^depth
+        let mut nodes_to_write = Vec::new();
+
+        // Collect all interior nodes at this depth
+        for i in 0..expected_count {
+            let prefix = Self::prefix_from_depth_and_index(depth, i);
+
+            if let Some(node_ref) = self.store.get(&prefix) {
+                if matches!(node_ref.value(), Node::Interior(_)) {
+                    nodes_to_write.push((prefix, node_ref.value().clone()));
+                }
+            }
+        }
+
+        // Write all nodes in a single transaction
+        if !nodes_to_write.is_empty() {
+            let tx = self.storage.start_transaction();
+            tx.batch_write_nodes(&nodes_to_write)?;
+            tx.commit()?;
+        }
+
+        Ok(())
+    }
+
     /// Update the tracked complete interior depth by scanning upward from the current depth.
     /// This is called after a batch upsert to check if new levels have become complete.
     fn update_complete_interior_depth(&self) {
@@ -457,6 +503,12 @@ impl RockSparseMPT {
 
             // Check if the next depth level is complete
             if self.check_depth_complete(next_depth) {
+                // Persist all interior nodes at this newly complete depth
+                if let Err(e) = self.persist_interior_nodes_at_depth(next_depth) {
+                    eprintln!("Warning: Failed to persist interior nodes at depth {}: {}", next_depth, e);
+                    break;
+                }
+
                 current_depth = next_depth;
                 self.complete_interior_depth.store(current_depth, std::sync::atomic::Ordering::Relaxed);
             } else {
