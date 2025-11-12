@@ -240,7 +240,7 @@ impl RockSparseMPT {
         entries.sort_unstable_by_key(|(hash, _)| *hash);
         entries.dedup_by_key(|(hash, _)| *hash);
 
-        let built_prefix = Self::batch_insert_into_empty(self, entries, None);
+        let built_prefix = Self::batch_insert_into_empty(self, &entries, None);
         self.loaded_subtrees.insert(prefix);
         if built_prefix != prefix {
             warn!(
@@ -353,7 +353,7 @@ impl RockSparseMPT {
         self.dirty_prefixes.clear();
         let tx = self.storage.start_transaction();
         let new_root =
-            Self::recursive_batch_upsert(self, self.root, entries_vec, Some(&self.dirty_prefixes));
+            Self::recursive_batch_upsert(self, self.root, &entries_vec, Some(&self.dirty_prefixes));
 
         {
             let mut writes: Vec<(Prefix, Node)> = self
@@ -394,14 +394,14 @@ impl RockSparseMPT {
         entries_vec.sort_unstable_by_key(|(k, _)| *k);
         entries_vec.dedup_by_key(|(k, _)| *k);
 
-        let new_root = Self::recursive_batch_upsert(self, self.root, entries_vec, None);
+        let new_root = Self::recursive_batch_upsert(self, self.root, &entries_vec, None);
         self.root = new_root;
     }
 
     fn recursive_batch_upsert(
         &self,
         current_prefix: Prefix,
-        entries: Vec<(Hash, Hash)>,
+        entries: &[(Hash, Hash)],
         dirty_prefixes: Option<&DirtyPrefixes>,
     ) -> Prefix {
         if entries.is_empty() {
@@ -438,14 +438,14 @@ impl RockSparseMPT {
 
     fn batch_insert_into_empty(
         &self,
-        mut entries: Vec<(Hash, Hash)>,
+        entries: &[(Hash, Hash)],
         dirty_prefixes: Option<&DirtyPrefixes>,
     ) -> Prefix {
         if entries.is_empty() {
             return Prefix::root();
         }
 
-        let (first_key, first_value) = entries.remove(0);
+        let (first_key, first_value) = entries[0];
         let first_prefix = Prefix::from(first_key);
         let first_leaf = LeafNode::new(first_key, first_value);
         if let Some(dirty) = dirty_prefixes.as_ref() {
@@ -453,35 +453,44 @@ impl RockSparseMPT {
         } else {
             self.insert_node_memory_only(first_prefix, Node::Leaf(first_leaf));
         }
-        Self::recursive_batch_upsert(self, first_prefix, entries, dirty_prefixes)
+        Self::recursive_batch_upsert(self, first_prefix, &entries[1..], dirty_prefixes)
     }
 
     fn batch_upsert_at_leaf(
         &self,
         leaf_prefix: Prefix,
         leaf: LeafNode,
-        mut entries: Vec<(Hash, Hash)>,
+        entries: &[(Hash, Hash)],
         dirty_prefixes: Option<&DirtyPrefixes>,
     ) -> Prefix {
         if let Ok(idx) = entries.binary_search_by_key(&leaf_prefix.hash, |(k, _)| *k) {
-            let (_, new_value) = entries.remove(idx);
+            let (_, new_value) = entries[idx];
             let updated_leaf = LeafNode::new(leaf_prefix.hash, new_value);
             if let Some(dirty) = dirty_prefixes.as_ref() {
                 self.insert_node_with_db(dirty, leaf_prefix, Node::Leaf(updated_leaf));
             } else {
                 self.insert_node_memory_only(leaf_prefix, Node::Leaf(updated_leaf));
             }
-            if entries.is_empty() {
+
+            // Special case: if only one entry left after the match, no need for recursion
+            if entries.len() == 1 {
                 return leaf_prefix;
             }
-            return Self::recursive_batch_upsert(self, leaf_prefix, entries, dirty_prefixes);
+
+            // Build combined slice: before + after the matched entry
+            // This still requires allocation but we're being more efficient about it
+            let mut remaining = Vec::with_capacity(entries.len() - 1);
+            remaining.extend_from_slice(&entries[..idx]);
+            remaining.extend_from_slice(&entries[idx + 1..]);
+
+            return Self::recursive_batch_upsert(self, leaf_prefix, &remaining, dirty_prefixes);
         }
 
         if entries.is_empty() {
             return leaf_prefix;
         }
 
-        let (first_key, first_value) = entries.remove(0);
+        let (first_key, first_value) = entries[0];
 
         let new_leaf = LeafNode::new(first_key, first_value);
         let new_prefix = Prefix::from(first_key);
@@ -515,66 +524,81 @@ impl RockSparseMPT {
             self.insert_node_memory_only(new_prefix, Node::Leaf(new_leaf));
         }
 
-        Self::recursive_batch_upsert(self, merged_prefix, entries, dirty_prefixes)
+        Self::recursive_batch_upsert(self, merged_prefix, &entries[1..], dirty_prefixes)
     }
 
     fn batch_upsert_at_interior(
         &self,
         interior_prefix: Prefix,
         interior: InteriorNode,
-        entries: Vec<(Hash, Hash)>,
+        entries: &[(Hash, Hash)],
         dirty_prefixes: Option<&DirtyPrefixes>,
     ) -> Prefix {
-        let (mut contained_entries, mut divergent_entries): (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) =
-            entries
-                .into_iter()
-                .partition(|(k, _)| interior_prefix.contains(k));
+        let len = entries.len();
 
-        if !divergent_entries.is_empty() {
-            let (first_key, first_value) = divergent_entries.remove(0);
-
-            let new_leaf = LeafNode::new(first_key, first_value);
-            let new_leaf_prefix = Prefix::from(first_key);
-            let common = Prefix::common_prefix(&interior_prefix, &new_leaf_prefix);
-
-            let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
-                &common,
-                first_key,
-                new_leaf_prefix,
-                new_leaf.merkle_hash,
-                interior_prefix,
-                interior.merkle_hash,
-            );
-
-            let new_interior =
-                InteriorNode::new(common, left_prefix, right_prefix, left_hash, right_hash);
-
-            if let Some(dirty) = dirty_prefixes.as_ref() {
-                self.insert_node_memory_only(common, Node::Interior(new_interior));
-                self.insert_node_with_db(dirty, new_leaf_prefix, Node::Leaf(new_leaf));
-            } else {
-                self.insert_node_memory_only(common, Node::Interior(new_interior));
-                self.insert_node_memory_only(new_leaf_prefix, Node::Leaf(new_leaf));
+        // Locate the contiguous window of entries covered by this interior node.
+        let mut left_edge = len;
+        for (idx, &(key, _)) in entries.iter().enumerate() {
+            if interior_prefix.contains(&key) {
+                left_edge = idx;
+                break;
             }
-
-            contained_entries.extend(divergent_entries);
-            return Self::recursive_batch_upsert(self, common, contained_entries, dirty_prefixes);
         }
-        let (right_entries, left_entries): (Vec<(Hash, Hash)>, Vec<(Hash, Hash)>) =
-            contained_entries
-                .into_iter()
-                .partition(|(k, _)| interior_prefix.key_goes_right(*k));
 
+        if left_edge == len {
+            // All entries diverge from this prefix.
+            return self.handle_divergent_entries(
+                interior_prefix,
+                interior,
+                entries,
+                dirty_prefixes,
+                0,
+            );
+        }
+
+        let mut right_edge = left_edge;
+        while right_edge < len && interior_prefix.contains(&entries[right_edge].0) {
+            right_edge += 1;
+        }
+
+        // Divergent entries exist on the left side.
+        if left_edge > 0 {
+            return self.handle_divergent_entries(
+                interior_prefix,
+                interior,
+                entries,
+                dirty_prefixes,
+                0,
+            );
+        }
+
+        // Divergent entries exist on the right side.
+        if right_edge < len {
+            return self.handle_divergent_entries(
+                interior_prefix,
+                interior,
+                entries,
+                dirty_prefixes,
+                right_edge,
+            );
+        }
+
+        // All entries are contained, split the window into left and right children.
+        let contained = &entries[left_edge..right_edge];
+        let middle =
+            left_edge + contained.partition_point(|(key, _)| !interior_prefix.key_goes_right(*key));
+        let left_entries = &entries[left_edge..middle];
+        let right_entries = &entries[middle..right_edge];
         let count = left_entries.len() + right_entries.len();
 
-        let (new_left, new_right) = if count > 1_000_024 {
+        let (new_left, new_right) = if count > 64 {
             join(
-                || Self::process_left_entries(self, interior.left, left_entries),
-                || Self::process_right_entries(self, interior.right, right_entries),
+                || Self::process_left_entries(self, interior.left, &left_entries),
+                || Self::process_right_entries(self, interior.right, &right_entries),
             )
         } else {
-            let new_left = Self::process_left_entries(self, interior.left, left_entries);
-            let new_right = Self::process_right_entries(self, interior.right, right_entries);
+            let new_left = Self::process_left_entries(self, interior.left, &left_entries);
+            let new_right = Self::process_right_entries(self, interior.right, &right_entries);
             (new_left, new_right)
         };
 
@@ -611,10 +635,71 @@ impl RockSparseMPT {
         interior_prefix
     }
 
+    fn handle_divergent_entries(
+        &self,
+        interior_prefix: Prefix,
+        interior: InteriorNode,
+        entries: &[(Hash, Hash)],
+        dirty_prefixes: Option<&DirtyPrefixes>,
+        first_idx: usize,
+    ) -> Prefix {
+        let (first_key, first_value) = entries[first_idx];
+        let new_leaf = LeafNode::new(first_key, first_value);
+        let new_leaf_prefix = Prefix::from(first_key);
+        let common = Prefix::common_prefix(&interior_prefix, &new_leaf_prefix);
+
+        let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
+            &common,
+            first_key,
+            new_leaf_prefix,
+            new_leaf.merkle_hash,
+            interior_prefix,
+            interior.merkle_hash,
+        );
+
+        let new_interior =
+            InteriorNode::new(common, left_prefix, right_prefix, left_hash, right_hash);
+
+        if let Some(dirty) = dirty_prefixes.as_ref() {
+            self.insert_node_memory_only(common, Node::Interior(new_interior));
+            self.insert_node_with_db(dirty, new_leaf_prefix, Node::Leaf(new_leaf));
+        } else {
+            self.insert_node_memory_only(common, Node::Interior(new_interior));
+            self.insert_node_memory_only(new_leaf_prefix, Node::Leaf(new_leaf));
+        }
+
+        if entries.len() == 1 {
+            return common;
+        }
+
+        // Reuse the original slices by processing the segments on each side of the divergent entry.
+        let mut result_prefix = common;
+
+        if first_idx > 0 {
+            result_prefix = Self::recursive_batch_upsert(
+                self,
+                result_prefix,
+                &entries[..first_idx],
+                dirty_prefixes,
+            );
+        }
+
+        if first_idx + 1 < entries.len() {
+            result_prefix = Self::recursive_batch_upsert(
+                self,
+                result_prefix,
+                &entries[first_idx + 1..],
+                dirty_prefixes,
+            );
+        }
+
+        result_prefix
+    }
+
     fn process_left_entries(
         &self,
         left_prefix: Prefix,
-        left_entries: Vec<(Hash, Hash)>,
+        left_entries: &[(Hash, Hash)],
     ) -> Prefix {
         if !left_entries.is_empty() {
             Self::recursive_batch_upsert(
@@ -632,7 +717,7 @@ impl RockSparseMPT {
     fn process_right_entries(
         &self,
         right_prefix: Prefix,
-        right_entries: Vec<(Hash, Hash)>,
+        right_entries: &[(Hash, Hash)],
     ) -> Prefix {
         if !right_entries.is_empty() {
             Self::recursive_batch_upsert(
