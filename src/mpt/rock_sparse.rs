@@ -566,37 +566,16 @@ impl RockSparseMPT {
                 .partition(|(k, _)| interior_prefix.key_goes_right(*k));
 
         let count = left_entries.len() + right_entries.len();
-        let l_work = || {
-            if !left_entries.is_empty() {
-                Self::recursive_batch_upsert(
-                    self,
-                    interior.left,
-                    left_entries,
-                    Some(&self.dirty_prefixes),
-                )
-            } else {
-                self.ensure_node_loaded(interior.left);
-                interior.left
-            }
-        };
-        let r_work = || {
-            if !right_entries.is_empty() {
-                Self::recursive_batch_upsert(
-                    self,
-                    interior.right,
-                    right_entries,
-                    Some(&self.dirty_prefixes),
-                )
-            } else {
-                self.ensure_node_loaded(interior.right);
-                interior.right
-            }
-        };
 
-        let (new_left, new_right) = if count > 1024 {
-            join(l_work, r_work)
+        let (new_left, new_right) = if count > 1_000_024 {
+            join(
+                || Self::process_left_entries(self, interior.left, left_entries),
+                || Self::process_right_entries(self, interior.right, right_entries),
+            )
         } else {
-            (l_work(), r_work())
+            let new_left = Self::process_left_entries(self, interior.left, left_entries);
+            let new_right = Self::process_right_entries(self, interior.right, right_entries);
+            (new_left, new_right)
         };
 
         let left_hash = self
@@ -630,6 +609,42 @@ impl RockSparseMPT {
         }
 
         interior_prefix
+    }
+
+    fn process_left_entries(
+        &self,
+        left_prefix: Prefix,
+        left_entries: Vec<(Hash, Hash)>,
+    ) -> Prefix {
+        if !left_entries.is_empty() {
+            Self::recursive_batch_upsert(
+                self,
+                left_prefix,
+                left_entries,
+                Some(&self.dirty_prefixes),
+            )
+        } else {
+            self.ensure_node_loaded(left_prefix);
+            left_prefix
+        }
+    }
+
+    fn process_right_entries(
+        &self,
+        right_prefix: Prefix,
+        right_entries: Vec<(Hash, Hash)>,
+    ) -> Prefix {
+        if !right_entries.is_empty() {
+            Self::recursive_batch_upsert(
+                self,
+                right_prefix,
+                right_entries,
+                Some(&self.dirty_prefixes),
+            )
+        } else {
+            self.ensure_node_loaded(right_prefix);
+            right_prefix
+        }
     }
 
     fn order_children(
