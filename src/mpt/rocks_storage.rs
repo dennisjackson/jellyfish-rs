@@ -1,16 +1,18 @@
-use std::{fmt, io};
 use std::path::Path;
+use std::{fmt, io};
 
 use rocksdb::{
-    DBIteratorWithThreadMode, IteratorMode, OptimisticTransactionDB, Options, Transaction,
+    DBIteratorWithThreadMode, Direction, IteratorMode, OptimisticTransactionDB, Options,
+    Transaction,
 };
 
-use crate::Prefix;
+use crate::{Hash, Prefix, prefix::HashExt};
 
-use super::sled_storage::{
-    decode_node, decode_prefix, encode_node, encode_prefix, prefix_key, ROOT_KEY, COMPLETE_DEPTH_KEY,
-};
 use super::Node;
+use super::sled_storage::{
+    COMPLETE_DEPTH_KEY, ROOT_KEY, decode_node, decode_prefix, encode_node, encode_prefix,
+    prefix_key,
+};
 
 pub type RocksResult<T> = Result<T, RocksStorageError>;
 
@@ -111,40 +113,88 @@ impl RocksStorage {
     /// all leaf nodes whose 256-bit hashes start with "1010".
     pub fn get_leaf_nodes_by_prefix(&self, prefix: &Prefix) -> RocksResult<Vec<(Prefix, Node)>> {
         let mut results = Vec::new();
+        let (start_hash, end_hash) = Self::leaf_range_bounds(prefix);
+        let start_key = Self::leaf_key_from_hash(&start_hash);
+        let end_key = end_hash.map(|hash| Self::leaf_key_from_hash(&hash));
 
-        // Construct the key prefix: <length=256 (2 bytes)> || <hash prefix>
-        // We want to match all keys that start with length 256 and the given hash prefix
-        let mut key_prefix = Vec::with_capacity(2 + 32);
-        // Add length field for leaf nodes (256)
-        key_prefix.extend_from_slice(&256u16.to_be_bytes());
-        // Add the hash prefix (only the relevant bytes based on prefix.length)
-        let num_bytes = ((prefix.length + 7) / 8) as usize; // Round up to nearest byte
-        key_prefix.extend_from_slice(&prefix.hash[..num_bytes]);
-
-        // Use RocksDB's prefix iterator with the constructed key
-        let iter = self.db.prefix_iterator(&key_prefix);
+        let iter = self
+            .db
+            .iterator(IteratorMode::From(start_key.as_slice(), Direction::Forward));
 
         for entry in iter {
             match entry {
                 Ok((key, value)) => {
-                    // Decode the prefix from the key
+                    if !Self::is_leaf_key(key.as_ref()) {
+                        break;
+                    }
+                    if let Some(ref end) = end_key {
+                        if key.as_ref() >= end.as_slice() {
+                            break;
+                        }
+                    }
+
                     let node_prefix = match decode_prefix(key.as_ref()) {
                         Ok(prefix) => prefix,
                         Err(err) => return Err(err.into()),
                     };
 
-                    // Double-check that this is a leaf node (length 256) and matches our prefix
-                    if node_prefix.length == 256 && prefix.prefix_of(&node_prefix) {
-                        // Decode the node
-                        let node = decode_node(value.as_ref())?;
-                        results.push((node_prefix, node));
+                    if node_prefix.length != 256 {
+                        break;
                     }
+                    if !prefix.prefix_of(&node_prefix) {
+                        break;
+                    }
+
+                    let node = decode_node(value.as_ref())?;
+                    results.push((node_prefix, node));
                 }
                 Err(err) => return Err(err.into()),
             }
         }
 
         Ok(results)
+    }
+
+    fn leaf_key_from_hash(hash: &Hash) -> Vec<u8> {
+        let mut key = Vec::with_capacity(34);
+        key.extend_from_slice(&256u16.to_be_bytes());
+        key.extend_from_slice(hash);
+        key
+    }
+
+    fn is_leaf_key(key: &[u8]) -> bool {
+        key.len() >= 2 && key[0] == 0x01 && key[1] == 0x00
+    }
+
+    fn leaf_range_bounds(prefix: &Prefix) -> (Hash, Option<Hash>) {
+        let start_hash = prefix.hash.zero_bits_from(prefix.length);
+        let end_hash = if prefix.length == 0 {
+            None
+        } else {
+            Self::next_prefix_hash(start_hash, prefix.length)
+        };
+        (start_hash, end_hash)
+    }
+
+    fn next_prefix_hash(mut hash: Hash, length: u16) -> Option<Hash> {
+        if length > 256 || length == 0 {
+            return None;
+        }
+
+        let mut bit = length as i32 - 1;
+        while bit >= 0 {
+            let byte_index = (bit / 8) as usize;
+            let bit_index = 7 - (bit % 8);
+            let mask = 1 << bit_index;
+            if hash[byte_index] & mask == 0 {
+                hash[byte_index] |= mask;
+                return Some(hash);
+            } else {
+                hash[byte_index] &= !mask;
+                bit -= 1;
+            }
+        }
+        None
     }
 
     /// Get all nodes at a specific prefix length.
@@ -161,14 +211,12 @@ impl RocksStorage {
 
         for entry in iter {
             match entry {
-
                 Ok((key, value)) => {
                     // Decode the prefix from the key
                     let prefix = match decode_prefix(key.as_ref()) {
                         Ok(prefix) => prefix,
                         Err(err) => return Err(err.into()),
                     };
-
 
                     // Decode the node
                     let node = decode_node(value.as_ref())?;
@@ -361,7 +409,9 @@ mod tests {
 
         // Query on empty tree should return empty
         let root = Prefix::root();
-        let results = storage.get_leaf_nodes_by_prefix(&root).expect("query by prefix");
+        let results = storage
+            .get_leaf_nodes_by_prefix(&root)
+            .expect("query by prefix");
         assert_eq!(results.len(), 0);
     }
 
@@ -383,7 +433,9 @@ mod tests {
 
         // Root prefix (length 0) should match all leaf nodes
         let root = Prefix::root();
-        let results = storage.get_leaf_nodes_by_prefix(&root).expect("query by prefix");
+        let results = storage
+            .get_leaf_nodes_by_prefix(&root)
+            .expect("query by prefix");
         assert_eq!(results.len(), 3);
     }
 
@@ -412,7 +464,9 @@ mod tests {
         let prefix = Prefix { hash, length: 1 };
 
         // Should match the two leaf nodes starting with 1 (0x80 and 0xFF)
-        let results = storage.get_leaf_nodes_by_prefix(&prefix).expect("query by prefix");
+        let results = storage
+            .get_leaf_nodes_by_prefix(&prefix)
+            .expect("query by prefix");
         assert_eq!(results.len(), 2);
 
         // Verify the results
@@ -428,10 +482,7 @@ mod tests {
         let storage = RocksStorage::open(dir.path()).expect("open rocksdb");
 
         // Insert nodes with first bit = 0
-        let entries = vec![
-            build_leaf(0x00, 1),
-            build_leaf(0x01, 2),
-        ];
+        let entries = vec![build_leaf(0x00, 1), build_leaf(0x01, 2)];
 
         let tx = storage.start_transaction();
         tx.batch_write_nodes(&entries).expect("write batch");
@@ -442,7 +493,9 @@ mod tests {
         hash[0] = 0x80;
         let prefix = Prefix { hash, length: 1 };
 
-        let results = storage.get_leaf_nodes_by_prefix(&prefix).expect("query by prefix");
+        let results = storage
+            .get_leaf_nodes_by_prefix(&prefix)
+            .expect("query by prefix");
         assert_eq!(results.len(), 0);
     }
 
@@ -468,7 +521,9 @@ mod tests {
         let prefix = Prefix::from(hash);
 
         // Should match exactly one node with this exact hash
-        let results = storage.get_leaf_nodes_by_prefix(&prefix).expect("query by prefix");
+        let results = storage
+            .get_leaf_nodes_by_prefix(&prefix)
+            .expect("query by prefix");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0.hash, hash);
     }
@@ -498,7 +553,9 @@ mod tests {
         let prefix = Prefix { hash, length: 4 };
 
         // Should match the two nodes starting with 1111 (0xF0 and 0xF8)
-        let results = storage.get_leaf_nodes_by_prefix(&prefix).expect("query by prefix");
+        let results = storage
+            .get_leaf_nodes_by_prefix(&prefix)
+            .expect("query by prefix");
         assert_eq!(results.len(), 2);
 
         let keys: Vec<u8> = results.iter().map(|(p, _)| p.hash[0]).collect();
@@ -512,7 +569,9 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let storage = RocksStorage::open(dir.path()).expect("open rocksdb");
 
-        let results = storage.get_nodes_by_prefix_length(256).expect("query by length");
+        let results = storage
+            .get_nodes_by_prefix_length(256)
+            .expect("query by length");
         assert_eq!(results.len(), 0);
     }
 
@@ -533,7 +592,9 @@ mod tests {
         tx.commit().expect("commit");
 
         // Query for length 256
-        let results = storage.get_nodes_by_prefix_length(256).expect("query by length");
+        let results = storage
+            .get_nodes_by_prefix_length(256)
+            .expect("query by length");
         assert_eq!(results.len(), 3);
 
         // All results should have length 256
@@ -550,15 +611,24 @@ mod tests {
         // Create nodes with different prefix lengths
         let mut hash1 = [0u8; 32];
         hash1[0] = 0x00;
-        let prefix1 = Prefix { hash: hash1, length: 4 };
+        let prefix1 = Prefix {
+            hash: hash1,
+            length: 4,
+        };
 
         let mut hash2 = [0u8; 32];
         hash2[0] = 0x10;
-        let prefix2 = Prefix { hash: hash2, length: 4 };
+        let prefix2 = Prefix {
+            hash: hash2,
+            length: 4,
+        };
 
         let mut hash3 = [0u8; 32];
         hash3[0] = 0x80;
-        let prefix3 = Prefix { hash: hash3, length: 8 };
+        let prefix3 = Prefix {
+            hash: hash3,
+            length: 8,
+        };
 
         // Full length nodes
         let (prefix4, node4) = build_leaf(0xFF, 1);
@@ -575,24 +645,33 @@ mod tests {
         tx.commit().expect("commit");
 
         // Query for length 4
-        let results_4 = storage.get_nodes_by_prefix_length(4).expect("query by length 4");
+        let results_4 = storage
+            .get_nodes_by_prefix_length(4)
+            .expect("query by length 4");
+        println!("results_4 = {:?}", results_4);
         assert_eq!(results_4.len(), 2);
         for (prefix, _) in &results_4 {
             assert_eq!(prefix.length, 4);
         }
 
         // Query for length 8
-        let results_8 = storage.get_nodes_by_prefix_length(8).expect("query by length 8");
+        let results_8 = storage
+            .get_nodes_by_prefix_length(8)
+            .expect("query by length 8");
         assert_eq!(results_8.len(), 1);
         assert_eq!(results_8[0].0.length, 8);
 
         // Query for length 256
-        let results_256 = storage.get_nodes_by_prefix_length(256).expect("query by length 256");
+        let results_256 = storage
+            .get_nodes_by_prefix_length(256)
+            .expect("query by length 256");
         assert_eq!(results_256.len(), 1);
         assert_eq!(results_256[0].0.length, 256);
 
         // Query for length that doesn't exist
-        let results_16 = storage.get_nodes_by_prefix_length(16).expect("query by length 16");
+        let results_16 = storage
+            .get_nodes_by_prefix_length(16)
+            .expect("query by length 16");
         assert_eq!(results_16.len(), 0);
     }
 
@@ -616,7 +695,9 @@ mod tests {
         tx.commit().expect("commit");
 
         // Query for length 16
-        let results = storage.get_nodes_by_prefix_length(16).expect("query by length 16");
+        let results = storage
+            .get_nodes_by_prefix_length(16)
+            .expect("query by length 16");
         assert_eq!(results.len(), 10);
 
         // Verify all have length 16
@@ -626,7 +707,7 @@ mod tests {
 
         // Results should be ordered by hash (since keys are <length> || <hash>)
         for i in 1..results.len() {
-            assert!(results[i-1].0.hash <= results[i].0.hash);
+            assert!(results[i - 1].0.hash <= results[i].0.hash);
         }
     }
 
@@ -641,30 +722,53 @@ mod tests {
         // Length 4, starting with 0000
         let mut hash1 = [0u8; 32];
         hash1[0] = 0x00;
-        entries.push((Prefix { hash: hash1, length: 4 }, Node::Leaf(LeafNode::new(hash1, [1u8; 32]))));
+        entries.push((
+            Prefix {
+                hash: hash1,
+                length: 4,
+            },
+            Node::Leaf(LeafNode::new(hash1, [1u8; 32])),
+        ));
 
         // Length 4, starting with 1111
         let mut hash2 = [0u8; 32];
         hash2[0] = 0xF0;
-        entries.push((Prefix { hash: hash2, length: 4 }, Node::Leaf(LeafNode::new(hash2, [2u8; 32]))));
+        entries.push((
+            Prefix {
+                hash: hash2,
+                length: 4,
+            },
+            Node::Leaf(LeafNode::new(hash2, [2u8; 32])),
+        ));
 
         // Length 8, starting with 0000
         let mut hash3 = [0u8; 32];
         hash3[0] = 0x00;
-        entries.push((Prefix { hash: hash3, length: 8 }, Node::Leaf(LeafNode::new(hash3, [3u8; 32]))));
+        entries.push((
+            Prefix {
+                hash: hash3,
+                length: 8,
+            },
+            Node::Leaf(LeafNode::new(hash3, [3u8; 32])),
+        ));
 
         let tx = storage.start_transaction();
         tx.batch_write_nodes(&entries).expect("write batch");
         tx.commit().expect("commit");
 
         // Get all length 4 nodes
-        let length_4 = storage.get_nodes_by_prefix_length(4).expect("query by length");
+        let length_4 = storage
+            .get_nodes_by_prefix_length(4)
+            .expect("query by length");
         assert_eq!(length_4.len(), 2);
 
         // Among length 4 nodes, filter by prefix
         let mut prefix_filter = [0u8; 32];
         prefix_filter[0] = 0x00;
-        let filter_prefix = Prefix { hash: prefix_filter, length: 1 };
+        let filter_prefix = Prefix {
+            hash: prefix_filter,
+            length: 1,
+        };
 
         let matching: Vec<_> = length_4
             .iter()
@@ -674,4 +778,3 @@ mod tests {
         assert_eq!(matching[0].0.hash[0], 0x00);
     }
 }
-

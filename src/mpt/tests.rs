@@ -1,7 +1,7 @@
 use log::trace;
 
-use super::*;
 use super::rocks_storage::RocksResult;
+use super::*;
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -133,7 +133,8 @@ where
     };
 
     let (root3, leaf_count3) = {
-        let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} third open failed: {e}"));
+        let mut tree =
+            constructor(path).unwrap_or_else(|e| panic!("{label} third open failed: {e}"));
         tree.batch_upsert(further_entries);
         let root = tree
             .get_root_hash()
@@ -180,7 +181,8 @@ where
     };
 
     let (root3, leaf_count3) = {
-        let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} third open failed: {e}"));
+        let mut tree =
+            constructor(path).unwrap_or_else(|e| panic!("{label} third open failed: {e}"));
         tree.batch_upsert(further_entries);
         let root = tree
             .get_root_hash()
@@ -227,7 +229,8 @@ where
     };
 
     let (root3, leaf_count3) = {
-        let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} third open failed: {e}"));
+        let mut tree =
+            constructor(path).unwrap_or_else(|e| panic!("{label} third open failed: {e}"));
         tree.batch_upsert(further_entries);
         let root = tree
             .get_root_hash()
@@ -768,10 +771,13 @@ test_all_impls!(test_batch_upsert_incremental, {
 
 #[test]
 fn test_persistent_reopen_consistency() {
-    use rand::{RngCore, SeedableRng};
     use rand::rngs::StdRng;
+    use rand::{RngCore, SeedableRng};
 
-    let _ = env_logger::builder().is_test(true).filter(None, log::LevelFilter::Debug).try_init();
+    let _ = env_logger::builder()
+        .is_test(true)
+        .filter(None, log::LevelFilter::Debug)
+        .try_init();
 
     // Use a seeded RNG for reproducible random hashes
     let mut rng = StdRng::seed_from_u64(42);
@@ -826,7 +832,15 @@ fn test_persistent_reopen_consistency() {
                     &further_entries,
                     |p| <$impl_type>::new_with_path(p),
                 );
-            results.push(($name, root1, leaf_count1, root2, leaf_count2, root3, leaf_count3));
+            results.push((
+                $name,
+                root1,
+                leaf_count1,
+                root2,
+                leaf_count2,
+                root3,
+                leaf_count3,
+            ));
         }};
     }
 
@@ -843,7 +857,15 @@ fn test_persistent_reopen_consistency() {
                     &further_entries,
                     |p| <$impl_type>::new_with_path(p),
                 );
-            results.push(($name, root1, leaf_count1, root2, leaf_count2, root3, leaf_count3));
+            results.push((
+                $name,
+                root1,
+                leaf_count1,
+                root2,
+                leaf_count2,
+                root3,
+                leaf_count3,
+            ));
         }};
     }
 
@@ -860,7 +882,15 @@ fn test_persistent_reopen_consistency() {
                     &further_entries,
                     |p| <$impl_type>::new_with_path(p),
                 );
-            results.push(($name, root1, leaf_count1, root2, leaf_count2, root3, leaf_count3));
+            results.push((
+                $name,
+                root1,
+                leaf_count1,
+                root2,
+                leaf_count2,
+                root3,
+                leaf_count3,
+            ));
         }};
     }
 
@@ -875,7 +905,8 @@ fn test_persistent_reopen_consistency() {
     test_rocks_impl!(RockSparseMPT, "RockSparseMPT", "rock_sparse");
 
     // Use the first implementation as reference
-    let (reference_label, ref_root1, ref_count1, ref_root2, ref_count2, ref_root3, ref_count3) = results[0];
+    let (reference_label, ref_root1, ref_count1, ref_root2, ref_count2, ref_root3, ref_count3) =
+        results[0];
 
     // Verify all implementations produce the same results after each batch
     for (label, root1, count1, root2, count2, root3, count3) in results.iter().copied() {

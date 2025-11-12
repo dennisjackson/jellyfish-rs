@@ -4,8 +4,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 
 use sled::{Batch, Config, Error};
 
@@ -301,7 +301,10 @@ impl Iterator for SledNodeIter {
             match entry {
                 Ok((key, value)) => {
                     let key_ref = key.as_ref();
-                    if key_ref == ROOT_KEY || key_ref == LEAF_COUNT_KEY || key_ref == COMPLETE_DEPTH_KEY {
+                    if key_ref == ROOT_KEY
+                        || key_ref == LEAF_COUNT_KEY
+                        || key_ref == COMPLETE_DEPTH_KEY
+                    {
                         continue;
                     }
                     let prefix = match decode_prefix(key_ref) {

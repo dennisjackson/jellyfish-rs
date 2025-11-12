@@ -32,7 +32,7 @@ pub struct RockSparseMPT {
     /// Tracks the depth (prefix length) where all nodes exist and are interior nodes.
     /// At depth D, there should be 2^D interior nodes for this depth to be considered complete.
     complete_interior_depth: AtomicU16,
-    prefix_loads: AtomicU64
+    prefix_loads: AtomicU64,
 }
 
 impl RockSparseMPT {
@@ -59,10 +59,7 @@ impl RockSparseMPT {
     fn recover_full_tree_from_storage(&mut self) -> RocksResult<()> {
         const RECOVERY_CHUNK: usize = 1024 * 1024;
         let mut leaf_entries: Vec<(Hash, Hash)> = Vec::with_capacity(RECOVERY_CHUNK);
-        let stored_nodes = self
-            .storage
-            .iter_nodes()
-            .collect::<RocksResult<Vec<_>>>()?;
+        let stored_nodes = self.storage.iter_nodes().collect::<RocksResult<Vec<_>>>()?;
         for (prefix, node) in stored_nodes {
             if let Node::Leaf(leaf) = node {
                 leaf_entries.push((prefix.hash, leaf.value));
@@ -89,7 +86,11 @@ impl RockSparseMPT {
                 _ => None,
             })
             .collect();
-        info!("Loaded {} interior nodes at depth {} from storage", interior_nodes.len(), depth);
+        info!(
+            "Loaded {} interior nodes at depth {} from storage",
+            interior_nodes.len(),
+            depth
+        );
         if interior_nodes.is_empty() {
             return Ok(false);
         }
@@ -161,8 +162,13 @@ impl RockSparseMPT {
                     Some(child) => child,
                     None => return false,
                 };
-                let parent_node =
-                    InteriorNode::new(parent_prefix, left_prefix, right_prefix, left_hash, right_hash);
+                let parent_node = InteriorNode::new(
+                    parent_prefix,
+                    left_prefix,
+                    right_prefix,
+                    left_hash,
+                    right_hash,
+                );
                 next_nodes.push((parent_prefix, parent_node));
             }
 
@@ -184,7 +190,10 @@ impl RockSparseMPT {
     }
 
     fn is_right_child(prefix: &Prefix) -> bool {
-        assert!(prefix.length > 0, "Root prefix cannot be classified as child");
+        assert!(
+            prefix.length > 0,
+            "Root prefix cannot be classified as child"
+        );
         prefix.hash.get_bit(prefix.length - 1)
     }
 
@@ -234,18 +243,28 @@ impl RockSparseMPT {
         let built_prefix = Self::batch_insert_into_empty(self, entries, None);
         self.loaded_subtrees.insert(prefix);
         if built_prefix != prefix {
-            warn!("Loaded subtree prefix {} does not match built prefix {}",
+            warn!(
+                "Loaded subtree prefix {} does not match built prefix {}",
                 prefix.short_hex(),
-                built_prefix.short_hex());
+                built_prefix.short_hex()
+            );
             self.loaded_subtrees.insert(built_prefix);
         }
-        debug!("Loaded subtree prefix {} successfully from {} leaf nodes", prefix.short_hex(), loaded_nodes);
+        debug!(
+            "Loaded subtree prefix {} successfully from {} leaf nodes",
+            prefix.short_hex(),
+            loaded_nodes
+        );
         Ok(true)
     }
 
     fn load_prefix_or_panic(&self, prefix: Prefix) {
         if let Err(err) = self.load_subtree_from_storage(prefix) {
-            panic!("Failed to load prefix {} from RocksDB: {}", prefix.short_hex(), err);
+            panic!(
+                "Failed to load prefix {} from RocksDB: {}",
+                prefix.short_hex(),
+                err
+            );
         }
     }
 
@@ -322,22 +341,23 @@ impl RockSparseMPT {
             return;
         }
 
-        info!("Beginning batch upsert. Prefix Loads: {} Loaded prefixes: {}", self.prefix_loads.load(Ordering::Relaxed), self.loaded_subtrees.len());
+        info!(
+            "Beginning batch upsert. Prefix Loads: {} Loaded prefixes: {}",
+            self.prefix_loads.load(Ordering::Relaxed),
+            self.loaded_subtrees.len()
+        );
         let mut entries_vec: Vec<(Hash, Hash)> = entries.to_vec();
         entries_vec.sort_unstable_by_key(|(k, _)| *k);
         entries_vec.dedup_by_key(|(k, _)| *k);
 
         self.dirty_prefixes.clear();
         let tx = self.storage.start_transaction();
-        let new_root = Self::recursive_batch_upsert(
-            self,
-            self.root,
-            entries_vec,
-            Some(&self.dirty_prefixes),
-        );
+        let new_root =
+            Self::recursive_batch_upsert(self, self.root, entries_vec, Some(&self.dirty_prefixes));
 
         {
-            let mut writes: Vec<(Prefix, Node)> = self.dirty_prefixes
+            let mut writes: Vec<(Prefix, Node)> = self
+                .dirty_prefixes
                 .iter()
                 .filter_map(|prefix_ref| {
                     let prefix = *prefix_ref;
@@ -355,8 +375,7 @@ impl RockSparseMPT {
             }
         }
 
-        tx.set_root(new_root)
-            .expect("Failed to update root in DB");
+        tx.set_root(new_root).expect("Failed to update root in DB");
 
         // Update and persist the complete interior depth in the same transaction
         self.update_complete_interior_depth(&tx);
@@ -407,15 +426,13 @@ impl RockSparseMPT {
             Node::Leaf(leaf) => {
                 Self::batch_upsert_at_leaf(self, current_prefix, leaf, entries, dirty_prefixes)
             }
-            Node::Interior(interior) => {
-                Self::batch_upsert_at_interior(
-                    self,
-                    current_prefix,
-                    interior,
-                    entries,
-                    dirty_prefixes,
-                )
-            }
+            Node::Interior(interior) => Self::batch_upsert_at_interior(
+                self,
+                current_prefix,
+                interior,
+                entries,
+                dirty_prefixes,
+            ),
         }
     }
 
@@ -551,7 +568,12 @@ impl RockSparseMPT {
         let count = left_entries.len() + right_entries.len();
         let l_work = || {
             if !left_entries.is_empty() {
-                Self::recursive_batch_upsert(self, interior.left, left_entries, Some(&self.dirty_prefixes))
+                Self::recursive_batch_upsert(
+                    self,
+                    interior.left,
+                    left_entries,
+                    Some(&self.dirty_prefixes),
+                )
             } else {
                 self.ensure_node_loaded(interior.left);
                 interior.left
@@ -559,7 +581,12 @@ impl RockSparseMPT {
         };
         let r_work = || {
             if !right_entries.is_empty() {
-                Self::recursive_batch_upsert(self, interior.right, right_entries, Some(&self.dirty_prefixes))
+                Self::recursive_batch_upsert(
+                    self,
+                    interior.right,
+                    right_entries,
+                    Some(&self.dirty_prefixes),
+                )
             } else {
                 self.ensure_node_loaded(interior.right);
                 interior.right
@@ -643,7 +670,9 @@ impl RockSparseMPT {
     fn check_depth_complete(&self, depth: u16) -> bool {
         // The root (depth 0) is always considered complete if it exists as an interior
         if depth == 0 {
-            let is_interior = self.store.get(&Prefix::root())
+            let is_interior = self
+                .store
+                .get(&Prefix::root())
                 .map(|n| matches!(n.value(), Node::Interior(_)))
                 .unwrap_or(false);
             return is_interior;
@@ -695,12 +724,19 @@ impl RockSparseMPT {
             }
         }
 
-        Prefix { hash, length: depth }
+        Prefix {
+            hash,
+            length: depth,
+        }
     }
 
     /// Persist all interior nodes at a specific depth to the database in the given transaction.
     /// This is called when we discover that a depth has become complete.
-    fn persist_interior_nodes_at_depth_in_tx(&self, depth: u16, tx: &super::rocks_storage::RocksTransaction) -> RocksResult<()> {
+    fn persist_interior_nodes_at_depth_in_tx(
+        &self,
+        depth: u16,
+        tx: &super::rocks_storage::RocksTransaction,
+    ) -> RocksResult<()> {
         if depth >= 20 {
             // Too deep, too many nodes to handle
             return Ok(());
@@ -749,7 +785,7 @@ impl RockSparseMPT {
             } else {
                 (leaf_nodes as f64).log2().ceil() as u16
             };
-            if current_depth > log_leaf_nodes - 13 {
+            if current_depth > log_leaf_nodes.saturating_sub(13) {
                 // Don't want depth to be close to true frontier
                 break;
             }
@@ -758,12 +794,16 @@ impl RockSparseMPT {
             if self.check_depth_complete(next_depth) {
                 // Persist all interior nodes at this newly complete depth to the database
                 if let Err(e) = self.persist_interior_nodes_at_depth_in_tx(next_depth, tx) {
-                    eprintln!("Warning: Failed to persist interior nodes at depth {}: {}", next_depth, e);
+                    eprintln!(
+                        "Warning: Failed to persist interior nodes at depth {}: {}",
+                        next_depth, e
+                    );
                     break;
                 }
 
                 current_depth = next_depth;
-                self.complete_interior_depth.store(current_depth, Ordering::Relaxed);
+                self.complete_interior_depth
+                    .store(current_depth, Ordering::Relaxed);
             } else {
                 // If this level is incomplete, we're done
                 break;
@@ -772,7 +812,10 @@ impl RockSparseMPT {
 
         // Persist the updated depth to the database
         if let Err(e) = tx.set_complete_depth(current_depth) {
-            eprintln!("Warning: Failed to persist complete depth {}: {}", current_depth, e);
+            eprintln!(
+                "Warning: Failed to persist complete depth {}: {}",
+                current_depth, e
+            );
         }
     }
 }
@@ -812,9 +855,7 @@ impl MerklePatriciaTree for RockSparseMPT {
             .map(|guard| guard.value().clone())
             .or_else(|| {
                 self.load_prefix_or_panic(prefix);
-                self.store
-                    .get(&prefix)
-                    .map(|guard| guard.value().clone())
+                self.store.get(&prefix).map(|guard| guard.value().clone())
             });
         match node {
             Some(Node::Leaf(leaf)) => Some(leaf.value),

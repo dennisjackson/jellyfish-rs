@@ -92,15 +92,12 @@ impl RockLeafMPT {
 
         self.dirty_prefixes.clear();
         let tx = self.storage.start_transaction();
-        let new_root = Self::recursive_batch_upsert(
-            self,
-            self.root,
-            entries_vec,
-            Some(&self.dirty_prefixes),
-        );
+        let new_root =
+            Self::recursive_batch_upsert(self, self.root, entries_vec, Some(&self.dirty_prefixes));
 
         {
-            let mut writes: Vec<(Prefix, Node)> = self.dirty_prefixes
+            let mut writes: Vec<(Prefix, Node)> = self
+                .dirty_prefixes
                 .iter()
                 .filter_map(|prefix_ref| {
                     let prefix = *prefix_ref;
@@ -118,8 +115,7 @@ impl RockLeafMPT {
             }
         }
 
-        tx.set_root(new_root)
-            .expect("Failed to update root in DB");
+        tx.set_root(new_root).expect("Failed to update root in DB");
         tx.commit().expect("Failed to commit batch upsert");
         self.root = new_root;
         self.dirty_prefixes.clear();
@@ -160,15 +156,13 @@ impl RockLeafMPT {
             Node::Leaf(leaf) => {
                 Self::batch_upsert_at_leaf(self, current_prefix, leaf, entries, dirty_prefixes)
             }
-            Node::Interior(interior) => {
-                Self::batch_upsert_at_interior(
-                    self,
-                    current_prefix,
-                    interior,
-                    entries,
-                    dirty_prefixes,
-                )
-            }
+            Node::Interior(interior) => Self::batch_upsert_at_interior(
+                self,
+                current_prefix,
+                interior,
+                entries,
+                dirty_prefixes,
+            ),
         }
     }
 
@@ -304,14 +298,24 @@ impl RockLeafMPT {
         let count = left_entries.len() + right_entries.len();
         let l_work = || {
             if !left_entries.is_empty() {
-                Self::recursive_batch_upsert(self, interior.left, left_entries, Some(&self.dirty_prefixes))
+                Self::recursive_batch_upsert(
+                    self,
+                    interior.left,
+                    left_entries,
+                    Some(&self.dirty_prefixes),
+                )
             } else {
                 interior.left
             }
         };
         let r_work = || {
             if !right_entries.is_empty() {
-                Self::recursive_batch_upsert(self, interior.right, right_entries, Some(&self.dirty_prefixes))
+                Self::recursive_batch_upsert(
+                    self,
+                    interior.right,
+                    right_entries,
+                    Some(&self.dirty_prefixes),
+                )
             } else {
                 interior.right
             }
