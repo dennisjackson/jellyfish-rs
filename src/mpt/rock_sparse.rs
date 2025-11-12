@@ -341,7 +341,7 @@ impl RockSparseMPT {
             return;
         }
 
-        info!(
+        debug!(
             "Beginning batch upsert. Prefix Loads: {} Loaded prefixes: {}",
             self.prefix_loads.load(Ordering::Relaxed),
             self.loaded_subtrees.len()
@@ -593,7 +593,7 @@ impl RockSparseMPT {
             }
         };
 
-        let (new_left, new_right) = if count > 10 {
+        let (new_left, new_right) = if count > 1024 {
             join(l_work, r_work)
         } else {
             (l_work(), r_work())
@@ -785,7 +785,7 @@ impl RockSparseMPT {
             } else {
                 (leaf_nodes as f64).log2().ceil() as u16
             };
-            if current_depth > log_leaf_nodes.saturating_sub(13) {
+            if current_depth > log_leaf_nodes.saturating_sub(10) {
                 // Don't want depth to be close to true frontier
                 break;
             }
