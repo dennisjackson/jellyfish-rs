@@ -1,3 +1,5 @@
+use log::trace;
+
 use super::*;
 use super::rocks_storage::RocksResult;
 use std::{
@@ -67,7 +69,7 @@ fn count_leaf_nodes<T: MerklePatriciaTree>(mpt: &T) -> usize {
         .iter()
         .filter(|(_, node)| matches!(node, Node::Leaf(_)))
     {
-        println!("Leaf node: {:?}", x);
+        trace!("Leaf node: {:?}", x);
         count += 1;
     }
     count
@@ -104,30 +106,44 @@ fn run_sled_persistence_test<T, F>(
     additional_entries: &[(Hash, Hash)],
     further_entries: &[(Hash, Hash)],
     mut constructor: F,
-) -> (Hash, usize)
+) -> (Hash, usize, Hash, usize, Hash, usize)
 where
     T: MerklePatriciaTree,
     F: FnMut(&Path) -> sled::Result<T>,
 {
-    {
+    let (root1, leaf_count1) = {
         let mut tree =
             constructor(path).unwrap_or_else(|e| panic!("{label} initial open failed: {e}"));
         tree.batch_upsert(initial_entries);
-    }
+        let root = tree
+            .get_root_hash()
+            .unwrap_or_else(|| panic!("{label} root after batch 1 was None"));
+        let leaf_count = count_leaf_nodes(&tree);
+        (root, leaf_count)
+    };
 
-    {
+    let (root2, leaf_count2) = {
         let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} reopen failed: {e}"));
         tree.batch_upsert(additional_entries);
-    }
+        let root = tree
+            .get_root_hash()
+            .unwrap_or_else(|| panic!("{label} root after batch 2 was None"));
+        let leaf_count = count_leaf_nodes(&tree);
+        (root, leaf_count)
+    };
 
-    let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} third open failed: {e}"));
-    tree.batch_upsert(further_entries);
-    let root = tree
-        .get_root_hash()
-        .unwrap_or_else(|| panic!("{label} final root was None"));
-    let leaf_count = count_leaf_nodes(&tree);
-    drop(tree);
-    (root, leaf_count)
+    let (root3, leaf_count3) = {
+        let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} third open failed: {e}"));
+        tree.batch_upsert(further_entries);
+        let root = tree
+            .get_root_hash()
+            .unwrap_or_else(|| panic!("{label} root after batch 3 was None"));
+        let leaf_count = count_leaf_nodes(&tree);
+        drop(tree);
+        (root, leaf_count)
+    };
+
+    (root1, leaf_count1, root2, leaf_count2, root3, leaf_count3)
 }
 
 fn run_sqlite_persistence_test<T, F>(
@@ -137,30 +153,44 @@ fn run_sqlite_persistence_test<T, F>(
     additional_entries: &[(Hash, Hash)],
     further_entries: &[(Hash, Hash)],
     mut constructor: F,
-) -> (Hash, usize)
+) -> (Hash, usize, Hash, usize, Hash, usize)
 where
     T: MerklePatriciaTree,
     F: FnMut(&str) -> rusqlite::Result<T>,
 {
-    {
+    let (root1, leaf_count1) = {
         let mut tree =
             constructor(path).unwrap_or_else(|e| panic!("{label} initial open failed: {e}"));
         tree.batch_upsert(initial_entries);
-    }
+        let root = tree
+            .get_root_hash()
+            .unwrap_or_else(|| panic!("{label} root after batch 1 was None"));
+        let leaf_count = count_leaf_nodes(&tree);
+        (root, leaf_count)
+    };
 
-    {
+    let (root2, leaf_count2) = {
         let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} reopen failed: {e}"));
         tree.batch_upsert(additional_entries);
-    }
+        let root = tree
+            .get_root_hash()
+            .unwrap_or_else(|| panic!("{label} root after batch 2 was None"));
+        let leaf_count = count_leaf_nodes(&tree);
+        (root, leaf_count)
+    };
 
-    let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} third open failed: {e}"));
-    tree.batch_upsert(further_entries);
-    let root = tree
-        .get_root_hash()
-        .unwrap_or_else(|| panic!("{label} final root was None"));
-    let leaf_count = count_leaf_nodes(&tree);
-    drop(tree);
-    (root, leaf_count)
+    let (root3, leaf_count3) = {
+        let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} third open failed: {e}"));
+        tree.batch_upsert(further_entries);
+        let root = tree
+            .get_root_hash()
+            .unwrap_or_else(|| panic!("{label} root after batch 3 was None"));
+        let leaf_count = count_leaf_nodes(&tree);
+        drop(tree);
+        (root, leaf_count)
+    };
+
+    (root1, leaf_count1, root2, leaf_count2, root3, leaf_count3)
 }
 
 fn run_rocks_persistence_test<T, F>(
@@ -170,30 +200,44 @@ fn run_rocks_persistence_test<T, F>(
     additional_entries: &[(Hash, Hash)],
     further_entries: &[(Hash, Hash)],
     mut constructor: F,
-) -> (Hash, usize)
+) -> (Hash, usize, Hash, usize, Hash, usize)
 where
     T: MerklePatriciaTree,
     F: FnMut(&Path) -> RocksResult<T>,
 {
-    {
+    let (root1, leaf_count1) = {
         let mut tree =
             constructor(path).unwrap_or_else(|e| panic!("{label} initial open failed: {e}"));
         tree.batch_upsert(initial_entries);
-    }
+        let root = tree
+            .get_root_hash()
+            .unwrap_or_else(|| panic!("{label} root after batch 1 was None"));
+        let leaf_count = count_leaf_nodes(&tree);
+        (root, leaf_count)
+    };
 
-    {
+    let (root2, leaf_count2) = {
         let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} reopen failed: {e}"));
         tree.batch_upsert(additional_entries);
-    }
+        let root = tree
+            .get_root_hash()
+            .unwrap_or_else(|| panic!("{label} root after batch 2 was None"));
+        let leaf_count = count_leaf_nodes(&tree);
+        (root, leaf_count)
+    };
 
-    let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} third open failed: {e}"));
-    tree.batch_upsert(further_entries);
-    let root = tree
-        .get_root_hash()
-        .unwrap_or_else(|| panic!("{label} final root was None"));
-    let leaf_count = count_leaf_nodes(&tree);
-    drop(tree);
-    (root, leaf_count)
+    let (root3, leaf_count3) = {
+        let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} third open failed: {e}"));
+        tree.batch_upsert(further_entries);
+        let root = tree
+            .get_root_hash()
+            .unwrap_or_else(|| panic!("{label} root after batch 3 was None"));
+        let leaf_count = count_leaf_nodes(&tree);
+        drop(tree);
+        (root, leaf_count)
+    };
+
+    (root1, leaf_count1, root2, leaf_count2, root3, leaf_count3)
 }
 
 test_all_impls!(test_empty_tree, {
@@ -765,22 +809,24 @@ fn test_persistent_reopen_consistency() {
 
     let _cleanup = DirCleanup(base_dir.clone());
 
-    let mut roots: Vec<(&'static str, Hash, usize)> = Vec::new();
+    // Store results after each batch: (label, root1, leaf_count1, root2, leaf_count2, root3, leaf_count3)
+    let mut results: Vec<(&'static str, Hash, usize, Hash, usize, Hash, usize)> = Vec::new();
 
     // Macro to reduce repetition for SQLite-based persistent implementations
     macro_rules! test_sqlite_impl {
         ($impl_type:ty, $name:expr, $subdir:expr) => {{
             let path = base_dir.join($subdir);
             let path_str = path.to_string_lossy().to_string();
-            let (root, leaf_count) = run_sqlite_persistence_test::<$impl_type, _>(
-                $name,
-                &path_str,
-                &initial_entries,
-                &additional_entries,
-                &further_entries,
-                |p| <$impl_type>::new_with_path(p),
-            );
-            roots.push(($name, root, leaf_count));
+            let (root1, leaf_count1, root2, leaf_count2, root3, leaf_count3) =
+                run_sqlite_persistence_test::<$impl_type, _>(
+                    $name,
+                    &path_str,
+                    &initial_entries,
+                    &additional_entries,
+                    &further_entries,
+                    |p| <$impl_type>::new_with_path(p),
+                );
+            results.push(($name, root1, leaf_count1, root2, leaf_count2, root3, leaf_count3));
         }};
     }
 
@@ -788,15 +834,16 @@ fn test_persistent_reopen_consistency() {
     macro_rules! test_sled_impl {
         ($impl_type:ty, $name:expr, $subdir:expr) => {{
             let dir = base_dir.join($subdir);
-            let (root, leaf_count) = run_sled_persistence_test::<$impl_type, _>(
-                $name,
-                &dir,
-                &initial_entries,
-                &additional_entries,
-                &further_entries,
-                |p| <$impl_type>::new_with_path(p),
-            );
-            roots.push(($name, root, leaf_count));
+            let (root1, leaf_count1, root2, leaf_count2, root3, leaf_count3) =
+                run_sled_persistence_test::<$impl_type, _>(
+                    $name,
+                    &dir,
+                    &initial_entries,
+                    &additional_entries,
+                    &further_entries,
+                    |p| <$impl_type>::new_with_path(p),
+                );
+            results.push(($name, root1, leaf_count1, root2, leaf_count2, root3, leaf_count3));
         }};
     }
 
@@ -804,15 +851,16 @@ fn test_persistent_reopen_consistency() {
     macro_rules! test_rocks_impl {
         ($impl_type:ty, $name:expr, $subdir:expr) => {{
             let dir = base_dir.join($subdir);
-            let (root, leaf_count) = run_rocks_persistence_test::<$impl_type, _>(
-                $name,
-                &dir,
-                &initial_entries,
-                &additional_entries,
-                &further_entries,
-                |p| <$impl_type>::new_with_path(p),
-            );
-            roots.push(($name, root, leaf_count));
+            let (root1, leaf_count1, root2, leaf_count2, root3, leaf_count3) =
+                run_rocks_persistence_test::<$impl_type, _>(
+                    $name,
+                    &dir,
+                    &initial_entries,
+                    &additional_entries,
+                    &further_entries,
+                    |p| <$impl_type>::new_with_path(p),
+                );
+            results.push(($name, root1, leaf_count1, root2, leaf_count2, root3, leaf_count3));
         }};
     }
 
@@ -826,24 +874,46 @@ fn test_persistent_reopen_consistency() {
     test_rocks_impl!(RockLeafMPT, "RockLeafMPT", "rock_leaf");
     test_rocks_impl!(RockSparseMPT, "RockSparseMPT", "rock_sparse");
 
-    // Verify all implementations produce the same root hash and leaf count
-    let (reference_label, reference_root, reference_leaf_count) = roots[0];
+    // Use the first implementation as reference
+    let (reference_label, ref_root1, ref_count1, ref_root2, ref_count2, ref_root3, ref_count3) = results[0];
 
-    // With random hashes, we expect the leaf count to be close to 300
-    // (could be less due to hash collisions, but highly unlikely with SHA256)
-    assert!(
-        reference_leaf_count >= 250 && reference_leaf_count <= 300,
-        "{reference_label} has unexpected leaf count: {reference_leaf_count} (expected between 250-300)"
-    );
-
-    for (label, root, leaf_count) in roots.iter().copied() {
+    // Verify all implementations produce the same results after each batch
+    for (label, root1, count1, root2, count2, root3, count3) in results.iter().copied() {
+        // Check batch 1 consistency
         assert_eq!(
-            root, reference_root,
-            "{label} final root hash diverged from {reference_label}"
+            root1, ref_root1,
+            "{label} root hash after batch 1 diverged from {reference_label}"
         );
         assert_eq!(
-            leaf_count, reference_leaf_count,
-            "{label} has incorrect leaf count: expected {reference_leaf_count}, got {leaf_count}"
+            count1, ref_count1,
+            "{label} leaf count after batch 1 differs from {reference_label}: expected {ref_count1}, got {count1}"
+        );
+
+        // Check batch 2 consistency
+        assert_eq!(
+            root2, ref_root2,
+            "{label} root hash after batch 2 diverged from {reference_label}"
+        );
+        assert_eq!(
+            count2, ref_count2,
+            "{label} leaf count after batch 2 differs from {reference_label}: expected {ref_count2}, got {count2}"
+        );
+
+        // Check batch 3 consistency
+        assert_eq!(
+            root3, ref_root3,
+            "{label} root hash after batch 3 diverged from {reference_label}"
+        );
+        assert_eq!(
+            count3, ref_count3,
+            "{label} leaf count after batch 3 differs from {reference_label}: expected {ref_count3}, got {count3}"
         );
     }
+
+    // With random hashes, we expect the final leaf count to be close to 3000
+    // (could be less due to hash collisions, but highly unlikely with SHA256)
+    assert!(
+        ref_count3 >= 2500 && ref_count3 <= 3000,
+        "{reference_label} has unexpected final leaf count: {ref_count3} (expected between 2500-3000)"
+    );
 }
