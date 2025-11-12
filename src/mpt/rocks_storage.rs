@@ -72,8 +72,11 @@ impl RocksStorage {
     pub fn open(path: impl AsRef<Path>) -> RocksResult<Self> {
         let mut options = Options::default();
         options.create_if_missing(true);
-        options.set_max_open_files(512);
+        // options.set_max_open_files(512);
+        options.optimize_universal_style_compaction(1024 * 1024 * 1024);
         options.increase_parallelism(32);
+        options.set_allow_concurrent_memtable_write(false);
+        options.set_inplace_update_support(true);
         // Enable prefix bloom filter for efficient prefix scans
         // The prefix extractor extracts the first 2 bytes (the length field)
         options.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(2));
