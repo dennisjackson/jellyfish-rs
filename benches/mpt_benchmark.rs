@@ -2,17 +2,31 @@ use divan::{self, AllocProfiler, black_box, counter::ItemsCount};
 use jellyfish_rs::Hash;
 use jellyfish_rs::mpt::{MerklePatriciaTree, RockLeafMPT, RockSparseMPT, RocksParTransMPT};
 use sha2::{Digest, Sha256};
-use tempfile::TempDir;
+use tempfile::TempDir; // Reintroduce TempDir for automatic cleanup
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+
+// Produce a unique suffix for a directory based on bench name, time and pid.
+// Avoid external RNG dependencies to keep benches lean and deterministic-ish while
+// still vanishingly unlikely to collide (time + pid + address entropy).
+fn unique_dir_name(base: &str) -> String {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    // Mix in pid and an address of a stack value for a touch more variance.
+    let pid = std::process::id() as u128;
+    let addr = (&ts as *const u128 as usize) as u128; // not cryptographically strong; fine here.
+    let mix = ts ^ pid ^ addr;
+    format!("{base}-{:x}", mix)
+}
 
 #[global_allocator]
 static GLOBAL_ALLOC: AllocProfiler = AllocProfiler::system();
 
 // Number of records per phase for large inserts.
-const RECORDS_PER_PHASE: usize = 5_000_000;
+const RECORDS_PER_PHASE: usize = 20_000_000;
 // Chunk size for streaming generation to avoid allocating gigantic vectors.
 const GEN_CHUNK_SIZE: usize = 100_000;
 // Small loading benchmark size.
-const LOAD_SMALL: usize = 1_000;
+const SECOND_LOAD: usize = 100_000;
 
 // Expensive benches use tiny sample sizes to avoid hours of runtime.
 const LARGE_SAMPLE_COUNT: u32 = 1; // statistical samples (loops)
@@ -52,9 +66,18 @@ fn insert_streaming<T: MerklePatriciaTree>(tree: &mut T, start_index: u64, total
 // Macros to eliminate repetitive benchmark boilerplate for each MPT variant.
 macro_rules! bench_fresh {
     ($fn_name:ident, $ty:ty, $bench_name:literal) => {
-        #[divan::bench(name = $bench_name, sample_count = LARGE_SAMPLE_COUNT, sample_size = LARGE_SAMPLE_SIZE, counter = ItemsCount::new(RECORDS_PER_PHASE))]
+        #[divan::bench(
+            name = $bench_name,
+            sample_count = LARGE_SAMPLE_COUNT,
+            sample_size = LARGE_SAMPLE_SIZE,
+            counter = ItemsCount::new(RECORDS_PER_PHASE)
+        )]
         fn $fn_name() {
-            let mut tree = <$ty>::new();
+            // TempDir ensures automatic cleanup after benchmark completes.
+            let temp_dir = TempDir::new().expect("temp dir");
+            let bench_path: PathBuf = temp_dir.path().join(unique_dir_name($bench_name));
+            std::fs::create_dir(&bench_path).expect("create unique bench dir");
+            let mut tree = <$ty>::new_with_path(&bench_path).expect("open unique path");
             insert_streaming(&mut tree, 0, RECORDS_PER_PHASE);
             black_box(tree.get_root_hash());
         }
@@ -63,43 +86,57 @@ macro_rules! bench_fresh {
 
 macro_rules! bench_incremental_reopen {
     ($fn_name:ident, $ty:ty, $bench_name:literal) => {
-        #[divan::bench(name = $bench_name, sample_count = LARGE_SAMPLE_COUNT, sample_size = LARGE_SAMPLE_SIZE, counter = ItemsCount::new(RECORDS_PER_PHASE * 2))]
+        #[divan::bench(
+            name = $bench_name,
+            sample_count = LARGE_SAMPLE_COUNT,
+            sample_size = LARGE_SAMPLE_SIZE,
+            counter = ItemsCount::new(RECORDS_PER_PHASE + SECOND_LOAD)
+        )]
         fn $fn_name() {
+            // Keep TempDir alive across reopen phases for consistent persistence.
             let temp_dir = TempDir::new().expect("temp dir");
-            let path = temp_dir.path().to_path_buf();
+            let bench_path: PathBuf = temp_dir.path().join(unique_dir_name($bench_name));
+            std::fs::create_dir(&bench_path).expect("create unique bench dir");
             {
-                let mut tree = <$ty>::new_with_path(&path).expect("open");
+                let mut tree = <$ty>::new_with_path(&bench_path).expect("open");
                 insert_streaming(&mut tree, 0, RECORDS_PER_PHASE);
                 tree.flush().ok();
             }
-            let mut tree = <$ty>::new_with_path(&path).expect("reopen");
-            insert_streaming(&mut tree, RECORDS_PER_PHASE as u64, RECORDS_PER_PHASE);
+            let mut tree = <$ty>::new_with_path(&bench_path).expect("reopen");
+            insert_streaming(&mut tree, RECORDS_PER_PHASE as u64, SECOND_LOAD);
             black_box(tree.get_root_hash());
         }
     };
 }
 
-macro_rules! bench_load_small_after_large {
-    ($fn_name:ident, $ty:ty, $bench_name:literal) => {
-        #[divan::bench(name = $bench_name, sample_count = LOAD_SAMPLE_COUNT, sample_size = LOAD_SAMPLE_SIZE, counter = ItemsCount::new(LOAD_SMALL))]
-        fn $fn_name() {
-            let temp_dir = TempDir::new().expect("temp dir");
-            let path = temp_dir.path().to_path_buf();
-            {
-                let mut preload = <$ty>::new_with_path(&path).expect("preload open");
-                insert_streaming(&mut preload, 0, RECORDS_PER_PHASE);
-                preload.flush().ok();
-            }
-            let mut tree = <$ty>::new_with_path(&path).expect("reopen");
-            insert_streaming(&mut tree, RECORDS_PER_PHASE as u64, LOAD_SMALL);
-            black_box(tree.get_root_hash());
-        }
-    };
-}
+// macro_rules! bench_load_small_after_large {
+//     ($fn_name:ident, $ty:ty, $bench_name:literal) => {
+//         #[divan::bench(
+//             name = $bench_name,
+//             sample_count = LOAD_SAMPLE_COUNT,
+//             sample_size = LOAD_SAMPLE_SIZE,
+//             counter = ItemsCount::new(LOAD_SMALL)
+//         )]
+//         fn $fn_name() {
+//             // TempDir persists for preload + measurement, then cleans up.
+//             let temp_dir = TempDir::new().expect("temp dir");
+//             let bench_path: PathBuf = temp_dir.path().join(unique_dir_name($bench_name));
+//             std::fs::create_dir(&bench_path).expect("create unique bench dir");
+//             {
+//                 let mut preload = <$ty>::new_with_path(&bench_path).expect("preload open");
+//                 insert_streaming(&mut preload, 0, RECORDS_PER_PHASE);
+//                 preload.flush().ok();
+//             }
+//             let mut tree = <$ty>::new_with_path(&bench_path).expect("reopen");
+//             insert_streaming(&mut tree, RECORDS_PER_PHASE as u64, LOAD_SMALL);
+//             black_box(tree.get_root_hash());
+//         }
+//     };
+// }
 
 // Generate concrete benchmark functions.
 bench_fresh!(rock_leaf_fresh_5m, RockLeafMPT, "rock_leaf_fresh_5m");
-bench_fresh!(rock_sparse_fresh_5m, RockSparseMPT, "rock_sparse_fresh_5m");
+// bench_fresh!(rock_sparse_fresh_5m, RockSparseMPT, "rock_sparse_fresh_5m");
 bench_fresh!(
     rocks_par_trans_fresh_5m,
     RocksParTransMPT,
@@ -111,32 +148,32 @@ bench_incremental_reopen!(
     RockLeafMPT,
     "rock_leaf_incremental_reopen_5m_plus_5m"
 );
-bench_incremental_reopen!(
-    rock_sparse_incremental_reopen,
-    RockSparseMPT,
-    "rock_sparse_incremental_reopen_5m_plus_5m"
-);
+// bench_incremental_reopen!(
+//     rock_sparse_incremental_reopen,
+//     RockSparseMPT,
+//     "rock_sparse_incremental_reopen_5m_plus_5m"
+// );
 bench_incremental_reopen!(
     rocks_par_trans_incremental_reopen,
     RocksParTransMPT,
     "rocks_par_trans_incremental_reopen_5m_plus_5m"
 );
 
-bench_load_small_after_large!(
-    rock_leaf_load_small,
-    RockLeafMPT,
-    "rock_leaf_load_after_5m_plus_1k"
-);
-bench_load_small_after_large!(
-    rock_sparse_load_small,
-    RockSparseMPT,
-    "rock_sparse_load_after_5m_plus_1k"
-);
-bench_load_small_after_large!(
-    rocks_par_trans_load_small,
-    RocksParTransMPT,
-    "rocks_par_trans_load_after_5m_plus_1k"
-);
+// bench_load_small_after_large!(
+//     rock_leaf_load_small,
+//     RockLeafMPT,
+//     "rock_leaf_load_after_5m_plus_1k"
+// // );
+// bench_load_small_after_large!(
+//     rock_sparse_load_small,
+//     RockSparseMPT,
+//     "rock_sparse_load_after_5m_plus_1k"
+// );
+// bench_load_small_after_large!(
+//     rocks_par_trans_load_small,
+//     RocksParTransMPT,
+//     "rocks_par_trans_load_after_5m_plus_1k"
+// );
 
 fn main() {
     divan::main();
