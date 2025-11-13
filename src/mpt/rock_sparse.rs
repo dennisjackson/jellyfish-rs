@@ -47,11 +47,14 @@ impl RockSparseMPT {
         Self::from_storage(storage, Some(temp_dir))
     }
 
+    fn insert_node_with_db(&self, dirty_prefixes: &DirtyPrefixes, prefix: Prefix, node: Node) {
+        self.store.insert(prefix, node);
+        dirty_prefixes.insert(prefix);
+    }
+
     fn insert_node_memory_only(&self, prefix: Prefix, node: Node) {
         self.store.insert(prefix, node);
     }
-
-    // No longer needed: leaves are written opportunistically during recursion.
 
     fn recover_full_tree_from_storage(&mut self) -> RocksResult<()> {
         const RECOVERY_CHUNK: usize = 1024 * 1024;
@@ -237,8 +240,7 @@ impl RockSparseMPT {
         entries.sort_unstable_by_key(|(hash, _)| *hash);
         entries.dedup_by_key(|(hash, _)| *hash);
 
-        let mut dummy = false;
-        let built_prefix = Self::batch_insert_into_empty(self, &entries, None, &mut dummy);
+        let built_prefix = Self::batch_insert_into_empty(self, &entries, None);
         self.loaded_subtrees.insert(prefix);
         if built_prefix != prefix {
             warn!(
@@ -348,40 +350,39 @@ impl RockSparseMPT {
         entries_vec.sort_unstable_by_key(|(k, _)| *k);
         entries_vec.dedup_by_key(|(k, _)| *k);
 
-        debug!(
-            "RocksSparse: batch_upsert_optimized start entries={} complete_depth={}",
-            entries_vec.len(),
-            self.complete_interior_depth.load(Ordering::Relaxed)
-        );
-        // Perform recursive upsert using per-interior-node batches only at boundaries.
-        let mut boundary_started = false;
-        let new_root = Self::recursive_batch_upsert(
-            self,
-            self.root,
-            &entries_vec,
-            None,
-            &mut boundary_started,
-        );
-
-        // Persist root and possibly advance/persist complete depth in a final small tx.
+        self.dirty_prefixes.clear();
         let tx = self.storage.start_transaction();
-        tx.set_root(new_root).expect("Failed to update root in DB");
-        self.update_complete_interior_depth(&tx);
-        tx.commit().expect("Failed to commit metadata update");
-        // With a global write batch, a separate boundary batch may not be started explicitly.
-        if let Some(root_hash) = self
-            .store
-            .get(&new_root)
-            .map(|n| n.value().merkle_hash())
+        let new_root =
+            Self::recursive_batch_upsert(self, self.root, &entries_vec, Some(&self.dirty_prefixes));
+
         {
-            debug!(
-                "RocksSparse: batch_upsert_optimized end new_root={} hash={}",
-                new_root.short_hex(),
-                root_hash.short_hex()
-            );
+            let writes: Vec<(Prefix, Node)> = self
+                .dirty_prefixes
+                .par_iter()
+                .filter_map(|prefix_ref| {
+                    let prefix = *prefix_ref;
+                    self.store
+                        .get(&prefix)
+                        .map(|node| (prefix, node.value().clone()))
+                })
+                .collect();
+
+            if !writes.is_empty() {
+                // Keep a consistent order for determinism in tests/debugging.
+                // writes.sort_unstable_by_key(|(prefix, _)| *prefix);
+                tx.batch_write_nodes(&writes)
+                    .expect("DB batch write failed");
+            }
         }
 
+        tx.set_root(new_root).expect("Failed to update root in DB");
+
+        // Update and persist the complete interior depth in the same transaction
+        self.update_complete_interior_depth(&tx);
+
+        tx.commit().expect("Failed to commit batch upsert");
         self.root = new_root;
+        self.dirty_prefixes.clear();
     }
 
     fn batch_upsert_memory_only(&mut self, entries: &[(Hash, Hash)]) {
@@ -393,9 +394,7 @@ impl RockSparseMPT {
         entries_vec.sort_unstable_by_key(|(k, _)| *k);
         entries_vec.dedup_by_key(|(k, _)| *k);
 
-        let mut dummy = false;
-        let new_root =
-            Self::recursive_batch_upsert(self, self.root, &entries_vec, None, &mut dummy);
+        let new_root = Self::recursive_batch_upsert(self, self.root, &entries_vec, None);
         self.root = new_root;
     }
 
@@ -403,8 +402,7 @@ impl RockSparseMPT {
         &self,
         current_prefix: Prefix,
         entries: &[(Hash, Hash)],
-        mut active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
-        boundary_started: &mut bool,
+        dirty_prefixes: Option<&DirtyPrefixes>,
     ) -> Prefix {
         if entries.is_empty() {
             return current_prefix;
@@ -421,36 +419,19 @@ impl RockSparseMPT {
                     .map(|guard| guard.value().clone())
             });
         let Some(node) = node else {
-            debug!(
-                "RocksSparse: node miss at {} depth {}, inserting into empty (entries={})",
-                current_prefix.short_hex(),
-                current_prefix.length,
-                entries.len()
-            );
-            return Self::batch_insert_into_empty(
-                self,
-                entries,
-                active_batch.as_deref_mut(),
-                boundary_started,
-            );
+            return Self::batch_insert_into_empty(self, entries, dirty_prefixes);
         };
 
         match node {
-            Node::Leaf(leaf) => Self::batch_upsert_at_leaf(
-                self,
-                current_prefix,
-                leaf,
-                entries,
-                active_batch.as_deref_mut(),
-                boundary_started,
-            ),
+            Node::Leaf(leaf) => {
+                Self::batch_upsert_at_leaf(self, current_prefix, leaf, entries, dirty_prefixes)
+            }
             Node::Interior(interior) => Self::batch_upsert_at_interior(
                 self,
                 current_prefix,
                 interior,
                 entries,
-                active_batch.as_deref_mut(),
-                boundary_started,
+                dirty_prefixes,
             ),
         }
     }
@@ -458,8 +439,7 @@ impl RockSparseMPT {
     fn batch_insert_into_empty(
         &self,
         entries: &[(Hash, Hash)],
-        mut active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
-        _boundary_started: &mut bool,
+        dirty_prefixes: Option<&DirtyPrefixes>,
     ) -> Prefix {
         if entries.is_empty() {
             return Prefix::root();
@@ -468,11 +448,12 @@ impl RockSparseMPT {
         let (first_key, first_value) = entries[0];
         let first_prefix = Prefix::from(first_key);
         let first_leaf = LeafNode::new(first_key, first_value);
-        self.insert_node_memory_only(first_prefix, Node::Leaf(first_leaf.clone()));
-        if let Some(batch) = active_batch.as_deref_mut() {
-            let _ = batch.put_node(&first_prefix, &Node::Leaf(first_leaf));
+        if let Some(dirty) = dirty_prefixes.as_ref() {
+            self.insert_node_with_db(dirty, first_prefix, Node::Leaf(first_leaf));
+        } else {
+            self.insert_node_memory_only(first_prefix, Node::Leaf(first_leaf));
         }
-        Self::recursive_batch_upsert(self, first_prefix, &entries[1..], active_batch, _boundary_started)
+        Self::recursive_batch_upsert(self, first_prefix, &entries[1..], dirty_prefixes)
     }
 
     fn batch_upsert_at_leaf(
@@ -480,58 +461,29 @@ impl RockSparseMPT {
         leaf_prefix: Prefix,
         leaf: LeafNode,
         entries: &[(Hash, Hash)],
-        mut active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
-        boundary_started: &mut bool,
+        dirty_prefixes: Option<&DirtyPrefixes>,
     ) -> Prefix {
         if let Ok(idx) = entries.binary_search_by_key(&leaf_prefix.hash, |(k, _)| *k) {
             let (_, new_value) = entries[idx];
             let updated_leaf = LeafNode::new(leaf_prefix.hash, new_value);
-            self.insert_node_memory_only(leaf_prefix, Node::Leaf(updated_leaf.clone()));
-
-            if let Some(batch) = active_batch.as_deref_mut() {
-                let _ = batch.put_node(&leaf_prefix, &Node::Leaf(updated_leaf));
-                // Special case: if only one entry left after the match, no need for recursion
-                if entries.len() == 1 {
-                    return leaf_prefix;
-                }
-                // Build combined slice: before + after the matched entry
-                let mut remaining = Vec::with_capacity(entries.len() - 1);
-                remaining.extend_from_slice(&entries[..idx]);
-                remaining.extend_from_slice(&entries[idx + 1..]);
-                return Self::recursive_batch_upsert(
-                    self,
-                    leaf_prefix,
-                    &remaining,
-                    active_batch,
-                    boundary_started,
-                );
+            if let Some(dirty) = dirty_prefixes.as_ref() {
+                self.insert_node_with_db(dirty, leaf_prefix, Node::Leaf(updated_leaf));
             } else {
-                // Start a local batch for this leaf update so it is durable
-                let mut batch = self.storage.start_batch();
-                let _ = batch.put_node(&leaf_prefix, &Node::Leaf(updated_leaf));
-
-                if entries.len() == 1 {
-                    self.storage
-                        .write_batch(batch)
-                        .expect("Failed to commit leaf update batch");
-                    return leaf_prefix;
-                }
-
-                let mut remaining = Vec::with_capacity(entries.len() - 1);
-                remaining.extend_from_slice(&entries[..idx]);
-                remaining.extend_from_slice(&entries[idx + 1..]);
-                let res = Self::recursive_batch_upsert(
-                    self,
-                    leaf_prefix,
-                    &remaining,
-                    Some(&mut batch),
-                    boundary_started,
-                );
-                self.storage
-                    .write_batch(batch)
-                    .expect("Failed to commit leaf update batch");
-                return res;
+                self.insert_node_memory_only(leaf_prefix, Node::Leaf(updated_leaf));
             }
+
+            // Special case: if only one entry left after the match, no need for recursion
+            if entries.len() == 1 {
+                return leaf_prefix;
+            }
+
+            // Build combined slice: before + after the matched entry
+            // This still requires allocation but we're being more efficient about it
+            let mut remaining = Vec::with_capacity(entries.len() - 1);
+            remaining.extend_from_slice(&entries[..idx]);
+            remaining.extend_from_slice(&entries[idx + 1..]);
+
+            return Self::recursive_batch_upsert(self, leaf_prefix, &remaining, dirty_prefixes);
         }
 
         if entries.is_empty() {
@@ -562,72 +514,17 @@ impl RockSparseMPT {
             right_hash,
         );
 
-        // Always update in-memory nodes
-        self.insert_node_memory_only(merged_prefix, Node::Interior(new_interior.clone()));
-        self.insert_node_memory_only(existing_prefix, Node::Leaf(leaf.clone()));
-        self.insert_node_memory_only(new_prefix, Node::Leaf(new_leaf.clone()));
-
-        // If we already have an active batch, just write into it and continue.
-        if let Some(batch) = active_batch.as_deref_mut() {
-            let _ = batch.put_node(&merged_prefix, &Node::Interior(new_interior));
-            let _ = batch.put_node(&existing_prefix, &Node::Leaf(leaf));
-            let _ = batch.put_node(&new_prefix, &Node::Leaf(new_leaf));
-            return Self::recursive_batch_upsert(
-                self,
-                merged_prefix,
-                &entries[1..],
-                active_batch,
-                boundary_started,
-            );
+        if let Some(dirty) = dirty_prefixes.as_ref() {
+            self.insert_node_memory_only(merged_prefix, Node::Interior(new_interior));
+            self.insert_node_with_db(dirty, existing_prefix, Node::Leaf(leaf));
+            self.insert_node_with_db(dirty, new_prefix, Node::Leaf(new_leaf));
+        } else {
+            self.insert_node_memory_only(merged_prefix, Node::Interior(new_interior));
+            self.insert_node_memory_only(existing_prefix, Node::Leaf(leaf));
+            self.insert_node_memory_only(new_prefix, Node::Leaf(new_leaf));
         }
 
-        // If no active batch yet and we created an interior at the current
-        // complete boundary depth, start a batch here so all subsequent
-        // nodes under this interior get persisted.
-        let complete_depth = self.complete_interior_depth.load(Ordering::Relaxed);
-        if merged_prefix.length == complete_depth {
-            debug!(
-                "RocksSparse: start boundary batch (leaf-merge) at {} depth {} rem_entries {}",
-                merged_prefix.short_hex(),
-                merged_prefix.length,
-                entries.len().saturating_sub(1)
-            );
-            let mut batch = self.storage.start_batch();
-            let _ = batch.put_node(&merged_prefix, &Node::Interior(new_interior));
-            let _ = batch.put_node(&existing_prefix, &Node::Leaf(leaf));
-            let _ = batch.put_node(&new_prefix, &Node::Leaf(new_leaf));
-
-            let res = Self::recursive_batch_upsert(
-                self,
-                merged_prefix,
-                &entries[1..],
-                Some(&mut batch),
-                boundary_started,
-            );
-            self.storage
-                .write_batch(batch)
-                .expect("Failed to commit leaf-merge subtree batch");
-            self.loaded_subtrees.insert(merged_prefix);
-            *boundary_started = true;
-            return res;
-        }
-
-        // Otherwise, still no active batch: start a local batch for this merge so both leaves persist
-        let mut batch = self.storage.start_batch();
-        let _ = batch.put_node(&merged_prefix, &Node::Interior(new_interior));
-        let _ = batch.put_node(&existing_prefix, &Node::Leaf(leaf));
-        let _ = batch.put_node(&new_prefix, &Node::Leaf(new_leaf));
-        let res = Self::recursive_batch_upsert(
-            self,
-            merged_prefix,
-            &entries[1..],
-            Some(&mut batch),
-            boundary_started,
-        );
-        self.storage
-            .write_batch(batch)
-            .expect("Failed to commit leaf-merge batch");
-        res
+        Self::recursive_batch_upsert(self, merged_prefix, &entries[1..], dirty_prefixes)
     }
 
     fn batch_upsert_at_interior(
@@ -635,20 +532,9 @@ impl RockSparseMPT {
         interior_prefix: Prefix,
         interior: InteriorNode,
         entries: &[(Hash, Hash)],
-        mut active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
-        boundary_started: &mut bool,
+        dirty_prefixes: Option<&DirtyPrefixes>,
     ) -> Prefix {
         let len = entries.len();
-
-        let complete_depth = self.complete_interior_depth.load(Ordering::Relaxed);
-        let persist_here = interior_prefix.length == complete_depth;
-        debug!(
-            "RocksSparse: visit interior {} depth {} persist_here={} entries={}",
-            interior_prefix.short_hex(),
-            interior_prefix.length,
-            persist_here,
-            len
-        );
 
         // Locate the contiguous window of entries covered by this interior node.
         let mut left_edge = len;
@@ -661,38 +547,13 @@ impl RockSparseMPT {
 
         if left_edge == len {
             // All entries diverge from this prefix.
-            if persist_here && active_batch.is_none() {
-                debug!(
-                    "RocksSparse: start boundary batch (diverge-all) at {} depth {} entries {}",
-                    interior_prefix.short_hex(),
-                    interior_prefix.length,
-                    len
-                );
-                let mut batch = self.storage.start_batch();
-                let res = self.handle_divergent_entries(
-                    interior_prefix,
-                    interior,
-                    entries,
-                    Some(&mut batch),
-                    boundary_started,
-                    0,
-                );
-                self.storage
-                    .write_batch(batch)
-                    .expect("Failed to commit diverge-all subtree batch");
-                self.loaded_subtrees.insert(interior_prefix);
-                *boundary_started = true;
-                return res;
-            } else {
-                return self.handle_divergent_entries(
-                    interior_prefix,
-                    interior,
-                    entries,
-                    active_batch.as_deref_mut(),
-                    boundary_started,
-                    0,
-                );
-            }
+            return self.handle_divergent_entries(
+                interior_prefix,
+                interior,
+                entries,
+                dirty_prefixes,
+                0,
+            );
         }
 
         let mut right_edge = left_edge;
@@ -700,104 +561,26 @@ impl RockSparseMPT {
             right_edge += 1;
         }
 
-        // Assert windowing correctness around the contained segment.
-        if right_edge > left_edge {
-            for i in left_edge..right_edge {
-                assert!(
-                    interior_prefix.contains(&entries[i].0),
-                    "Windowing error: entry at {} not contained by prefix {}",
-                    i,
-                    interior_prefix.short_hex()
-                );
-            }
-            if left_edge > 0 {
-                assert!(
-                    !interior_prefix.contains(&entries[left_edge - 1].0),
-                    "Windowing error: left_edge-1 is still contained by prefix {}",
-                    interior_prefix.short_hex()
-                );
-            }
-            if right_edge < len {
-                assert!(
-                    !interior_prefix.contains(&entries[right_edge].0),
-                    "Windowing error: right_edge is still contained by prefix {}",
-                    interior_prefix.short_hex()
-                );
-            }
-        }
-
         // Divergent entries exist on the left side.
         if left_edge > 0 {
-            if persist_here && active_batch.is_none() {
-                debug!(
-                    "RocksSparse: start boundary batch (diverge-left) at {} depth {} left_edge {} entries {}",
-                    interior_prefix.short_hex(),
-                    interior_prefix.length,
-                    left_edge,
-                    len
-                );
-                let mut batch = self.storage.start_batch();
-                let res = self.handle_divergent_entries(
-                    interior_prefix,
-                    interior,
-                    entries,
-                    Some(&mut batch),
-                    boundary_started,
-                    0,
-                );
-                self.storage
-                    .write_batch(batch)
-                    .expect("Failed to commit diverge-left subtree batch");
-                self.loaded_subtrees.insert(interior_prefix);
-                *boundary_started = true;
-                return res;
-            } else {
-                return self.handle_divergent_entries(
-                    interior_prefix,
-                    interior,
-                    entries,
-                    active_batch.as_deref_mut(),
-                    boundary_started,
-                    0,
-                );
-            }
+            return self.handle_divergent_entries(
+                interior_prefix,
+                interior,
+                entries,
+                dirty_prefixes,
+                0,
+            );
         }
 
         // Divergent entries exist on the right side.
         if right_edge < len {
-            if persist_here && active_batch.is_none() {
-                debug!(
-                    "RocksSparse: start boundary batch (diverge-right) at {} depth {} right_edge {} entries {}",
-                    interior_prefix.short_hex(),
-                    interior_prefix.length,
-                    right_edge,
-                    len
-                );
-                let mut batch = self.storage.start_batch();
-                let res = self.handle_divergent_entries(
-                    interior_prefix,
-                    interior,
-                    entries,
-                    Some(&mut batch),
-                    boundary_started,
-                    right_edge,
-                );
-                self.storage
-                    .write_batch(batch)
-                    .expect("Failed to commit diverge-right subtree batch");
-                self.loaded_subtrees.insert(interior_prefix);
-                *boundary_started = true;
-                return res;
-            } else {
-                return self.handle_divergent_entries(
-                    interior_prefix,
-                    interior,
-                    entries,
-                    active_batch.as_deref_mut(),
-                    boundary_started,
-                    right_edge,
-                );
-            }
+            return self.handle_divergent_entries(
+                interior_prefix,
+                interior,
+                entries,
+                dirty_prefixes,
+                right_edge,
+            );
         }
 
         // All entries are contained, split the window into left and right children.
@@ -808,105 +591,14 @@ impl RockSparseMPT {
         let right_entries = &entries[middle..right_edge];
         let count = left_entries.len() + right_entries.len();
 
-        // Recurse into children.
-        let (new_left, new_right) = if persist_here && active_batch.is_none() {
-            // Start a local batch at the boundary (only if none exists) and pass it down so leaf updates write into it.
-            debug!(
-                "RocksSparse: start boundary batch (contained) at {} depth {} entries {} (L={}, R={})",
-                interior_prefix.short_hex(),
-                interior_prefix.length,
-                len,
-                left_entries.len(),
-                right_entries.len()
-            );
-            let mut batch = self.storage.start_batch();
-            let new_left = Self::process_left_entries(
-                self,
-                interior.left,
-                &left_entries,
-                Some(&mut batch),
-                boundary_started,
-            );
-            let new_right = Self::process_right_entries(
-                self,
-                interior.right,
-                &right_entries,
-                Some(&mut batch),
-                boundary_started,
-            );
-
-            // Compute interior and include it in the batch
-            let left_hash = self
-                .store
-                .get(&new_left)
-                .expect("Left child missing after batch upsert")
-                .merkle_hash();
-            let right_hash = self
-                .store
-                .get(&new_right)
-                .expect("Right child missing after batch upsert")
-                .merkle_hash();
-            let updated_interior = InteriorNode::new(
-                interior_prefix,
-                new_left,
-                new_right,
-                left_hash,
-                right_hash,
-            );
-            self.insert_node_memory_only(
-                interior_prefix,
-                Node::Interior(updated_interior.clone()),
-            );
-            let _ = batch.put_node(&interior_prefix, &Node::Interior(updated_interior));
-            self.storage
-                .write_batch(batch)
-                .expect("Failed to commit subtree batch");
-            self.loaded_subtrees.insert(interior_prefix);
-            *boundary_started = true;
-            return interior_prefix;
-        } else if count > 64 && active_batch.is_none() {
-            // No active batch; we can safely parallelize left/right recursion.
-            // Use local flags and fold them back after join to avoid shared mut across threads.
-            let mut left_started = false;
-            let mut right_started = false;
-            let (new_left, new_right) = join(
-                || {
-                    Self::process_left_entries(
-                        self,
-                        interior.left,
-                        &left_entries,
-                        None,
-                        &mut left_started,
-                    )
-                },
-                || {
-                    Self::process_right_entries(
-                        self,
-                        interior.right,
-                        &right_entries,
-                        None,
-                        &mut right_started,
-                    )
-                },
-            );
-            *boundary_started |= left_started || right_started;
-            (new_left, new_right)
+        let (new_left, new_right) = if count > 64 {
+            join(
+                || Self::process_left_entries(self, interior.left, &left_entries),
+                || Self::process_right_entries(self, interior.right, &right_entries),
+            )
         } else {
-            // Sequential when a batch is active; pass it through so updates persist.
-            let new_left = Self::process_left_entries(
-                self,
-                interior.left,
-                &left_entries,
-                active_batch.as_deref_mut(),
-                boundary_started,
-            );
-            let new_right = Self::process_right_entries(
-                self,
-                interior.right,
-                &right_entries,
-                active_batch.as_deref_mut(),
-                boundary_started,
-            );
+            let new_left = Self::process_left_entries(self, interior.left, &left_entries);
+            let new_right = Self::process_right_entries(self, interior.right, &right_entries);
             (new_left, new_right)
         };
 
@@ -924,63 +616,31 @@ impl RockSparseMPT {
         let updated_interior =
             InteriorNode::new(interior_prefix, new_left, new_right, left_hash, right_hash);
 
-        // Always update memory with the interior node (non-persistence path)
-        self.insert_node_memory_only(interior_prefix, Node::Interior(updated_interior.clone()));
-        // If part of an active batch, persist this interior as well.
-        if let Some(batch) = active_batch.as_deref_mut() {
-            let _ = batch.put_node(&interior_prefix, &Node::Interior(updated_interior));
+        // Check if this interior node is at or below the complete depth
+        // If so, mark it as dirty so it gets persisted to the database
+        let complete_depth = self.complete_interior_depth.load(Ordering::Relaxed);
+        if interior_prefix.length == complete_depth {
+            // This interior node is at or below the complete depth, so it should be persisted
+            if let Some(dirty) = dirty_prefixes.as_ref() {
+                self.insert_node_with_db(dirty, interior_prefix, Node::Interior(updated_interior));
+                self.loaded_subtrees.insert(interior_prefix);
+            } else {
+                self.insert_node_memory_only(interior_prefix, Node::Interior(updated_interior));
+            }
+        } else {
+            // Above the complete depth, keep it in memory only
+            self.insert_node_memory_only(interior_prefix, Node::Interior(updated_interior));
         }
 
-        // Not a persistence boundary here.
         interior_prefix
     }
 
-    // Wrapper: ensure a write batch exists when handling divergent entries so newly
-    // created ancestors/leaves are durably persisted even if we're above the
-    // current persistence boundary.
     fn handle_divergent_entries(
         &self,
         interior_prefix: Prefix,
         interior: InteriorNode,
         entries: &[(Hash, Hash)],
-        mut active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
-        boundary_started: &mut bool,
-        first_idx: usize,
-    ) -> Prefix {
-        if active_batch.is_some() {
-            return self.handle_divergent_entries_impl(
-                interior_prefix,
-                interior,
-                entries,
-                active_batch,
-                boundary_started,
-                first_idx,
-            );
-        }
-
-        // Start a local batch for this divergent subtree.
-        let mut batch = self.storage.start_batch();
-        let res = self.handle_divergent_entries_impl(
-            interior_prefix,
-            interior,
-            entries,
-            Some(&mut batch),
-            boundary_started,
-            first_idx,
-        );
-        self.storage
-            .write_batch(batch)
-            .expect("Failed to commit divergent subtree batch");
-        res
-    }
-
-    fn handle_divergent_entries_impl(
-        &self,
-        interior_prefix: Prefix,
-        interior: InteriorNode,
-        entries: &[(Hash, Hash)],
-        mut active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
-        boundary_started: &mut bool,
+        dirty_prefixes: Option<&DirtyPrefixes>,
         first_idx: usize,
     ) -> Prefix {
         let (first_key, first_value) = entries[first_idx];
@@ -1000,12 +660,12 @@ impl RockSparseMPT {
         let new_interior =
             InteriorNode::new(common, left_prefix, right_prefix, left_hash, right_hash);
 
-        self.insert_node_memory_only(common, Node::Interior(new_interior.clone()));
-        self.insert_node_memory_only(new_leaf_prefix, Node::Leaf(new_leaf.clone()));
-
-        if let Some(batch) = active_batch.as_deref_mut() {
-            let _ = batch.put_node(&common, &Node::Interior(new_interior));
-            let _ = batch.put_node(&new_leaf_prefix, &Node::Leaf(new_leaf));
+        if let Some(dirty) = dirty_prefixes.as_ref() {
+            self.insert_node_memory_only(common, Node::Interior(new_interior));
+            self.insert_node_with_db(dirty, new_leaf_prefix, Node::Leaf(new_leaf));
+        } else {
+            self.insert_node_memory_only(common, Node::Interior(new_interior));
+            self.insert_node_memory_only(new_leaf_prefix, Node::Leaf(new_leaf));
         }
 
         if entries.len() == 1 {
@@ -1016,25 +676,21 @@ impl RockSparseMPT {
         let mut result_prefix = common;
 
         if first_idx > 0 {
-            let pfx = Self::recursive_batch_upsert(
+            result_prefix = Self::recursive_batch_upsert(
                 self,
                 result_prefix,
                 &entries[..first_idx],
-                active_batch.as_deref_mut(),
-                boundary_started,
+                dirty_prefixes,
             );
-            result_prefix = pfx;
         }
 
         if first_idx + 1 < entries.len() {
-            let pfx = Self::recursive_batch_upsert(
+            result_prefix = Self::recursive_batch_upsert(
                 self,
                 result_prefix,
                 &entries[first_idx + 1..],
-                active_batch.as_deref_mut(),
-                boundary_started,
+                dirty_prefixes,
             );
-            result_prefix = pfx;
         }
 
         result_prefix
@@ -1044,11 +700,14 @@ impl RockSparseMPT {
         &self,
         left_prefix: Prefix,
         left_entries: &[(Hash, Hash)],
-        active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
-        boundary_started: &mut bool,
     ) -> Prefix {
         if !left_entries.is_empty() {
-            Self::recursive_batch_upsert(self, left_prefix, left_entries, active_batch, boundary_started)
+            Self::recursive_batch_upsert(
+                self,
+                left_prefix,
+                left_entries,
+                Some(&self.dirty_prefixes),
+            )
         } else {
             self.ensure_node_loaded(left_prefix);
             left_prefix
@@ -1059,11 +718,14 @@ impl RockSparseMPT {
         &self,
         right_prefix: Prefix,
         right_entries: &[(Hash, Hash)],
-        active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
-        boundary_started: &mut bool,
     ) -> Prefix {
         if !right_entries.is_empty() {
-            Self::recursive_batch_upsert(self, right_prefix, right_entries, active_batch, boundary_started)
+            Self::recursive_batch_upsert(
+                self,
+                right_prefix,
+                right_entries,
+                Some(&self.dirty_prefixes),
+            )
         } else {
             self.ensure_node_loaded(right_prefix);
             right_prefix

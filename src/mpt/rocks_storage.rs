@@ -4,7 +4,7 @@ use std::{fmt, io};
 use rayon::{prelude::*};
 use rocksdb::{
     DBIteratorWithThreadMode, Direction, IteratorMode, OptimisticTransactionDB, Options,
-    Transaction, WriteBatchWithTransaction,
+    Transaction,
 };
 
 use crate::{Hash, Prefix, prefix::HashExt};
@@ -75,8 +75,8 @@ impl RocksStorage {
         // options.set_max_open_files(512);
         options.optimize_universal_style_compaction(1024 * 1024 * 1024);
         options.increase_parallelism(32);
-        options.set_allow_concurrent_memtable_write(true);
-        options.set_inplace_update_support(false);
+        options.set_allow_concurrent_memtable_write(false);
+        options.set_inplace_update_support(true);
         // Enable prefix bloom filter for efficient prefix scans
         // The prefix extractor extracts the first 2 bytes (the length field)
         options.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(2));
@@ -237,38 +237,6 @@ impl RocksStorage {
     pub fn flush(&self) -> RocksResult<()> {
         self.db.flush()?;
         Ok(())
-    }
-
-    // Begin: WriteBatch interface
-    pub fn start_batch(&self) -> RocksWriteBatch {
-        RocksWriteBatch::new()
-    }
-
-    pub fn write_batch(&self, batch: RocksWriteBatch) -> RocksResult<()> {
-        self.db.write(batch.into_inner())?;
-        Ok(())
-    }
-    // End: WriteBatch interface
-}
-
-pub struct RocksWriteBatch {
-    batch: WriteBatchWithTransaction<true>,
-}
-
-impl RocksWriteBatch {
-    pub fn new() -> Self {
-        Self { batch: WriteBatchWithTransaction::default() }
-    }
-
-    pub fn put_node(&mut self, prefix: &Prefix, node: &Node) -> RocksResult<()> {
-        let key = prefix_key(prefix);
-        let value = encode_node(node);
-        self.batch.put(key, value);
-        Ok(())
-    }
-
-    pub fn into_inner(self) -> WriteBatchWithTransaction<true> {
-        self.batch
     }
 }
 
