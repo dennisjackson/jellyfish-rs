@@ -1,7 +1,7 @@
 use divan::{self, AllocProfiler, black_box, counter::ItemsCount};
 use jellyfish_rs::Hash;
 use jellyfish_rs::mpt::{MerklePatriciaTree, RockLeafMPT, RockSparseMPT, RocksParTransMPT};
-use sha2::{Digest, Sha256};
+use rand::{rngs::StdRng, SeedableRng, RngCore};
 use tempfile::TempDir; // Reintroduce TempDir for automatic cleanup
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::path::PathBuf;
@@ -18,8 +18,8 @@ fn unique_dir_name(base: &str) -> String {
     format!("{base}-{:x}", mix)
 }
 
-#[global_allocator]
-static GLOBAL_ALLOC: AllocProfiler = AllocProfiler::system();
+// #[global_allocator]
+// static GLOBAL_ALLOC: AllocProfiler = AllocProfiler::system();
 
 // Number of records per phase for large inserts.
 const RECORDS_PER_PHASE: usize = 20_000_000;
@@ -36,18 +36,14 @@ const LOAD_SAMPLE_COUNT: u32 = 10;
 const LOAD_SAMPLE_SIZE: u32 = 10;
 
 fn generate_chunk(start: u64, count: usize) -> Vec<(Hash, Hash)> {
+    // Seed RNG from the starting index for deterministic chunks while avoiding heavy hashing.
+    let mut rng = StdRng::seed_from_u64(start);
     let mut out = Vec::with_capacity(count);
-    for i in 0..count as u64 {
-        let idx = start + i;
-        let mut key_hasher = Sha256::new();
-        key_hasher.update(b"key");
-        key_hasher.update(idx.to_le_bytes());
-        let key: Hash = key_hasher.finalize().into();
-
-        let mut value_hasher = Sha256::new();
-        value_hasher.update(b"value");
-        value_hasher.update(idx.to_le_bytes());
-        let value: Hash = value_hasher.finalize().into();
+    for _ in 0..count {
+        let mut key = [0u8; 32];
+        let mut value = [0u8; 32];
+        rng.fill_bytes(&mut key);
+        rng.fill_bytes(&mut value);
         out.push((key, value));
     }
     out
@@ -138,7 +134,7 @@ macro_rules! bench_incremental_reopen {
 
 // Generate concrete benchmark functions.
 bench_fresh!(rock_leaf_fresh_5m, RockLeafMPT, "rock_leaf_fresh_5m");
-// bench_fresh!(rock_sparse_fresh_5m, RockSparseMPT, "rock_sparse_fresh_5m");
+bench_fresh!(rock_sparse_fresh_5m, RockSparseMPT, "rock_sparse_fresh_5m");
 bench_fresh!(
     rocks_par_trans_fresh_5m,
     RocksParTransMPT,
@@ -150,11 +146,11 @@ bench_incremental_reopen!(
     RockLeafMPT,
     "rock_leaf_incremental_reopen_5m_plus_5m"
 );
-// bench_incremental_reopen!(
-//     rock_sparse_incremental_reopen,
-//     RockSparseMPT,
-//     "rock_sparse_incremental_reopen_5m_plus_5m"
-// );
+bench_incremental_reopen!(
+    rock_sparse_incremental_reopen,
+    RockSparseMPT,
+    "rock_sparse_incremental_reopen_5m_plus_5m"
+);
 bench_incremental_reopen!(
     rocks_par_trans_incremental_reopen,
     RocksParTransMPT,

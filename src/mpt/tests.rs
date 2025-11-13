@@ -32,6 +32,7 @@ macro_rules! test_all_impls {
             test_impl::<RockLeafMPT>();
             test_impl::<RockSparseMPT>();
             test_impl::<RocksParTransMPT>();
+            test_impl::<RocksTransRelMPT>();
         }
     };
 }
@@ -49,6 +50,7 @@ macro_rules! for_each_impl {
         $macro!(RockLeafMPT);
         $macro!(RockSparseMPT);
         $macro!(RocksParTransMPT);
+        $macro!(RocksTransRelMPT);
     };
 }
 
@@ -906,6 +908,7 @@ fn test_persistent_reopen_consistency() {
     test_rocks_impl!(RockLeafMPT, "RockLeafMPT", "rock_leaf");
     test_rocks_impl!(RockSparseMPT, "RockSparseMPT", "rock_sparse");
     test_rocks_impl!(RocksParTransMPT, "RocksParTransMPT", "rocks_par_trans");
+    test_rocks_impl!(RocksTransRelMPT, "RocksTransRelMPT", "rocks_tran_rel");
 
     // Use the first implementation as reference
     let (reference_label, ref_root1, ref_count1, ref_root2, ref_count2, ref_root3, ref_count3) =
@@ -950,4 +953,79 @@ fn test_persistent_reopen_consistency() {
         ref_count3 >= 2500 && ref_count3 <= 3000,
         "{reference_label} has unexpected final leaf count: {ref_count3} (expected between 2500-3000)"
     );
+}
+
+#[test]
+fn test_persistent_reopen_small() {
+    // Small deterministic reopen test: 5 inserts one batch, reopen, verify parity across all impls.
+    use std::fs; use std::path::PathBuf; use std::time::{SystemTime, UNIX_EPOCH}; use crate::Hash;
+
+    let _ = env_logger::builder().is_test(true).filter(None, log::LevelFilter::Info).try_init();
+
+    // Deterministic small key/value set
+    let entries: Vec<(Hash, Hash)> = (1u8..=5u8).map(|b| (create_hash(b), create_hash(100 + b))).collect();
+
+    let pid = std::process::id();
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let base_dir = env::temp_dir().join(format!("mpt_small_reopen_{}_{}", pid, timestamp));
+    fs::create_dir_all(&base_dir).expect("failed to create small persistent test directory");
+
+    struct DirCleanup(PathBuf); impl Drop for DirCleanup { fn drop(&mut self){ let _ = fs::remove_dir_all(&self.0); } }
+    let _cleanup = DirCleanup(base_dir.clone());
+
+    // (label, root1, count1, root2, count2, root3, count3)
+    let mut results: Vec<(&'static str, Hash, usize, Hash, usize, Hash, usize)> = Vec::new();
+
+    macro_rules! test_sqlite_impl_small { ($impl_type:ty, $name:expr, $subdir:expr) => {{
+        let path = base_dir.join($subdir); let path_str = path.to_string_lossy().to_string();
+        // Initial open & batch 1
+        let mut tree = <$impl_type>::new_with_path(&path_str).expect("initial open failed");
+        tree.batch_upsert(&entries); let root1 = tree.get_root_hash().expect("root1 none"); let count1 = count_leaf_nodes(&tree); drop(tree);
+        // Reopen & verify
+        let mut tree = <$impl_type>::new_existing_with_path(&path_str).expect("reopen failed");
+        let root2 = tree.get_root_hash().expect("root2 none"); let count2 = count_leaf_nodes(&tree);
+        // Second batch after reopen (new keys 6..=10)
+        let second_entries: Vec<(Hash, Hash)> = (6u8..=10u8).map(|b| (create_hash(b), create_hash(100 + b))).collect();
+        tree.batch_upsert(&second_entries); let root3 = tree.get_root_hash().expect("root3 none"); let count3 = count_leaf_nodes(&tree); results.push(($name, root1, count1, root2, count2, root3, count3)); }}; }
+
+    macro_rules! test_sled_impl_small { ($impl_type:ty, $name:expr, $subdir:expr) => {{
+        let dir = base_dir.join($subdir); let mut tree = <$impl_type>::new_with_path(&dir).expect("initial open failed");
+        tree.batch_upsert(&entries); let root1 = tree.get_root_hash().expect("root1 none"); let count1 = count_leaf_nodes(&tree); drop(tree);
+        let mut tree = <$impl_type>::new_with_path(&dir).expect("reopen failed"); let root2 = tree.get_root_hash().expect("root2 none"); let count2 = count_leaf_nodes(&tree);
+        let second_entries: Vec<(Hash, Hash)> = (6u8..=10u8).map(|b| (create_hash(b), create_hash(100 + b))).collect();
+        tree.batch_upsert(&second_entries); let root3 = tree.get_root_hash().expect("root3 none"); let count3 = count_leaf_nodes(&tree); results.push(($name, root1, count1, root2, count2, root3, count3)); }}; }
+
+    macro_rules! test_rocks_impl_small { ($impl_type:ty, $name:expr, $subdir:expr) => {{
+        let dir = base_dir.join($subdir); let mut tree = <$impl_type>::new_with_path(&dir).expect("initial open failed");
+        tree.batch_upsert(&entries); let root1 = tree.get_root_hash().expect("root1 none"); let count1 = count_leaf_nodes(&tree); drop(tree);
+        let mut tree = <$impl_type>::new_with_path(&dir).expect("reopen failed"); let root2 = tree.get_root_hash().expect("root2 none"); let count2 = count_leaf_nodes(&tree);
+        let second_entries: Vec<(Hash, Hash)> = (6u8..=10u8).map(|b| (create_hash(b), create_hash(100 + b))).collect();
+        tree.batch_upsert(&second_entries); let root3 = tree.get_root_hash().expect("root3 none"); let count3 = count_leaf_nodes(&tree); results.push(($name, root1, count1, root2, count2, root3, count3)); }}; }
+
+    // Run small reopen across all implementations
+    test_sqlite_impl_small!(DurableBatchMPT, "DurableBatchMPT", "durable_small.db");
+    test_sled_impl_small!(SledBatchMPT, "SledBatchMPT", "sled_batch_small");
+    test_sled_impl_small!(SledLeafMPT, "SledLeafMPT", "sled_leaf_small");
+    test_sled_impl_small!(SledAllMPT, "SledAllMPT", "sled_all_small");
+    test_sled_impl_small!(SledTransMPT, "SledTransMPT", "sled_trans_small");
+    test_sled_impl_small!(SledChanMPT, "SledChanMPT", "sled_chan_small");
+    test_rocks_impl_small!(RockLeafMPT, "RockLeafMPT", "rock_leaf_small");
+    test_rocks_impl_small!(RockSparseMPT, "RockSparseMPT", "rock_sparse_small");
+    test_rocks_impl_small!(RocksParTransMPT, "RocksParTransMPT", "rocks_par_trans_small");
+    test_rocks_impl_small!(RocksTransRelMPT, "RocksTransRelMPT", "rocks_tran_rel_small");
+
+    // Reference = first implementation
+    let (ref_label, ref_root1, ref_count1, ref_root2, ref_count2, ref_root3, ref_count3) = results[0];
+    for (label, root1, count1, root2, count2, root3, count3) in results.iter().copied() {
+        assert_eq!(root1, ref_root1, "{label} root after batch 1 diverged from {ref_label}");
+        assert_eq!(count1, ref_count1, "{label} leaf count after batch 1 diverged from {ref_label}: expected {ref_count1}, got {count1}");
+        assert_eq!(root2, ref_root2, "{label} root after reopen diverged from {ref_label}");
+        assert_eq!(count2, ref_count2, "{label} leaf count after reopen diverged from {ref_label}: expected {ref_count2}, got {count2}");
+        assert_eq!(root3, ref_root3, "{label} root after batch 2 diverged from {ref_label}");
+        assert_eq!(count3, ref_count3, "{label} leaf count after batch 2 diverged from {ref_label}: expected {ref_count3}, got {count3}");
+    }
+
+    assert_eq!(ref_count1, 5, "Expected exactly 5 leaves after batch 1");
+    assert_eq!(ref_count2, 5, "Expected exactly 5 leaves after reopen before batch 2");
+    assert_eq!(ref_count3, 10, "Expected exactly 10 leaves after second batch");
 }

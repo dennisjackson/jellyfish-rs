@@ -42,6 +42,9 @@ pub use rock_sparse::RockSparseMPT;
 mod rock_par_trans;
 pub use rock_par_trans::RocksParTransMPT;
 
+mod rock_trans_rel;
+pub use rock_trans_rel::RocksTransRelMPT;
+
 mod cache;
 pub use cache::Cache;
 

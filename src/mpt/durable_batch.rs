@@ -413,6 +413,18 @@ impl DurableBatchMPT {
             .value()
             .merkle_hash();
 
+        #[cfg(feature = "trace_compare")]
+        {
+            println!(
+                "TRACE_INTERIOR durable prefix={} left={} right={} left_hash={} right_hash={}",
+                interior_prefix.short_hex(),
+                new_left.short_hex(),
+                new_right.short_hex(),
+                left_hash.short_hex(),
+                right_hash.short_hex()
+            );
+        }
+
         let updated_interior =
             InteriorNode::new(interior_prefix, new_left, new_right, left_hash, right_hash);
 
