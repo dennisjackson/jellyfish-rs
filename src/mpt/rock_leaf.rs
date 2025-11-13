@@ -378,8 +378,11 @@ impl MerklePatriciaTree for RockLeafMPT {
         Self::new_temporary().expect("Failed to create temporary RocksDB database")
     }
 
-    fn upsert(&mut self, key: Hash, value: Hash) {
-        self.batch_upsert(&[(key, value)]);
+    fn new_with_path<P: AsRef<Path>>(path: P) -> super::rocks_storage::RocksResult<Self>
+    where
+        Self: Sized,
+    {
+        RockLeafMPT::new_with_path(path)
     }
 
     fn batch_upsert(&mut self, entries: &[(Hash, Hash)]) {

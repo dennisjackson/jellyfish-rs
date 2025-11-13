@@ -39,6 +39,9 @@ pub use rock_leaf::RockLeafMPT;
 mod rock_sparse;
 pub use rock_sparse::RockSparseMPT;
 
+mod rock_par_trans;
+pub use rock_par_trans::RocksParTransMPT;
+
 mod cache;
 pub use cache::Cache;
 
@@ -196,12 +199,51 @@ impl fmt::Display for Node {
 }
 
 pub trait MerklePatriciaTree {
+    /// Construct a new in-memory (or temporary) instance.
     fn new() -> Self;
-    fn upsert(&mut self, key: Hash, value: Hash);
+    /// Construct an instance backed by a persistent path (e.g. RocksDB directory).
+    /// Implementations should create the store if missing.
+    fn new_with_path<P: AsRef<std::path::Path>>(_path: P) -> rocks_storage::RocksResult<Self>
+    where
+        Self: Sized,
+    {
+        // Default fallback: construct an in-memory instance. Implementations
+        // that support persistence should override this.
+        Ok(Self::new())
+    }
+    /// Core batch insertion primitive each implementation must provide.
+    /// Implementations should accept a slice of entries already de-duplicated and
+    /// (ideally) sorted by key for best performance, but callers are not required
+    /// to sort before calling.
     fn batch_upsert(&mut self, entries: &[(Hash, Hash)]);
+    /// Enumerate all nodes currently materialized in memory. Implementations
+    /// may choose to lazy-load before returning.
     fn enumerate_nodes(&self) -> Vec<(Prefix, Node)>;
+    /// Root merkle hash if the tree is non-empty.
     fn get_root_hash(&self) -> Option<Hash>;
+    /// Lookup leaf value by full key hash.
     fn get_leaf_value(&self, key: Hash) -> Option<Hash>;
+
+    /// Convenience single-key upsert implemented in terms of batch_upsert.
+    #[inline]
+    fn upsert(&mut self, key: Hash, value: Hash) {
+        self.batch_upsert(&[(key, value)]);
+    }
+
+    /// Generic iterator-based batch convenience. This avoids forcing callers
+    /// to allocate a Vec if they already have an iterator. Default collects
+    /// into a small Vec then delegates to required slice method.
+    #[inline]
+    fn batch_upsert_iter<I>(&mut self, entries: I)
+    where
+        I: IntoIterator<Item = (Hash, Hash)>,
+    {
+        let vec: Vec<(Hash, Hash)> = entries.into_iter().collect();
+        if vec.is_empty() {
+            return;
+        }
+        self.batch_upsert(&vec);
+    }
 }
 
 #[cfg(test)]

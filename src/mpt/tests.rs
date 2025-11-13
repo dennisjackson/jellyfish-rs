@@ -31,6 +31,7 @@ macro_rules! test_all_impls {
             test_impl::<SledChanMPT>();
             test_impl::<RockLeafMPT>();
             test_impl::<RockSparseMPT>();
+            test_impl::<RocksParTransMPT>();
         }
     };
 }
@@ -47,6 +48,7 @@ macro_rules! for_each_impl {
         $macro!(SledChanMPT);
         $macro!(RockLeafMPT);
         $macro!(RockSparseMPT);
+        $macro!(RocksParTransMPT);
     };
 }
 
@@ -903,6 +905,7 @@ fn test_persistent_reopen_consistency() {
     test_sled_impl!(SledChanMPT, "SledChanMPT", "sled_chan");
     test_rocks_impl!(RockLeafMPT, "RockLeafMPT", "rock_leaf");
     test_rocks_impl!(RockSparseMPT, "RockSparseMPT", "rock_sparse");
+    test_rocks_impl!(RocksParTransMPT, "RocksParTransMPT", "rocks_par_trans");
 
     // Use the first implementation as reference
     let (reference_label, ref_root1, ref_count1, ref_root2, ref_count2, ref_root3, ref_count3) =
