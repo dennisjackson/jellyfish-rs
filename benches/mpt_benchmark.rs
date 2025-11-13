@@ -24,9 +24,9 @@ static GLOBAL_ALLOC: AllocProfiler = AllocProfiler::system();
 // Number of records per phase for large inserts.
 const RECORDS_PER_PHASE: usize = 20_000_000;
 // Chunk size for streaming generation to avoid allocating gigantic vectors.
-const GEN_CHUNK_SIZE: usize = 100_000;
+const GEN_CHUNK_SIZE: usize = 10_000;
 // Small loading benchmark size.
-const SECOND_LOAD: usize = 100_000;
+const SECOND_LOAD: usize = 1000;
 
 // Expensive benches use tiny sample sizes to avoid hours of runtime.
 const LARGE_SAMPLE_COUNT: u32 = 1; // statistical samples (loops)
@@ -90,9 +90,9 @@ macro_rules! bench_incremental_reopen {
             name = $bench_name,
             sample_count = LARGE_SAMPLE_COUNT,
             sample_size = LARGE_SAMPLE_SIZE,
-            counter = ItemsCount::new(RECORDS_PER_PHASE + SECOND_LOAD)
+            counter = ItemsCount::new(SECOND_LOAD)
         )]
-        fn $fn_name() {
+    fn $fn_name(b: divan::Bencher) {
             // Keep TempDir alive across reopen phases for consistent persistence.
             let temp_dir = TempDir::new().expect("temp dir");
             let bench_path: PathBuf = temp_dir.path().join(unique_dir_name($bench_name));
@@ -102,9 +102,11 @@ macro_rules! bench_incremental_reopen {
                 insert_streaming(&mut tree, 0, RECORDS_PER_PHASE);
                 tree.flush().ok();
             }
-            let mut tree = <$ty>::new_with_path(&bench_path).expect("reopen");
-            insert_streaming(&mut tree, RECORDS_PER_PHASE as u64, SECOND_LOAD);
-            black_box(tree.get_root_hash());
+            b.bench(|| {
+                let mut tree = <$ty>::new_with_path(&bench_path).expect("reopen");
+                insert_streaming(&mut tree, RECORDS_PER_PHASE as u64, SECOND_LOAD);
+                black_box(tree.get_root_hash());
+            });
         }
     };
 }
