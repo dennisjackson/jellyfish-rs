@@ -22,6 +22,7 @@ struct ParentChildren {
 }
 
 const KEEP_BELOW_FRONTIER: u16 = 3;
+const LOG_LEAVES_PER_FRONTIER: u16 = 6;
 
 pub struct RocksTransRelMPT {
     storage: RocksStorage,
@@ -1343,7 +1344,7 @@ impl RocksTransRelMPT {
             } else {
                 (leaf_nodes as f64).log2().ceil() as u16
             };
-            if current_depth > log_leaf_nodes.saturating_sub(10) {
+            if current_depth > log_leaf_nodes.saturating_sub(LOG_LEAVES_PER_FRONTIER) {
                 // Don't want depth to be close to true frontier
                 break;
             }
