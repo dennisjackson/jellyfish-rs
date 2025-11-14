@@ -21,8 +21,9 @@ struct ParentChildren {
     right: Option<(Prefix, Hash)>,
 }
 
-const KEEP_BELOW_FRONTIER: u16 = 3;
-const LOG_LEAVES_PER_FRONTIER: u16 = 6;
+const KEEP_BELOW_FRONTIER: u16 = 3; // How many levels of nodes to keep in memory below the frontier. Must be at least 1
+const LOG_LEAVES_PER_FRONTIER: u16 = 5; // How close the frontier can get to the leaves. Higher = more memory usage.
+const MAX_FRONTIER_DEPTH : u16 = 30; // Maximum allowed frontier depth to prevent excessive memory usage.
 
 pub struct RocksTransRelMPT {
     storage: RocksStorage,
@@ -325,14 +326,16 @@ impl RocksTransRelMPT {
             initialized = instance.load_interior_nodes_from_storage(complete_depth)?;
         }
         if !initialized && has_entries {
+            warn!("Doing full recovery");
             instance.recover_full_tree_from_storage()?;
             instance.full_tree_loaded.store(true, Ordering::Relaxed);
         }
         info!(
-            "Initialized RocksTransRelMPT with root {}, complete depth {}, approx entries {}",
+            "Initialized RocksTransRelMPT with root {}, complete depth {}, approx entries {}, leaves per frontier {}",
             instance.root.short_hex(),
             instance.complete_interior_depth.load(Ordering::Relaxed),
-            instance.estimate_leaf_count().unwrap()
+            instance.estimate_leaf_count().unwrap(),
+            instance.estimate_leaf_count().unwrap() / (2 << instance.complete_interior_depth.load(Ordering::Relaxed))
         );
         Ok(instance)
     }
@@ -1239,7 +1242,7 @@ impl RocksTransRelMPT {
         }
 
         // If depth is too large (>= 20), we can't have that many nodes
-        if depth >= 20 {
+        if depth >= MAX_FRONTIER_DEPTH {
             return false;
         }
 
@@ -1351,9 +1354,10 @@ impl RocksTransRelMPT {
 
             // Check if the next depth level is complete
             if self.check_depth_complete(next_depth) {
+                info!("Advancing frontier depth to {} with nodes {}", next_depth, 1u64 << next_depth);
                 // Persist all interior nodes at this newly complete depth to the database
                 if let Err(e) = self.persist_interior_nodes_at_depth_in_tx(next_depth, tx) {
-                    eprintln!(
+                    warn!(
                         "Warning: Failed to persist interior nodes at depth {}: {}",
                         next_depth, e
                     );
