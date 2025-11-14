@@ -930,6 +930,7 @@ impl MerklePatriciaTree for RockSparseMPT {
 
     fn batch_upsert(&mut self, entries: &[(Hash, Hash)]) {
         self.batch_upsert_optimized(entries);
+        self.flush().expect("Failed to flush after batch upsert");
     }
 
     fn enumerate_nodes(&self) -> Vec<(Prefix, Node)> {

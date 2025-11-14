@@ -77,6 +77,7 @@ impl RocksStorage {
         options.increase_parallelism(32);
         options.set_allow_concurrent_memtable_write(true);
         options.set_inplace_update_support(false);
+        options.set_manual_wal_flush(true);
         // Enable prefix bloom filter for efficient prefix scans
         // The prefix extractor extracts the first 2 bytes (the length field)
         options.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(2));
@@ -235,7 +236,8 @@ impl RocksStorage {
     }
 
     pub fn flush(&self) -> RocksResult<()> {
-        self.db.flush()?;
+        // self.db.flush()?;
+        self.db.flush_wal(true)?;
         Ok(())
     }
 
