@@ -617,7 +617,7 @@ impl RocksTransRelMPT {
 
         // Otherwise, still no active batch: start a local batch for this merge so both leaves persist
         let mut batch = self.storage.start_batch();
-        let _ = batch.put_node(&merged_prefix, &Node::Interior(new_interior));
+        // let _ = batch.put_node(&merged_prefix, &Node::Interior(new_interior));
         let _ = batch.put_node(&existing_prefix, &Node::Leaf(leaf));
         let _ = batch.put_node(&new_prefix, &Node::Leaf(new_leaf));
         let res = Self::recursive_batch_upsert(
@@ -1335,12 +1335,18 @@ impl MerklePatriciaTree for RocksTransRelMPT {
 mod tests {
     use super::*;
     use crate::Hash;
+    use rand::{Rng, SeedableRng};
+    use rand::rngs::StdRng;
+    use std::cell::RefCell;
 
-    fn make_hash(byte: u8) -> Hash {
-        let mut hash = [0u8; 32];
-        hash[0] = byte;
-        hash
+    thread_local! {
+        static RNG: RefCell<StdRng> = RefCell::new(StdRng::seed_from_u64(42));
     }
+
+    fn make_random_hash() -> Hash {
+        RNG.with(|rng| rng.borrow_mut().random::<[u8; 32]>())
+    }
+
 
     #[test]
     fn test_complete_interior_depth_empty_tree() {
@@ -1354,7 +1360,7 @@ mod tests {
         let mut tree = RocksTransRelMPT::new_temporary().expect("create tree");
 
         // Insert a single key-value pair
-        tree.batch_upsert(&[(make_hash(0x00), make_hash(0x01))]);
+        tree.batch_upsert(&[(make_random_hash(), make_random_hash())]);
 
         // With just one leaf, we should still have depth 0
         // (the root exists but is a leaf, not an interior)
@@ -1369,8 +1375,8 @@ mod tests {
         // 0x00 = 00000000...
         // 0x80 = 10000000...
         tree.batch_upsert(&[
-            (make_hash(0x00), make_hash(0x01)),
-            (make_hash(0x80), make_hash(0x02)),
+            (make_random_hash(), make_random_hash()),
+            (make_random_hash(), make_random_hash()),
         ]);
 
         // Now the root should be an interior node (depth 0 complete)
@@ -1386,10 +1392,10 @@ mod tests {
         // Insert 4 keys to create a tree with depth 2
         // This creates interior nodes at depth 0 and 1
         tree.batch_upsert(&[
-            (make_hash(0x00), make_hash(0x01)), // 00...
-            (make_hash(0x40), make_hash(0x02)), // 01...
-            (make_hash(0x80), make_hash(0x03)), // 10...
-            (make_hash(0xC0), make_hash(0x04)), // 11...
+            (make_random_hash(), make_random_hash()),
+            (make_random_hash(), make_random_hash()),
+            (make_random_hash(), make_random_hash()),
+            (make_random_hash(), make_random_hash()),
         ]);
 
         let depth = tree.complete_interior_depth();
@@ -1410,19 +1416,19 @@ mod tests {
         println!("Initial depth: {}", initial_depth);
 
         // Add first key
-        tree.batch_upsert(&[(make_hash(0x00), make_hash(0x01))]);
+        tree.batch_upsert(&[(make_random_hash(), make_random_hash())]);
         let depth1 = tree.complete_interior_depth();
         println!("Depth after 1 insert: {}", depth1);
 
         // Add second key (different first bit)
-        tree.batch_upsert(&[(make_hash(0x80), make_hash(0x02))]);
+        tree.batch_upsert(&[(make_random_hash(), make_random_hash())]);
         let depth2 = tree.complete_interior_depth();
         println!("Depth after 2 inserts: {}", depth2);
 
         // Add third and fourth keys
         tree.batch_upsert(&[
-            (make_hash(0x40), make_hash(0x03)),
-            (make_hash(0xC0), make_hash(0x04)),
+            (make_random_hash(), make_random_hash()),
+            (make_random_hash(), make_random_hash()),
         ]);
         let depth3 = tree.complete_interior_depth();
         println!("Depth after 4 inserts: {}", depth3);
@@ -1430,5 +1436,111 @@ mod tests {
         // The depth should not decrease
         assert!(depth3 >= depth2);
         assert!(depth2 >= depth1);
+    }
+
+    #[cfg(test)]
+    impl RocksTransRelMPT {
+        /// Checks that the in-memory tree is complete down to the frontier, and pruned below it.
+        fn check_frontier_invariant(&self) {
+            let complete_depth = self.complete_interior_depth();
+            let mut queue: std::collections::VecDeque<Prefix> = std::collections::VecDeque::new();
+            if self.store.get(&self.root).is_some() {
+                queue.push_back(self.root);
+            }
+
+            let mut visited = std::collections::HashSet::new();
+            visited.insert(self.root);
+
+            while let Some(prefix) = queue.pop_front() {
+                if prefix.length >= complete_depth {
+                    // Nodes at the frontier should exist, but we don't check their children.
+                    // Nodes below the frontier should not be in the queue.
+                    assert!(
+                        prefix.length == complete_depth,
+                        "Node {} with depth {} found below frontier depth {}",
+                        prefix.short_hex(),
+                        prefix.length,
+                        complete_depth
+                    );
+                    continue;
+                }
+
+                // We are above the frontier, so this must be an interior node.
+                let node = self.store.get(&prefix).expect("Missing node in tree traversal");
+                match node.value() {
+                    Node::Interior(interior) => {
+                        // Children must be in the store if we are above the frontier.
+                        if !visited.contains(&interior.left) {
+                            assert!(
+                                self.store.contains_key(&interior.left),
+                                "Left child {} of {} not in store",
+                                interior.left.short_hex(),
+                                prefix.short_hex()
+                            );
+                            queue.push_back(interior.left);
+                            visited.insert(interior.left);
+                        }
+                        if !visited.contains(&interior.right) {
+                            assert!(
+                                self.store.contains_key(&interior.right),
+                                "Right child {} of {} not in store",
+                                interior.right.short_hex(),
+                                prefix.short_hex()
+                            );
+                            queue.push_back(interior.right);
+                            visited.insert(interior.right);
+                        }
+                    }
+                    Node::Leaf(_) => {
+                        panic!(
+                            "Leaf node found at prefix {} with depth {}, which is above the frontier depth {}",
+                            prefix.short_hex(),
+                            prefix.length,
+                            complete_depth
+                        );
+                    }
+                }
+            }
+
+            // Check that all nodes at the frontier depth are present.
+            if complete_depth > 0 {
+                let expected_frontier_nodes = 1u64 << complete_depth;
+                for i in 0..expected_frontier_nodes {
+                    let prefix = Self::prefix_from_depth_and_index(complete_depth, i);
+                    assert!(
+                        self.store.contains_key(&prefix),
+                        "Frontier node {} at depth {} is missing from the store",
+                        prefix.short_hex(),
+                        complete_depth
+                    );
+                }
+            }
+
+            // Verify no nodes below the frontier exist in the store.
+            for item in self.store.iter() {
+                let prefix = item.key();
+                assert!(
+                    prefix.length <= complete_depth,
+                    "Node {} with depth {} found in store, but is below frontier depth {}",
+                    prefix.short_hex(),
+                    prefix.length,
+                    complete_depth
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_frontier_invariant_after_batch_insert() {
+        let mut tree = RocksTransRelMPT::new_temporary().expect("create tree");
+
+        // Insert enough keys to create a few levels of interior nodes.
+        let entries: Vec<_> = (0..10000u32)
+            .map(|_| (make_random_hash(), make_random_hash()))
+            .collect();
+        tree.batch_upsert(&entries);
+
+        // After the batch insert, the invariant should hold.
+        tree.check_frontier_invariant();
     }
 }
