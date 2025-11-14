@@ -306,7 +306,7 @@ impl RocksTransRelMPT {
         let estimated_entries = approx_entries.max(1);
         let mut instance = Self {
             storage,
-            store: DashMap::with_capacity(estimated_entries.saturating_mul(2)),
+            store: DashMap::with_capacity(2_usize.pow(complete_depth as u32 +4)),
             root,
             dirty_prefixes: DashSet::new(),
             loaded_subtrees: DashSet::new(),
@@ -532,6 +532,7 @@ impl RocksTransRelMPT {
                 self.storage
                     .write_batch(batch)
                     .expect("Failed to commit leaf update batch");
+                self.release_subtree(res);
                 return res;
             }
         }
@@ -609,7 +610,7 @@ impl RocksTransRelMPT {
                 .write_batch(batch)
                 .expect("Failed to commit leaf-merge subtree batch");
             self.release_subtree(res);
-            self.loaded_subtrees.insert(merged_prefix);
+            // self.loaded_subtrees.insert(merged_prefix);
             *boundary_started = true;
             return res;
         }
@@ -629,6 +630,7 @@ impl RocksTransRelMPT {
         self.storage
             .write_batch(batch)
             .expect("Failed to commit leaf-merge batch");
+        // self.release_subtree(res);
         res
     }
 
@@ -682,7 +684,8 @@ impl RocksTransRelMPT {
                 self.storage
                     .write_batch(batch)
                     .expect("Failed to commit diverge-all subtree batch");
-                self.loaded_subtrees.insert(interior_prefix);
+                // self.loaded_subtrees.insert(interior_prefix);
+                self.release_subtree(res);
                 *boundary_started = true;
                 return res;
             } else {
@@ -750,7 +753,8 @@ impl RocksTransRelMPT {
                 self.storage
                     .write_batch(batch)
                     .expect("Failed to commit diverge-left subtree batch");
-                self.loaded_subtrees.insert(interior_prefix);
+                // self.loaded_subtrees.insert(interior_prefix);
+                self.release_subtree(res);
                 *boundary_started = true;
                 return res;
             } else {
@@ -787,7 +791,8 @@ impl RocksTransRelMPT {
                 self.storage
                     .write_batch(batch)
                     .expect("Failed to commit diverge-right subtree batch");
-                self.loaded_subtrees.insert(interior_prefix);
+                // self.loaded_subtrees.insert(interior_prefix);
+                self.release_subtree(res);
                 *boundary_started = true;
                 return res;
             } else {
@@ -855,7 +860,8 @@ impl RocksTransRelMPT {
             self.storage
                 .write_batch(batch)
                 .expect("Failed to commit subtree batch");
-            self.loaded_subtrees.insert(interior_prefix);
+            // self.loaded_subtrees.insert(interior_prefix);
+            // self.release_subtree(interior_prefix);
             *boundary_started = true;
             return interior_prefix;
         } else if count > 64 && active_batch.is_none() {
