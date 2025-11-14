@@ -3,8 +3,7 @@ use std::{fmt, io};
 
 use rayon::prelude::*;
 use rocksdb::{
-    DBIteratorWithThreadMode, Direction, IteratorMode, OptimisticTransactionDB, Options,
-    Transaction, WriteBatchWithTransaction,
+    Cache, DBIteratorWithThreadMode, Direction, IteratorMode, OptimisticTransactionDB, Options, Transaction, WriteBatchWithTransaction
 };
 
 use crate::{Hash, Prefix, prefix::HashExt};
@@ -66,6 +65,7 @@ impl From<io::Error> for RocksStorageError {
 
 pub struct RocksStorage {
     db: OptimisticTransactionDB,
+    cache: Cache,
 }
 
 impl RocksStorage {
@@ -73,7 +73,9 @@ impl RocksStorage {
         let mut options = Options::default();
         options.create_if_missing(true);
         // options.set_max_open_files(512);
+        let cache = Cache::new_lru_cache(1024*1024*1024);
         options.optimize_universal_style_compaction(1024 * 1024 * 1024);
+        options.set_row_cache(&cache);
         options.increase_parallelism(32);
         options.set_allow_concurrent_memtable_write(true);
         options.set_inplace_update_support(false);
@@ -82,7 +84,7 @@ impl RocksStorage {
         // The prefix extractor extracts the first 2 bytes (the length field)
         options.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(2));
         let db = OptimisticTransactionDB::open(&options, path)?;
-        Ok(Self { db })
+        Ok(Self { db, cache })
     }
 
     pub fn start_transaction(&self) -> RocksTransaction<'_> {

@@ -209,10 +209,10 @@ impl RocksTransRelMPT {
     }
 
     fn load_subtree_from_storage(&self, prefix: Prefix) -> RocksResult<bool> {
-        if self.loaded_subtrees.contains(&prefix) {
-            debug!("Subtree prefix {} already loaded", prefix.short_hex());
-            return Ok(false);
-        }
+        // if self.loaded_subtrees.contains(&prefix) {
+        //     debug!("Subtree prefix {} already loaded", prefix.short_hex());
+        //     return Ok(false);
+        // }
 
         self.prefix_loads.fetch_add(1, Ordering::Relaxed);
         let leaf_nodes = self.storage.get_leaf_nodes_by_prefix(&prefix)?;
@@ -378,6 +378,13 @@ impl RocksTransRelMPT {
         }
 
         self.root = new_root;
+
+        // Prune all nodes below the frontier to maintain the invariant
+        // Only prune when we have an established frontier with multiple levels
+        // For small trees (frontier at depth 0), keep everything in memory
+        if self.complete_interior_depth.load(Ordering::Relaxed) > 0 {
+            self.prune_below_frontier();
+        }
     }
 
     fn batch_upsert_memory_only(&mut self, entries: &[(Hash, Hash)]) {
@@ -1193,7 +1200,6 @@ impl RocksTransRelMPT {
         // Collect all interior nodes at this depth
         for i in 0..expected_count {
             let prefix = Self::prefix_from_depth_and_index(depth, i);
-            self.loaded_subtrees.insert(prefix); // Mark as loaded
             if let Some(node_ref) = self.store.get(&prefix) {
                 if matches!(node_ref.value(), Node::Interior(_)) {
                     nodes_to_write.push((prefix, node_ref.value().clone()));
@@ -1266,6 +1272,7 @@ impl RocksTransRelMPT {
 
     /// Release all nodes in the subtree starting from `prefix`, excluding the node at `prefix` itself.
     fn release_subtree(&self, prefix: Prefix) {
+        self.full_tree_loaded.store(false, Ordering::Relaxed);
         if let Some(node_ref) = self.store.get(&prefix) {
             match node_ref.value() {
                 Node::Interior(interior) => {
@@ -1279,6 +1286,32 @@ impl RocksTransRelMPT {
                     // Nothing to do for a leaf, as it has no children.
                 }
             }
+        }
+    }
+
+    /// Prune all nodes from memory that are below the frontier depth.
+    /// This maintains the invariant that only nodes at or above the frontier depth remain in memory.
+    fn prune_below_frontier(&self) {
+        self.full_tree_loaded.store(false, Ordering::Relaxed);
+        let frontier_depth = self.complete_interior_depth.load(Ordering::Relaxed);
+
+        // Collect all prefixes that need to be removed (depth > frontier_depth, not >= )
+        // Never remove the root node regardless of depth
+        let to_remove: Vec<Prefix> = self.store
+            .iter()
+            .filter_map(|entry| {
+                let prefix = *entry.key();
+                if prefix.length > frontier_depth && prefix != self.root {
+                    Some(prefix)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Remove all nodes below the frontier
+        for prefix in to_remove {
+            self.store.remove(&prefix);
         }
     }
 }
