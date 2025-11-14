@@ -21,6 +21,8 @@ struct ParentChildren {
     right: Option<(Prefix, Hash)>,
 }
 
+const KEEP_BELOW_FRONTIER: u16 = 3;
+
 pub struct RocksTransRelMPT {
     storage: RocksStorage,
     store: DashMap<Prefix, Node>,
@@ -1272,6 +1274,7 @@ impl RocksTransRelMPT {
 
     /// Release all nodes in the subtree starting from `prefix`, excluding the node at `prefix` itself.
     fn release_subtree(&self, prefix: Prefix) {
+        let depth = self.complete_interior_depth.load(Ordering::Relaxed);
         self.full_tree_loaded.store(false, Ordering::Relaxed);
         if let Some(node_ref) = self.store.get(&prefix) {
             match node_ref.value() {
@@ -1279,8 +1282,12 @@ impl RocksTransRelMPT {
                     // Recursively release children and then remove them.
                     self.release_subtree(interior.left);
                     self.release_subtree(interior.right);
-                    self.store.remove(&interior.left);
-                    self.store.remove(&interior.right);
+                    if interior.left.length > depth+3 {
+                        self.store.remove(&interior.left);
+                    }
+                    if interior.right.length > depth+KEEP_BELOW_FRONTIER {
+                        self.store.remove(&interior.right);
+                    }
                 }
                 Node::Leaf(_) => {
                     // Nothing to do for a leaf, as it has no children.
@@ -1294,25 +1301,14 @@ impl RocksTransRelMPT {
     fn prune_below_frontier(&self) {
         self.full_tree_loaded.store(false, Ordering::Relaxed);
         let frontier_depth = self.complete_interior_depth.load(Ordering::Relaxed);
+        let root = self.root;
 
-        // Collect all prefixes that need to be removed (depth > frontier_depth, not >= )
-        // Never remove the root node regardless of depth
-        let to_remove: Vec<Prefix> = self.store
-            .iter()
-            .filter_map(|entry| {
-                let prefix = *entry.key();
-                if prefix.length > frontier_depth && prefix != self.root {
-                    Some(prefix)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Remove all nodes below the frontier
-        for prefix in to_remove {
-            self.store.remove(&prefix);
-        }
+        // Remove nodes in parallel without collecting first
+        // DashMap supports concurrent removal, so we can safely remove during iteration
+        self.store.retain(|prefix, _| {
+            // Keep nodes at or above frontier depth, and always keep the root
+            prefix.length <= frontier_depth+KEEP_BELOW_FRONTIER || *prefix == root
+        });
     }
 }
 
@@ -1485,19 +1481,20 @@ mod tests {
             visited.insert(self.root);
 
             while let Some(prefix) = queue.pop_front() {
-                if prefix.length >= complete_depth {
+                if prefix.length > complete_depth+KEEP_BELOW_FRONTIER as u16 {
                     // Nodes at the frontier should exist, but we don't check their children.
                     // Nodes below the frontier should not be in the queue.
-                    assert!(
-                        prefix.length == complete_depth,
+                    panic!(
                         "Node {} with depth {} found below frontier depth {}",
                         prefix.short_hex(),
                         prefix.length,
-                        complete_depth
+                        complete_depth+KEEP_BELOW_FRONTIER as u16
                     );
-                    continue;
                 }
 
+                if prefix.length == complete_depth+KEEP_BELOW_FRONTIER as u16 {
+                    continue;
+                }
                 // We are above the frontier, so this must be an interior node.
                 let node = self.store.get(&prefix).expect("Missing node in tree traversal");
                 match node.value() {
@@ -1553,11 +1550,11 @@ mod tests {
             for item in self.store.iter() {
                 let prefix = item.key();
                 assert!(
-                    prefix.length <= complete_depth,
+                    prefix.length <= complete_depth+KEEP_BELOW_FRONTIER,
                     "Node {} with depth {} found in store, but is below frontier depth {}",
                     prefix.short_hex(),
                     prefix.length,
-                    complete_depth
+                    complete_depth+KEEP_BELOW_FRONTIER
                 );
             }
         }
