@@ -331,7 +331,7 @@ impl RocksTransRelMPT {
             "Initialized RocksTransRelMPT with root {}, complete depth {}, approx entries {}",
             instance.root.short_hex(),
             instance.complete_interior_depth.load(Ordering::Relaxed),
-            approx_entries
+            instance.estimate_leaf_count().unwrap()
         );
         Ok(instance)
     }
@@ -1106,7 +1106,7 @@ impl RocksTransRelMPT {
     }
 
     pub fn len(&self) -> usize {
-        self.storage.approximate_entry_count()
+        self.estimate_leaf_count().unwrap()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1117,6 +1117,111 @@ impl RocksTransRelMPT {
     /// At this depth, all 2^depth nodes exist and are interior nodes.
     pub fn complete_interior_depth(&self) -> u16 {
         self.complete_interior_depth.load(Ordering::Relaxed)
+    }
+
+    /// Estimates the number of leaf nodes by sampling random interior nodes at the frontier level.
+    ///
+    /// This method randomly samples interior nodes at the complete_interior_depth and counts
+    /// the leaf nodes below each sampled node. It then extrapolates this to estimate the total
+    /// number of leaf nodes in the tree.
+    ///
+    /// # Arguments
+    /// * `sample_size` - Number of frontier nodes to sample. More samples give better accuracy
+    ///                   but take longer. Default recommendation: 100-1000 samples.
+    ///
+    /// # Returns
+    /// An estimated count of leaf nodes in the tree. If the tree is too small or the frontier
+    /// depth is 0, falls back to approximate_entry_count().
+    pub fn estimate_leaf_count_by_sampling(&self, sample_size: usize) -> RocksResult<usize> {
+        let frontier_depth = self.complete_interior_depth.load(Ordering::Relaxed);
+
+        // If frontier depth is 0, we can't sample interior nodes meaningfully
+        if frontier_depth == 0 {
+            return Ok(self.storage.approximate_entry_count());
+        }
+
+        // Calculate total number of nodes at frontier depth
+        let total_frontier_nodes = if frontier_depth >= 63 {
+            // Avoid overflow for very deep trees
+            warn!("Frontier depth {} is too deep for sampling estimation", frontier_depth);
+            return Ok(self.storage.approximate_entry_count());
+        } else {
+            1u64 << frontier_depth
+        };
+
+        // Clamp sample size to the total number of frontier nodes
+        let actual_sample_size = sample_size.min(total_frontier_nodes as usize);
+
+        if actual_sample_size == 0 {
+            return Ok(0);
+        }
+
+        // Generate random indices to sample
+        use rand::Rng;
+        let mut rng = rand::rng();
+        let mut samples: Vec<u64> = Vec::with_capacity(actual_sample_size);
+
+        // Use reservoir sampling if we're sampling a significant portion
+        if actual_sample_size as u64 > total_frontier_nodes / 2 {
+            // Sample all nodes (or most of them)
+            samples = (0..total_frontier_nodes).collect();
+            if actual_sample_size < total_frontier_nodes as usize {
+                // Shuffle and take the first sample_size
+                use rand::seq::SliceRandom;
+                samples.shuffle(&mut rng);
+                samples.truncate(actual_sample_size);
+            }
+        } else {
+            // Random sampling with replacement (simpler, good enough for large populations)
+            for _ in 0..actual_sample_size {
+                samples.push(rng.random_range(0..total_frontier_nodes));
+            }
+        }
+
+        // Count leaves for each sampled frontier node
+        let leaf_counts: Vec<usize> = samples
+            .par_iter()
+            .map(|&index| {
+                let prefix = Self::prefix_from_depth_and_index(frontier_depth, index);
+                match self.storage.get_leaf_nodes_by_prefix(&prefix) {
+                    Ok(leaves) => leaves.len(),
+                    Err(e) => {
+                        warn!("Error counting leaves for prefix {}: {}", prefix.short_hex(), e);
+                        0
+                    }
+                }
+            })
+            .collect();
+
+        // Calculate average leaves per frontier node
+        let total_sampled_leaves: usize = leaf_counts.iter().sum();
+        let avg_leaves_per_node = total_sampled_leaves as f64 / actual_sample_size as f64;
+
+        // Extrapolate to total tree
+        let estimated_total = (avg_leaves_per_node * total_frontier_nodes as f64) as usize;
+
+        debug!(
+            "Sampled {} frontier nodes at depth {}, avg {:.2} leaves/node, estimated {} total leaves",
+            actual_sample_size, frontier_depth, avg_leaves_per_node, estimated_total
+        );
+
+        Ok(estimated_total)
+    }
+
+    /// Estimates the number of leaf nodes with a default sample size.
+    ///
+    /// Uses a sample size of min(100, 10% of frontier nodes) for a good balance
+    /// between accuracy and performance.
+    pub fn estimate_leaf_count(&self) -> RocksResult<usize> {
+        let frontier_depth = self.complete_interior_depth.load(Ordering::Relaxed);
+        if frontier_depth == 0 {
+            return Ok(self.storage.approximate_entry_count());
+        }
+
+        let total_frontier_nodes = 1u64 << frontier_depth.min(20);
+        let default_sample_size = ((total_frontier_nodes as usize / 10).max(10)).min(100);
+
+        self.estimate_leaf_count_by_sampling(default_sample_size)
     }
 
     /// Check if all nodes at the given depth exist and are interior nodes.
@@ -1232,7 +1337,7 @@ impl RocksTransRelMPT {
                 break;
             }
 
-            let leaf_nodes = self.storage.approximate_entry_count();
+            let leaf_nodes = self.estimate_leaf_count().unwrap();
             let log_leaf_nodes = if leaf_nodes == 0 {
                 0
             } else {
@@ -1572,5 +1677,106 @@ mod tests {
 
         // After the batch insert, the invariant should hold.
         tree.check_frontier_invariant();
+    }
+
+    #[test]
+    fn test_estimate_leaf_count_empty_tree() {
+        let tree = RocksTransRelMPT::new_temporary().expect("create tree");
+        let estimate = tree.estimate_leaf_count().expect("estimate leaves");
+        // Empty tree may have the root node counted, so allow 0 or 1
+        assert!(estimate <= 1, "Empty tree should have 0 or 1 entries, got {}", estimate);
+    }
+
+    #[test]
+    fn test_estimate_leaf_count_small_tree() {
+        let mut tree = RocksTransRelMPT::new_temporary().expect("create tree");
+
+        // Insert 10 entries
+        let entries: Vec<_> = (0..10u32)
+            .map(|_| (make_random_hash(), make_random_hash()))
+            .collect();
+        tree.batch_upsert(&entries);
+
+        let estimate = tree.estimate_leaf_count().expect("estimate leaves");
+        println!("Estimated {} leaves for tree with 10 entries", estimate);
+
+        // The estimate should be close to 10 (within reasonable margin)
+        // For small trees, there might be more variation
+        assert!(estimate >= 5 && estimate <= 20,
+                "Estimate {} should be roughly 10 (5-20 range)", estimate);
+    }
+
+    #[test]
+    fn test_estimate_leaf_count_medium_tree() {
+        let mut tree = RocksTransRelMPT::new_temporary().expect("create tree");
+
+        // Insert 1000 entries
+        let entries: Vec<_> = (0..1000u32)
+            .map(|_| (make_random_hash(), make_random_hash()))
+            .collect();
+        tree.batch_upsert(&entries);
+
+        let estimate = tree.estimate_leaf_count().expect("estimate leaves");
+        println!("Estimated {} leaves for tree with 1000 entries", estimate);
+        println!("Frontier depth: {}", tree.complete_interior_depth());
+
+        // The estimate should be close to 1000 (within 20%)
+        assert!(estimate >= 800 && estimate <= 1200,
+                "Estimate {} should be roughly 1000 (800-1200 range)", estimate);
+    }
+
+    #[test]
+    fn test_estimate_leaf_count_with_custom_sample_size() {
+        let mut tree = RocksTransRelMPT::new_temporary().expect("create tree");
+
+        // Insert 500 entries
+        let entries: Vec<_> = (0..500u32)
+            .map(|_| (make_random_hash(), make_random_hash()))
+            .collect();
+        tree.batch_upsert(&entries);
+
+        // Try different sample sizes
+        let estimate_10 = tree.estimate_leaf_count_by_sampling(10).expect("estimate with 10 samples");
+        let estimate_50 = tree.estimate_leaf_count_by_sampling(50).expect("estimate with 50 samples");
+        let estimate_200 = tree.estimate_leaf_count_by_sampling(200).expect("estimate with 200 samples");
+
+        println!("Estimates: 10 samples={}, 50 samples={}, 200 samples={}",
+                 estimate_10, estimate_50, estimate_200);
+
+        // All estimates should be in a reasonable range
+        for estimate in [estimate_10, estimate_50, estimate_200] {
+            assert!(estimate >= 300 && estimate <= 700,
+                    "Estimate {} should be roughly 500", estimate);
+        }
+    }
+
+    #[test]
+    fn test_estimate_vs_actual_count() {
+        let mut tree = RocksTransRelMPT::new_temporary().expect("create tree");
+
+        // Insert 2000 entries
+        let entries: Vec<_> = (0..2000u32)
+            .map(|_| (make_random_hash(), make_random_hash()))
+            .collect();
+        tree.batch_upsert(&entries);
+
+        // Get estimate
+        let estimate = tree.estimate_leaf_count_by_sampling(100).expect("estimate leaves");
+
+        // Get actual count by loading full tree
+        tree.ensure_full_tree_loaded();
+        let actual = tree.store.iter()
+            .filter(|entry| matches!(entry.value(), Node::Leaf(_)))
+            .count();
+
+        println!("Estimated {} leaves, actual {}", estimate, actual);
+        println!("Frontier depth: {}", tree.complete_interior_depth());
+
+        // The estimate should be within 20% of actual
+        let lower_bound = (actual as f64 * 0.8) as usize;
+        let upper_bound = (actual as f64 * 1.2) as usize;
+        assert!(estimate >= lower_bound && estimate <= upper_bound,
+                "Estimate {} should be within 20% of actual {} ({}-{})",
+                estimate, actual, lower_bound, upper_bound);
     }
 }
