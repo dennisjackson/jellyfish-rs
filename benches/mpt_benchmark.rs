@@ -1,6 +1,6 @@
 use divan::{self, AllocProfiler, black_box, counter::ItemsCount};
 use jellyfish_rs::Hash;
-use jellyfish_rs::mpt::{MerklePatriciaTree, RockLeafMPT, RockSparseMPT, RocksParTransMPT};
+use jellyfish_rs::mpt::{MerklePatriciaTree, RockLeafMPT, RockSparseMPT, RocksParTransMPT, RocksTransRelMPT};
 use rand::{rngs::StdRng, SeedableRng, RngCore};
 use tempfile::TempDir; // Reintroduce TempDir for automatic cleanup
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,7 +22,7 @@ fn unique_dir_name(base: &str) -> String {
 // static GLOBAL_ALLOC: AllocProfiler = AllocProfiler::system();
 
 // Number of records per phase for large inserts.
-const RECORDS_PER_PHASE: usize = 20_000_000;
+const RECORDS_PER_PHASE: usize = 5_000_000;
 // Chunk size for streaming generation to avoid allocating gigantic vectors.
 const GEN_CHUNK_SIZE: usize = 10_000;
 // Small loading benchmark size.
@@ -140,6 +140,11 @@ bench_fresh!(
     RocksParTransMPT,
     "rocks_par_trans_fresh_5m"
 );
+bench_fresh!(
+    rocks_trans_rel_fresh_5m,
+    RocksTransRelMPT,
+    "rocks_trans_rel_fresh_5m"
+);
 
 bench_incremental_reopen!(
     rock_leaf_incremental_reopen,
@@ -156,22 +161,11 @@ bench_incremental_reopen!(
     RocksParTransMPT,
     "rocks_par_trans_incremental_reopen_5m_plus_5m"
 );
-
-// bench_load_small_after_large!(
-//     rock_leaf_load_small,
-//     RockLeafMPT,
-//     "rock_leaf_load_after_5m_plus_1k"
-// // );
-// bench_load_small_after_large!(
-//     rock_sparse_load_small,
-//     RockSparseMPT,
-//     "rock_sparse_load_after_5m_plus_1k"
-// );
-// bench_load_small_after_large!(
-//     rocks_par_trans_load_small,
-//     RocksParTransMPT,
-//     "rocks_par_trans_load_after_5m_plus_1k"
-// );
+bench_incremental_reopen!(
+    rocks_trans_rel_incremental_reopen,
+    RocksTransRelMPT,
+    "rocks_trans_rel_incremental_reopen_5m_plus_5m"
+);
 
 fn main() {
     divan::main();

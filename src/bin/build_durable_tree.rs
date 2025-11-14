@@ -1,5 +1,5 @@
 use indicatif::{ProgressBar, ProgressStyle};
-use jellyfish_rs::mpt::{MerklePatriciaTree, RocksParTransMPT};
+use jellyfish_rs::mpt::{MerklePatriciaTree, RocksTransRelMPT};
 use jellyfish_rs::{BatchMPT, Hash};
 use log::info;
 use std::env;
@@ -10,7 +10,7 @@ use std::time::Instant;
 const IN_MEMORY_FLAG: &str = "--in-memory";
 
 enum Tree {
-    Durable(RocksParTransMPT),
+    Durable(RocksTransRelMPT),
     InMemory(BatchMPT),
 }
 
@@ -117,10 +117,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     } else if let Some(path) = db_path {
         ensure_parent(path)?;
         info!("Writing durable MPT to {}", path);
-        Tree::Durable(RocksParTransMPT::new_with_path(path)?)
+        Tree::Durable(RocksTransRelMPT::new_with_path(path)?)
     } else {
         info!("Using temporary database path for durable MPT");
-        Tree::Durable(RocksParTransMPT::new())
+        Tree::Durable(RocksTransRelMPT::new())
     };
     let startup_time = start.elapsed().as_secs_f64();
     let current_tree_size = tree.len();

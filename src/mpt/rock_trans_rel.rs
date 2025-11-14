@@ -571,7 +571,6 @@ impl RocksTransRelMPT {
 
         // If we already have an active batch, just write into it and continue.
         if let Some(batch) = active_batch.as_deref_mut() {
-            let _ = batch.put_node(&merged_prefix, &Node::Interior(new_interior));
             let _ = batch.put_node(&existing_prefix, &Node::Leaf(leaf));
             let _ = batch.put_node(&new_prefix, &Node::Leaf(new_leaf));
             return Self::recursive_batch_upsert(
@@ -609,6 +608,7 @@ impl RocksTransRelMPT {
             self.storage
                 .write_batch(batch)
                 .expect("Failed to commit leaf-merge subtree batch");
+            self.release_subtree(res);
             self.loaded_subtrees.insert(merged_prefix);
             *boundary_started = true;
             return res;
@@ -920,10 +920,6 @@ impl RocksTransRelMPT {
 
         // Always update memory with the interior node (non-persistence path)
         self.insert_node_memory_only(interior_prefix, Node::Interior(updated_interior.clone()));
-        // If part of an active batch, persist this interior as well.
-        if let Some(batch) = active_batch.as_deref_mut() {
-            let _ = batch.put_node(&interior_prefix, &Node::Interior(updated_interior));
-        }
 
         // Not a persistence boundary here.
         interior_prefix
@@ -998,7 +994,6 @@ impl RocksTransRelMPT {
         self.insert_node_memory_only(new_leaf_prefix, Node::Leaf(new_leaf.clone()));
 
         if let Some(batch) = active_batch.as_deref_mut() {
-            let _ = batch.put_node(&common, &Node::Interior(new_interior));
             let _ = batch.put_node(&new_leaf_prefix, &Node::Leaf(new_leaf));
         }
 
@@ -1260,6 +1255,24 @@ impl RocksTransRelMPT {
                 "Warning: Failed to persist complete depth {}: {}",
                 current_depth, e
             );
+        }
+    }
+
+    /// Release all nodes in the subtree starting from `prefix`, excluding the node at `prefix` itself.
+    fn release_subtree(&self, prefix: Prefix) {
+        if let Some(node_ref) = self.store.get(&prefix) {
+            match node_ref.value() {
+                Node::Interior(interior) => {
+                    // Recursively release children and then remove them.
+                    self.release_subtree(interior.left);
+                    self.release_subtree(interior.right);
+                    self.store.remove(&interior.left);
+                    self.store.remove(&interior.right);
+                }
+                Node::Leaf(_) => {
+                    // Nothing to do for a leaf, as it has no children.
+                }
+            }
         }
     }
 }
