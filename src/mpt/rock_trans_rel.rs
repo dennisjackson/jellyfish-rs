@@ -24,6 +24,7 @@ struct ParentChildren {
 const KEEP_BELOW_FRONTIER: u16 = 3; // How many levels of nodes to keep in memory below the frontier. Must be at least 1
 const LOG_LEAVES_PER_FRONTIER: u16 = 5; // How close the frontier can get to the leaves. Higher = more memory usage.
 const MAX_FRONTIER_DEPTH : u16 = 30; // Maximum allowed frontier depth to prevent excessive memory usage.
+const DEPTH_ALWAYS_KEEP : u16 = 19; // Always keep nodes up to this depth in memory to avoid excessive loads.
 
 pub struct RocksTransRelMPT {
     storage: RocksStorage,
@@ -1386,16 +1387,17 @@ impl RocksTransRelMPT {
     fn release_subtree(&self, prefix: Prefix) {
         let depth = self.complete_interior_depth.load(Ordering::Relaxed);
         self.full_tree_loaded.store(false, Ordering::Relaxed);
+        let max_depth = (depth+KEEP_BELOW_FRONTIER).max(DEPTH_ALWAYS_KEEP);
         if let Some(node_ref) = self.store.get(&prefix) {
             match node_ref.value() {
                 Node::Interior(interior) => {
                     // Recursively release children and then remove them.
                     self.release_subtree(interior.left);
                     self.release_subtree(interior.right);
-                    if interior.left.length > depth+3 {
+                    if interior.left.length > max_depth {
                         self.store.remove(&interior.left);
                     }
-                    if interior.right.length > depth+KEEP_BELOW_FRONTIER {
+                    if interior.right.length > max_depth {
                         self.store.remove(&interior.right);
                     }
                 }
@@ -1417,7 +1419,7 @@ impl RocksTransRelMPT {
         // DashMap supports concurrent removal, so we can safely remove during iteration
         self.store.retain(|prefix, _| {
             // Keep nodes at or above frontier depth, and always keep the root
-            prefix.length <= frontier_depth+KEEP_BELOW_FRONTIER || *prefix == root
+            prefix.length <= frontier_depth+KEEP_BELOW_FRONTIER || *prefix == root || prefix.length <= DEPTH_ALWAYS_KEEP
         });
     }
 }
