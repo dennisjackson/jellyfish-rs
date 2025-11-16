@@ -21,10 +21,10 @@ struct ParentChildren {
     right: Option<(Prefix, Hash)>,
 }
 
-const KEEP_BELOW_FRONTIER: u16 = 3; // How many levels of nodes to keep in memory below the frontier. Must be at least 1
-const LOG_LEAVES_PER_FRONTIER: u16 = 5; // How close the frontier can get to the leaves. Higher = more memory usage.
-const MAX_FRONTIER_DEPTH : u16 = 30; // Maximum allowed frontier depth to prevent excessive memory usage.
-const DEPTH_ALWAYS_KEEP : u16 = 19; // Always keep nodes up to this depth in memory to avoid excessive loads.
+const KEEP_BELOW_FRONTIER: u16 = 2; // How many levels of nodes to keep in memory below the frontier. Must be at least 1
+const LOG_LEAVES_PER_FRONTIER: u16 = 1; // How close the frontier can get to the leaves. Higher = more memory usage.
+const MAX_FRONTIER_DEPTH: u16 = 24; // Maximum allowed frontier depth to prevent excessive memory usage.
+const DEPTH_ALWAYS_KEEP: u16 = 23; // Always keep nodes up to this depth in memory to avoid excessive loads.
 
 pub struct RocksTransRelMPT {
     storage: RocksStorage,
@@ -311,7 +311,7 @@ impl RocksTransRelMPT {
         let estimated_entries = approx_entries.max(1);
         let mut instance = Self {
             storage,
-            store: DashMap::with_capacity(2_usize.pow(complete_depth as u32 +4)),
+            store: DashMap::with_capacity(2_usize.pow(complete_depth as u32 + 4)),
             root,
             dirty_prefixes: DashSet::new(),
             loaded_subtrees: DashSet::new(),
@@ -336,7 +336,8 @@ impl RocksTransRelMPT {
             instance.root.short_hex(),
             instance.complete_interior_depth.load(Ordering::Relaxed),
             instance.estimate_leaf_count().unwrap(),
-            instance.estimate_leaf_count().unwrap() / (2 << instance.complete_interior_depth.load(Ordering::Relaxed))
+            instance.estimate_leaf_count().unwrap()
+                / (2 << instance.complete_interior_depth.load(Ordering::Relaxed))
         );
         Ok(instance)
     }
@@ -1148,7 +1149,10 @@ impl RocksTransRelMPT {
         // Calculate total number of nodes at frontier depth
         let total_frontier_nodes = if frontier_depth >= 63 {
             // Avoid overflow for very deep trees
-            warn!("Frontier depth {} is too deep for sampling estimation", frontier_depth);
+            warn!(
+                "Frontier depth {} is too deep for sampling estimation",
+                frontier_depth
+            );
             return Ok(self.storage.approximate_entry_count());
         } else {
             1u64 << frontier_depth
@@ -1191,7 +1195,11 @@ impl RocksTransRelMPT {
                 match self.storage.get_leaf_nodes_by_prefix(&prefix) {
                     Ok(leaves) => leaves.len(),
                     Err(e) => {
-                        warn!("Error counting leaves for prefix {}: {}", prefix.short_hex(), e);
+                        warn!(
+                            "Error counting leaves for prefix {}: {}",
+                            prefix.short_hex(),
+                            e
+                        );
                         0
                     }
                 }
@@ -1355,7 +1363,11 @@ impl RocksTransRelMPT {
 
             // Check if the next depth level is complete
             if self.check_depth_complete(next_depth) {
-                info!("Advancing frontier depth to {} with nodes {}", next_depth, 1u64 << next_depth);
+                info!(
+                    "Advancing frontier depth to {} with nodes {}",
+                    next_depth,
+                    1u64 << next_depth
+                );
                 // Persist all interior nodes at this newly complete depth to the database
                 if let Err(e) = self.persist_interior_nodes_at_depth_in_tx(next_depth, tx) {
                     warn!(
@@ -1387,7 +1399,7 @@ impl RocksTransRelMPT {
     fn release_subtree(&self, prefix: Prefix) {
         let depth = self.complete_interior_depth.load(Ordering::Relaxed);
         self.full_tree_loaded.store(false, Ordering::Relaxed);
-        let max_depth = (depth+KEEP_BELOW_FRONTIER).max(DEPTH_ALWAYS_KEEP);
+        let max_depth = (depth + KEEP_BELOW_FRONTIER).max(DEPTH_ALWAYS_KEEP);
         if let Some(node_ref) = self.store.get(&prefix) {
             match node_ref.value() {
                 Node::Interior(interior) => {
@@ -1419,7 +1431,9 @@ impl RocksTransRelMPT {
         // DashMap supports concurrent removal, so we can safely remove during iteration
         self.store.retain(|prefix, _| {
             // Keep nodes at or above frontier depth, and always keep the root
-            prefix.length <= frontier_depth+KEEP_BELOW_FRONTIER || *prefix == root || prefix.length <= DEPTH_ALWAYS_KEEP
+            prefix.length <= frontier_depth + KEEP_BELOW_FRONTIER
+                || *prefix == root
+                || prefix.length <= DEPTH_ALWAYS_KEEP
         });
     }
 }
@@ -1438,7 +1452,9 @@ impl MerklePatriciaTree for RocksTransRelMPT {
 
     fn batch_upsert(&mut self, entries: &[(Hash, Hash)]) {
         self.batch_upsert_optimized(entries);
-        self.storage.flush().expect("Failed to flush after batch upsert");
+        self.storage
+            .flush()
+            .expect("Failed to flush after batch upsert");
     }
 
     fn enumerate_nodes(&self) -> Vec<(Prefix, Node)> {
@@ -1476,8 +1492,8 @@ impl MerklePatriciaTree for RocksTransRelMPT {
 mod tests {
     use super::*;
     use crate::Hash;
-    use rand::{Rng, SeedableRng};
     use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
     use std::cell::RefCell;
 
     thread_local! {
@@ -1487,7 +1503,6 @@ mod tests {
     fn make_random_hash() -> Hash {
         RNG.with(|rng| rng.borrow_mut().random::<[u8; 32]>())
     }
-
 
     #[test]
     fn test_complete_interior_depth_empty_tree() {
@@ -1593,44 +1608,53 @@ mod tests {
             visited.insert(self.root);
 
             while let Some(prefix) = queue.pop_front() {
-                if prefix.length > complete_depth+KEEP_BELOW_FRONTIER as u16 {
+                if prefix.length > complete_depth + KEEP_BELOW_FRONTIER as u16 {
                     // Nodes at the frontier should exist, but we don't check their children.
                     // Nodes below the frontier should not be in the queue.
                     panic!(
                         "Node {} with depth {} found below frontier depth {}",
                         prefix.short_hex(),
                         prefix.length,
-                        complete_depth+KEEP_BELOW_FRONTIER as u16
+                        complete_depth + KEEP_BELOW_FRONTIER as u16
                     );
                 }
 
-                if prefix.length == complete_depth+KEEP_BELOW_FRONTIER as u16 {
+                // We are below the frontier + KEEP_BELOW_FRONTIER depth
+                // At this depth, we don't require children to be present (they may be pruned)
+                if prefix.length > complete_depth + KEEP_BELOW_FRONTIER as u16 {
                     continue;
                 }
-                // We are above the frontier, so this must be an interior node.
-                let node = self.store.get(&prefix).expect("Missing node in tree traversal");
+                // We are above or at the frontier + KEEP_BELOW_FRONTIER, so this must be an interior node.
+                let node = self
+                    .store
+                    .get(&prefix)
+                    .expect("Missing node in tree traversal");
                 match node.value() {
                     Node::Interior(interior) => {
-                        // Children must be in the store if we are above the frontier.
-                        if !visited.contains(&interior.left) {
-                            assert!(
-                                self.store.contains_key(&interior.left),
-                                "Left child {} of {} not in store",
-                                interior.left.short_hex(),
-                                prefix.short_hex()
-                            );
-                            queue.push_back(interior.left);
-                            visited.insert(interior.left);
-                        }
-                        if !visited.contains(&interior.right) {
-                            assert!(
-                                self.store.contains_key(&interior.right),
-                                "Right child {} of {} not in store",
-                                interior.right.short_hex(),
-                                prefix.short_hex()
-                            );
-                            queue.push_back(interior.right);
-                            visited.insert(interior.right);
+                        // Children must be in the store if their depth is <= frontier + KEEP_BELOW_FRONTIER
+                        // Only check if children would be at acceptable depth
+                        let child_depth = prefix.length + 1;
+                        if child_depth <= complete_depth + KEEP_BELOW_FRONTIER as u16 {
+                            if !visited.contains(&interior.left) {
+                                assert!(
+                                    self.store.contains_key(&interior.left),
+                                    "Left child {} of {} not in store",
+                                    interior.left.short_hex(),
+                                    prefix.short_hex()
+                                );
+                                queue.push_back(interior.left);
+                                visited.insert(interior.left);
+                            }
+                            if !visited.contains(&interior.right) {
+                                assert!(
+                                    self.store.contains_key(&interior.right),
+                                    "Right child {} of {} not in store",
+                                    interior.right.short_hex(),
+                                    prefix.short_hex()
+                                );
+                                queue.push_back(interior.right);
+                                visited.insert(interior.right);
+                            }
                         }
                     }
                     Node::Leaf(_) => {
@@ -1662,11 +1686,11 @@ mod tests {
             for item in self.store.iter() {
                 let prefix = item.key();
                 assert!(
-                    prefix.length <= complete_depth+KEEP_BELOW_FRONTIER,
+                    prefix.length <= complete_depth + KEEP_BELOW_FRONTIER,
                     "Node {} with depth {} found in store, but is below frontier depth {}",
                     prefix.short_hex(),
                     prefix.length,
-                    complete_depth+KEEP_BELOW_FRONTIER
+                    complete_depth + KEEP_BELOW_FRONTIER
                 );
             }
         }
@@ -1682,6 +1706,9 @@ mod tests {
             .collect();
         tree.batch_upsert(&entries);
 
+        println!("Frontier depth: {}", tree.complete_interior_depth());
+        println!("Nodes in store: {}", tree.store.len());
+
         // After the batch insert, the invariant should hold.
         tree.check_frontier_invariant();
     }
@@ -1691,7 +1718,11 @@ mod tests {
         let tree = RocksTransRelMPT::new_temporary().expect("create tree");
         let estimate = tree.estimate_leaf_count().expect("estimate leaves");
         // Empty tree may have the root node counted, so allow 0 or 1
-        assert!(estimate <= 1, "Empty tree should have 0 or 1 entries, got {}", estimate);
+        assert!(
+            estimate <= 1,
+            "Empty tree should have 0 or 1 entries, got {}",
+            estimate
+        );
     }
 
     #[test]
@@ -1709,8 +1740,11 @@ mod tests {
 
         // The estimate should be close to 10 (within reasonable margin)
         // For small trees, there might be more variation
-        assert!(estimate >= 5 && estimate <= 20,
-                "Estimate {} should be roughly 10 (5-20 range)", estimate);
+        assert!(
+            estimate >= 5 && estimate <= 20,
+            "Estimate {} should be roughly 10 (5-20 range)",
+            estimate
+        );
     }
 
     #[test]
@@ -1728,8 +1762,11 @@ mod tests {
         println!("Frontier depth: {}", tree.complete_interior_depth());
 
         // The estimate should be close to 1000 (within 20%)
-        assert!(estimate >= 800 && estimate <= 1200,
-                "Estimate {} should be roughly 1000 (800-1200 range)", estimate);
+        assert!(
+            estimate >= 800 && estimate <= 1200,
+            "Estimate {} should be roughly 1000 (800-1200 range)",
+            estimate
+        );
     }
 
     #[test]
@@ -1743,17 +1780,28 @@ mod tests {
         tree.batch_upsert(&entries);
 
         // Try different sample sizes
-        let estimate_10 = tree.estimate_leaf_count_by_sampling(10).expect("estimate with 10 samples");
-        let estimate_50 = tree.estimate_leaf_count_by_sampling(50).expect("estimate with 50 samples");
-        let estimate_200 = tree.estimate_leaf_count_by_sampling(200).expect("estimate with 200 samples");
+        let estimate_10 = tree
+            .estimate_leaf_count_by_sampling(10)
+            .expect("estimate with 10 samples");
+        let estimate_50 = tree
+            .estimate_leaf_count_by_sampling(50)
+            .expect("estimate with 50 samples");
+        let estimate_200 = tree
+            .estimate_leaf_count_by_sampling(200)
+            .expect("estimate with 200 samples");
 
-        println!("Estimates: 10 samples={}, 50 samples={}, 200 samples={}",
-                 estimate_10, estimate_50, estimate_200);
+        println!(
+            "Estimates: 10 samples={}, 50 samples={}, 200 samples={}",
+            estimate_10, estimate_50, estimate_200
+        );
 
         // All estimates should be in a reasonable range
         for estimate in [estimate_10, estimate_50, estimate_200] {
-            assert!(estimate >= 300 && estimate <= 700,
-                    "Estimate {} should be roughly 500", estimate);
+            assert!(
+                estimate >= 300 && estimate <= 700,
+                "Estimate {} should be roughly 500",
+                estimate
+            );
         }
     }
 
@@ -1768,11 +1816,15 @@ mod tests {
         tree.batch_upsert(&entries);
 
         // Get estimate
-        let estimate = tree.estimate_leaf_count_by_sampling(100).expect("estimate leaves");
+        let estimate = tree
+            .estimate_leaf_count_by_sampling(100)
+            .expect("estimate leaves");
 
         // Get actual count by loading full tree
         tree.ensure_full_tree_loaded();
-        let actual = tree.store.iter()
+        let actual = tree
+            .store
+            .iter()
             .filter(|entry| matches!(entry.value(), Node::Leaf(_)))
             .count();
 
@@ -1782,8 +1834,13 @@ mod tests {
         // The estimate should be within 20% of actual
         let lower_bound = (actual as f64 * 0.8) as usize;
         let upper_bound = (actual as f64 * 1.2) as usize;
-        assert!(estimate >= lower_bound && estimate <= upper_bound,
-                "Estimate {} should be within 20% of actual {} ({}-{})",
-                estimate, actual, lower_bound, upper_bound);
+        assert!(
+            estimate >= lower_bound && estimate <= upper_bound,
+            "Estimate {} should be within 20% of actual {} ({}-{})",
+            estimate,
+            actual,
+            lower_bound,
+            upper_bound
+        );
     }
 }

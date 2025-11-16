@@ -3,7 +3,8 @@ use std::{fmt, io};
 
 use rayon::prelude::*;
 use rocksdb::{
-    Cache, DBIteratorWithThreadMode, Direction, IteratorMode, OptimisticTransactionDB, Options, Transaction, WriteBatchWithTransaction
+    Cache, DBIteratorWithThreadMode, Direction, IteratorMode, OptimisticTransactionDB, Options,
+    Transaction, WriteBatchWithTransaction,
 };
 
 use crate::{Hash, Prefix, prefix::HashExt};
@@ -73,16 +74,13 @@ impl RocksStorage {
         let mut options = Options::default();
         options.create_if_missing(true);
         // options.set_max_open_files(512);
-        let cache = Cache::new_lru_cache(1024*1024*1024);
-        options.optimize_universal_style_compaction(1024 * 1024 * 1024);
+        let cache = Cache::new_lru_cache(1024 * 1024 * 1024);
+        // options.optimize_universal_style_compaction(1024 * 1024 * 1024);
         options.set_row_cache(&cache);
         options.increase_parallelism(32);
         options.set_allow_concurrent_memtable_write(true);
         options.set_inplace_update_support(false);
         options.set_manual_wal_flush(true);
-        // Enable prefix bloom filter for efficient prefix scans
-        // The prefix extractor extracts the first 2 bytes (the length field)
-        options.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(2));
         let db = OptimisticTransactionDB::open(&options, path)?;
         Ok(Self { db, cache })
     }
@@ -106,8 +104,11 @@ impl RocksStorage {
     }
 
     pub fn iter_nodes(&self) -> RocksNodeIter<'_> {
+        // Start from the smallest possible node key (length 0)
+        // This efficiently skips metadata keys which use different key formats
+        let start_key = 0u16.to_be_bytes();
         RocksNodeIter {
-            iter: self.db.iterator(IteratorMode::Start),
+            iter: self.db.iterator(IteratorMode::From(&start_key, Direction::Forward)),
         }
     }
 
@@ -132,6 +133,11 @@ impl RocksStorage {
         for entry in iter {
             match entry {
                 Ok((key, value)) => {
+                    // Check if this is a valid node key (34 bytes)
+                    if key.len() != 34 {
+                        break;
+                    }
+                    
                     if !Self::is_leaf_key(key.as_ref()) {
                         break;
                     }
@@ -207,24 +213,35 @@ impl RocksStorage {
 
     /// Get all nodes at a specific prefix length.
     /// This is efficient because keys are encoded as <length> || <hash>,
-    /// so we can use RocksDB's prefix iterator on the length bytes.
+    /// so we can seek directly to the target length and stop when we exceed it.
     pub fn get_nodes_by_prefix_length(&self, length: u16) -> RocksResult<Vec<(Prefix, Node)>> {
         let mut results = Vec::new();
 
-        // Create the prefix key for this length (just the 2 length bytes)
-        let length_prefix = length.to_be_bytes();
+        // Create the start key for this length
+        let start_key = length.to_be_bytes();
 
-        // Use prefix iterator - this is optimized by RocksDB with bloom filters
-        let iter = self.db.prefix_iterator(&length_prefix);
+        // Use iterator starting from this length
+        let iter = self.db.iterator(IteratorMode::From(&start_key, Direction::Forward));
 
         for entry in iter {
             match entry {
                 Ok((key, value)) => {
+                    // Check if this looks like a node key (34 bytes: 2 for length + 32 for hash)
+                    // If not, we've reached metadata keys or the end
+                    if key.len() != 34 {
+                        break;
+                    }
+
                     // Decode the prefix from the key
                     let prefix = match decode_prefix(key.as_ref()) {
                         Ok(prefix) => prefix,
                         Err(err) => return Err(err.into()),
                     };
+
+                    // Stop if we've moved past the target length
+                    if prefix.length != length {
+                        break;
+                    }
 
                     // Decode the node
                     let node = decode_node(value.as_ref())?;
@@ -393,26 +410,32 @@ impl<'a> Iterator for RocksNodeIter<'a> {
     type Item = RocksResult<(Prefix, Node)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(entry) = self.iter.next() {
+        loop {
+            let entry = self.iter.next()?;
             match entry {
                 Ok((key, value)) => {
-                    if key.as_ref() == ROOT_KEY || key.as_ref() == COMPLETE_DEPTH_KEY {
-                        continue;
+                    // Check if this looks like a node key (34 bytes: 2 for length + 32 for hash)
+                    // If not, we've reached metadata keys or the end, so stop iteration
+                    if key.len() != 34 {
+                        return None;
                     }
-                    let prefix = match decode_prefix(key.as_ref()) {
-                        Ok(prefix) => prefix,
-                        Err(err) => return Some(Err(err.into())),
-                    };
-                    let node = match decode_node(value.as_ref()) {
-                        Ok(node) => node,
-                        Err(err) => return Some(Err(err.into())),
-                    };
-                    return Some(Ok((prefix, node)));
+                    
+                    match decode_prefix(key.as_ref()) {
+                        Ok(prefix) => {
+                            match decode_node(value.as_ref()) {
+                                Ok(node) => return Some(Ok((prefix, node))),
+                                Err(err) => return Some(Err(err.into())),
+                            }
+                        }
+                        Err(_) => {
+                            // Key doesn't decode as a prefix, must have reached metadata or end
+                            return None;
+                        }
+                    }
                 }
                 Err(err) => return Some(Err(err.into())),
             }
         }
-        None
     }
 }
 
