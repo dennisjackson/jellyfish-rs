@@ -1115,3 +1115,103 @@ fn test_persistent_reopen_small() {
         "Expected exactly 10 leaves after second batch"
     );
 }
+
+#[test]
+fn test_rocks_impl_randomized_reopen_batches() {
+    use rand::rngs::StdRng;
+    use rand::{Rng, RngCore, SeedableRng};
+
+    let _ = env_logger::builder()
+        .is_test(true)
+        .filter(None, log::LevelFilter::Debug)
+        .try_init();
+
+    const BATCH_COUNT: usize = 50;
+    const MAX_BATCH_SIZE: usize = 5;
+
+    let mut rng = StdRng::seed_from_u64(1337);
+
+    fn make_random_hash(rng: &mut StdRng) -> Hash {
+        let mut hash = [0u8; 32];
+        rng.fill_bytes(&mut hash);
+        hash
+    }
+
+    let batches: Vec<Vec<(Hash, Hash)>> = (0..BATCH_COUNT)
+        .map(|_| {
+            let batch_len = rng.gen_range(1..=MAX_BATCH_SIZE);
+            (0..batch_len)
+                .map(|_| (make_random_hash(&mut rng), make_random_hash(&mut rng)))
+                .collect()
+        })
+        .collect();
+
+    // Build an in-memory reference tree so we can compare final roots.
+    let mut reference_tree = SimpleMPT::new();
+    for batch in &batches {
+        reference_tree.batch_upsert(batch.as_slice());
+    }
+    let reference_root = reference_tree
+        .get_root_hash()
+        .expect("reference tree unexpectedly empty");
+
+    let pid = std::process::id();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base_dir =
+        env::temp_dir().join(format!("rocks_randomized_reopen_{}_{}", pid, timestamp));
+    fs::create_dir_all(&base_dir).expect("failed to create randomized reopen directory");
+
+    struct DirCleanup(PathBuf);
+    impl Drop for DirCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let _cleanup = DirCleanup(base_dir.clone());
+
+    macro_rules! test_randomized_rocks_impl {
+        ($impl_type:ty, $name:expr, $subdir:expr) => {{
+            let dir = base_dir.join($subdir);
+            let _ = fs::remove_dir_all(&dir);
+
+            for (batch_idx, batch) in batches.iter().enumerate() {
+                let mut tree = <$impl_type>::new_with_path(&dir).unwrap_or_else(|e| {
+                    panic!("{name} failed to open at batch {batch_idx}: {e}", name = $name)
+                });
+                tree.batch_upsert(batch.as_slice());
+                drop(tree);
+            }
+
+            let mut final_tree = <$impl_type>::new_with_path(&dir).unwrap_or_else(|e| {
+                panic!("{name} final reopen failed: {e}", name = $name)
+            });
+            let disk_root = final_tree.get_root_hash().unwrap_or_else(|| {
+                panic!("{name} final root was None after randomized reopens", name = $name)
+            });
+            drop(final_tree);
+
+            assert_eq!(
+                disk_root, reference_root,
+                "{name} root diverged from in-memory reference after randomized reopen stress",
+                name = $name
+            );
+        }};
+    }
+
+    test_randomized_rocks_impl!(RockLeafMPT, "RockLeafMPT", "rock_leaf_randomized");
+    test_randomized_rocks_impl!(RockSparseMPT, "RockSparseMPT", "rock_sparse_randomized");
+    test_randomized_rocks_impl!(
+        RocksParTransMPT,
+        "RocksParTransMPT",
+        "rocks_par_trans_randomized"
+    );
+    test_randomized_rocks_impl!(
+        RocksTransRelMPT,
+        "RocksTransRelMPT",
+        "rocks_trans_rel_randomized"
+    );
+}
