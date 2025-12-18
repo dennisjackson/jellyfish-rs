@@ -137,7 +137,7 @@ impl RocksStorage {
                     if key.len() != 34 {
                         break;
                     }
-                    
+
                     if !Self::is_leaf_key(key.as_ref()) {
                         break;
                     }
@@ -419,7 +419,7 @@ impl<'a> Iterator for RocksNodeIter<'a> {
                     if key.len() != 34 {
                         return None;
                     }
-                    
+
                     match decode_prefix(key.as_ref()) {
                         Ok(prefix) => {
                             match decode_node(value.as_ref()) {

@@ -25,6 +25,7 @@ const KEEP_BELOW_FRONTIER: u16 = 2; // How many levels of nodes to keep in memor
 const LOG_LEAVES_PER_FRONTIER: u16 = 1; // How close the frontier can get to the leaves. Higher = more memory usage.
 const MAX_FRONTIER_DEPTH: u16 = 24; // Maximum allowed frontier depth to prevent excessive memory usage.
 const DEPTH_ALWAYS_KEEP: u16 = 23; // Always keep nodes up to this depth in memory to avoid excessive loads.
+const DEPTH_TO_WRITE: u16 = 3; // Number of depth levels starting from frontier to persist to storage. 1 = frontier only.
 
 pub struct RocksTransRelMPT {
     storage: RocksStorage,
@@ -54,6 +55,13 @@ impl RocksTransRelMPT {
 
     fn insert_node_memory_only(&self, prefix: Prefix, node: Node) {
         self.store.insert(prefix, node);
+    }
+
+    /// Check if a node at the given depth should be persisted to storage.
+    /// Nodes are persisted if they are within DEPTH_TO_WRITE levels from the frontier.
+    fn should_persist_depth(&self, depth: u16) -> bool {
+        let complete_depth = self.complete_interior_depth.load(Ordering::Relaxed);
+        depth >= complete_depth && depth < complete_depth + DEPTH_TO_WRITE
     }
 
     // No longer needed: leaves are written opportunistically during recursion.
@@ -598,11 +606,10 @@ impl RocksTransRelMPT {
             );
         }
 
-        // If no active batch yet and we created an interior at the current
-        // complete boundary depth, start a batch here so all subsequent
-        // nodes under this interior get persisted.
+        // If no active batch yet and we created an interior within the write depth range,
+        // start a batch here so all subsequent nodes under this interior get persisted.
         let complete_depth = self.complete_interior_depth.load(Ordering::Relaxed);
-        if merged_prefix.length == complete_depth {
+        if self.should_persist_depth(merged_prefix.length) && merged_prefix.length == complete_depth {
             debug!(
                 "RocksSparse: start boundary batch (leaf-merge) at {} depth {} rem_entries {}",
                 merged_prefix.short_hex(),
@@ -659,8 +666,8 @@ impl RocksTransRelMPT {
     ) -> Prefix {
         let len = entries.len();
 
-        let complete_depth = self.complete_interior_depth.load(Ordering::Relaxed);
-        let persist_here = interior_prefix.length == complete_depth;
+        // Persist at nodes within the write depth range
+        let persist_here = self.should_persist_depth(interior_prefix.length);
         debug!(
             "RocksSparse: visit interior {} depth {} persist_here={} entries={}",
             interior_prefix.short_hex(),
