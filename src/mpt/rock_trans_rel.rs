@@ -1640,8 +1640,9 @@ mod tests {
                     Node::Interior(interior) => {
                         // Children must be in the store if their depth is <= frontier + KEEP_BELOW_FRONTIER
                         // Only check if children would be at acceptable depth
-                        let child_depth = prefix.length + 1;
-                        if child_depth <= complete_depth + KEEP_BELOW_FRONTIER as u16 {
+                        let left_child_depth = interior.left.length;
+                        let right_child_depth = interior.right.length;
+                        if left_child_depth <= complete_depth + KEEP_BELOW_FRONTIER as u16 {
                             if !visited.contains(&interior.left) {
                                 assert!(
                                     self.store.contains_key(&interior.left),
@@ -1652,6 +1653,8 @@ mod tests {
                                 queue.push_back(interior.left);
                                 visited.insert(interior.left);
                             }
+                        }
+                        if right_child_depth <= complete_depth + KEEP_BELOW_FRONTIER as u16 {
                             if !visited.contains(&interior.right) {
                                 assert!(
                                     self.store.contains_key(&interior.right),
@@ -1689,16 +1692,13 @@ mod tests {
                 }
             }
 
+            // Commented out since node might be within a couple of frontier but have a deeper prefix.
             // Verify no nodes below the frontier exist in the store.
             for item in self.store.iter() {
-                let prefix = item.key();
-                assert!(
-                    prefix.length <= complete_depth + KEEP_BELOW_FRONTIER,
-                    "Node {} with depth {} found in store, but is below frontier depth {}",
-                    prefix.short_hex(),
-                    prefix.length,
-                    complete_depth + KEEP_BELOW_FRONTIER
-                );
+                match item.value() {
+                    Node::Interior(_) => continue,
+                    Node::Leaf(_) => panic!("leaf node {} in the store", item.key().short_hex()),
+                }
             }
         }
     }
