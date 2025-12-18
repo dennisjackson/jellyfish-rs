@@ -1,3 +1,4 @@
+use bincode::config;
 use dashmap::{DashMap, DashSet};
 use log::{debug, info, warn};
 use rayon::{join, prelude::*};
@@ -21,11 +22,64 @@ struct ParentChildren {
     right: Option<(Prefix, Hash)>,
 }
 
-const KEEP_BELOW_FRONTIER: u16 = 2; // How many levels of nodes to keep in memory below the frontier. Must be at least 1
-const LOG_LEAVES_PER_FRONTIER: u16 = 1; // How close the frontier can get to the leaves. Higher = more memory usage.
-const MAX_FRONTIER_DEPTH: u16 = 24; // Maximum allowed frontier depth to prevent excessive memory usage.
-const DEPTH_ALWAYS_KEEP: u16 = 23; // Always keep nodes up to this depth in memory to avoid excessive loads.
-const DEPTH_TO_WRITE: u16 = 3; // Number of depth levels starting from frontier to persist to storage. 1 = frontier only.
+#[derive(Clone, Copy, Debug)]
+pub struct RocksTransRelConfig {
+    /// How many levels of nodes to keep in memory below the frontier. Must be at least 1.
+    pub keep_below_frontier: u16,
+    /// How close the frontier can get to the leaves. Higher = more memory usage.
+    pub log_leaves_per_frontier: u16,
+    /// Maximum allowed frontier depth to prevent excessive memory usage.
+    pub max_frontier_depth: u16,
+    /// Always keep nodes up to this depth in memory to avoid excessive loads.
+    pub depth_always_keep: u16,
+    /// Number of depth levels starting from frontier to persist to storage. 1 = frontier only.
+    pub depth_to_write: u16,
+}
+
+impl Default for RocksTransRelConfig {
+    fn default() -> Self {
+        Self {
+            keep_below_frontier: 2,
+            log_leaves_per_frontier: 1,
+            max_frontier_depth: 24,
+            depth_always_keep: 23,
+            depth_to_write: 3,
+        }
+    }
+}
+
+impl RocksTransRelConfig {
+    pub fn new(
+        keep_below_frontier: u16,
+        log_leaves_per_frontier: u16,
+        max_frontier_depth: u16,
+        depth_always_keep: u16,
+        depth_to_write: u16,
+    ) -> Self {
+        assert!(
+            keep_below_frontier >= 1,
+            "keep_below_frontier must be at least 1"
+        );
+        Self {
+            keep_below_frontier,
+            log_leaves_per_frontier,
+            max_frontier_depth,
+            depth_always_keep,
+            depth_to_write,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn test_config() -> Self {
+        Self {
+            keep_below_frontier: 1,
+            log_leaves_per_frontier: 1,
+            max_frontier_depth: 5,
+            depth_always_keep: 4,
+            depth_to_write: 2,
+        }
+    }
+}
 
 pub struct RocksTransRelMPT {
     storage: RocksStorage,
@@ -39,18 +93,41 @@ pub struct RocksTransRelMPT {
     /// At depth D, there should be 2^D interior nodes for this depth to be considered complete.
     complete_interior_depth: AtomicU16,
     prefix_loads: AtomicU64,
+    config: RocksTransRelConfig,
 }
 
 impl RocksTransRelMPT {
+    fn default_config() -> RocksTransRelConfig {
+        #[cfg(test)]
+        {
+            return RocksTransRelConfig::test_config();
+        }
+        #[cfg(not(test))]
+        {
+            return RocksTransRelConfig::default();
+        }
+    }
+
     pub fn new_with_path(path: impl AsRef<Path>) -> RocksResult<Self> {
+        Self::new_with_path_and_config(path, Self::default_config())
+    }
+
+    pub fn new_with_path_and_config(
+        path: impl AsRef<Path>,
+        config: RocksTransRelConfig,
+    ) -> RocksResult<Self> {
         let storage = RocksStorage::open(path)?;
-        Self::from_storage(storage, None)
+        Self::from_storage(storage, None, config)
     }
 
     pub fn new_temporary() -> RocksResult<Self> {
+        Self::new_temporary_with_config(Self::default_config())
+    }
+
+    pub fn new_temporary_with_config(config: RocksTransRelConfig) -> RocksResult<Self> {
         let temp_dir = TempDir::new()?;
         let storage = RocksStorage::open(temp_dir.path())?;
-        Self::from_storage(storage, Some(temp_dir))
+        Self::from_storage(storage, Some(temp_dir), config)
     }
 
     fn insert_node_memory_only(&self, prefix: Prefix, node: Node) {
@@ -58,10 +135,10 @@ impl RocksTransRelMPT {
     }
 
     /// Check if a node at the given depth should be persisted to storage.
-    /// Nodes are persisted if they are within DEPTH_TO_WRITE levels from the frontier.
+    /// Nodes are persisted if they are within the configured write depth from the frontier.
     fn should_persist_depth(&self, depth: u16) -> bool {
         let complete_depth = self.complete_interior_depth.load(Ordering::Relaxed);
-        depth >= complete_depth && depth < complete_depth + DEPTH_TO_WRITE
+        depth >= complete_depth && depth < complete_depth + self.config.depth_to_write
     }
 
     // No longer needed: leaves are written opportunistically during recursion.
@@ -306,7 +383,11 @@ impl RocksTransRelMPT {
         self.full_tree_loaded.store(true, Ordering::Release);
     }
 
-    fn from_storage(storage: RocksStorage, temp_dir: Option<TempDir>) -> RocksResult<Self> {
+    fn from_storage(
+        storage: RocksStorage,
+        temp_dir: Option<TempDir>,
+        config: RocksTransRelConfig,
+    ) -> RocksResult<Self> {
         let (root, complete_depth) = {
             let tx = storage.start_transaction();
             let root = tx.load_root()?;
@@ -327,6 +408,7 @@ impl RocksTransRelMPT {
             _temp_dir: temp_dir,
             prefix_loads: AtomicU64::new(0),
             complete_interior_depth: AtomicU16::new(complete_depth),
+            config,
         };
 
         let has_entries = approx_entries > 0;
@@ -1258,7 +1340,7 @@ impl RocksTransRelMPT {
         }
 
         // If depth is too large (>= 20), we can't have that many nodes
-        if depth >= MAX_FRONTIER_DEPTH {
+        if depth >= self.config.max_frontier_depth {
             return false;
         }
 
@@ -1363,7 +1445,7 @@ impl RocksTransRelMPT {
             } else {
                 (leaf_nodes as f64).log2().ceil() as u16
             };
-            if current_depth > log_leaf_nodes.saturating_sub(LOG_LEAVES_PER_FRONTIER) {
+            if current_depth > log_leaf_nodes.saturating_sub(self.config.log_leaves_per_frontier) {
                 // Don't want depth to be close to true frontier
                 break;
             }
@@ -1406,7 +1488,8 @@ impl RocksTransRelMPT {
     fn release_subtree(&self, prefix: Prefix) {
         let depth = self.complete_interior_depth.load(Ordering::Relaxed);
         self.full_tree_loaded.store(false, Ordering::Relaxed);
-        let max_depth = (depth + KEEP_BELOW_FRONTIER).max(DEPTH_ALWAYS_KEEP);
+        let max_depth =
+            (depth + self.config.keep_below_frontier).max(self.config.depth_always_keep);
         if let Some(node_ref) = self.store.get(&prefix) {
             match node_ref.value() {
                 Node::Interior(interior) => {
@@ -1438,9 +1521,9 @@ impl RocksTransRelMPT {
         // DashMap supports concurrent removal, so we can safely remove during iteration
         self.store.retain(|prefix, _| {
             // Keep nodes at or above frontier depth, and always keep the root
-            prefix.length <= frontier_depth + KEEP_BELOW_FRONTIER
+            prefix.length <= frontier_depth + self.config.keep_below_frontier
                 || *prefix == root
-                || prefix.length <= DEPTH_ALWAYS_KEEP
+                || prefix.length <= self.config.depth_always_keep
         });
     }
 }
@@ -1615,34 +1698,34 @@ mod tests {
             visited.insert(self.root);
 
             while let Some(prefix) = queue.pop_front() {
-                if prefix.length > complete_depth + KEEP_BELOW_FRONTIER as u16 {
+                if prefix.length > complete_depth + self.config.keep_below_frontier {
                     // Nodes at the frontier should exist, but we don't check their children.
                     // Nodes below the frontier should not be in the queue.
                     panic!(
                         "Node {} with depth {} found below frontier depth {}",
                         prefix.short_hex(),
                         prefix.length,
-                        complete_depth + KEEP_BELOW_FRONTIER as u16
+                        complete_depth + self.config.keep_below_frontier
                     );
                 }
 
-                // We are below the frontier + KEEP_BELOW_FRONTIER depth
+                // We are below the frontier + keep_below_frontier depth
                 // At this depth, we don't require children to be present (they may be pruned)
-                if prefix.length > complete_depth + KEEP_BELOW_FRONTIER as u16 {
+                if prefix.length > complete_depth + self.config.keep_below_frontier {
                     continue;
                 }
-                // We are above or at the frontier + KEEP_BELOW_FRONTIER, so this must be an interior node.
+                // We are above or at the frontier + keep_below_frontier, so this must be an interior node.
                 let node = self
                     .store
                     .get(&prefix)
                     .expect("Missing node in tree traversal");
                 match node.value() {
                     Node::Interior(interior) => {
-                        // Children must be in the store if their depth is <= frontier + KEEP_BELOW_FRONTIER
+                        // Children must be in the store if their depth is <= frontier + keep_below_frontier
                         // Only check if children would be at acceptable depth
                         let left_child_depth = interior.left.length;
                         let right_child_depth = interior.right.length;
-                        if left_child_depth <= complete_depth + KEEP_BELOW_FRONTIER as u16 {
+                        if left_child_depth <= complete_depth + self.config.keep_below_frontier {
                             if !visited.contains(&interior.left) {
                                 assert!(
                                     self.store.contains_key(&interior.left),
@@ -1654,7 +1737,7 @@ mod tests {
                                 visited.insert(interior.left);
                             }
                         }
-                        if right_child_depth <= complete_depth + KEEP_BELOW_FRONTIER as u16 {
+                        if right_child_depth <= complete_depth + self.config.keep_below_frontier {
                             if !visited.contains(&interior.right) {
                                 assert!(
                                     self.store.contains_key(&interior.right),
