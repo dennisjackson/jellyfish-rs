@@ -1329,11 +1329,6 @@ impl RocksTransRelMPT {
         depth: u16,
         tx: &super::storage::rocks::RocksTransaction,
     ) -> RocksResult<()> {
-        if depth >= 20 {
-            // Too deep, too many nodes to handle
-            return Ok(());
-        }
-
         let expected_count = 1u64 << depth; // 2^depth
         let mut nodes_to_write = Vec::new();
 
