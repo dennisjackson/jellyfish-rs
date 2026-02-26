@@ -1,47 +1,22 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use jellyfish_rs::mpt::{MerklePatriciaTree, RocksTransRelMPT};
-use jellyfish_rs::{BatchMPT, Hash};
+use jellyfish_rs::{BatchMPT, DurableBatchMPT, Hash};
 use log::info;
 use std::env;
 use std::error::Error;
 use std::path::Path;
 use std::time::Instant;
 
-const IN_MEMORY_FLAG: &str = "--in-memory";
-
-enum Tree {
-    Durable(RocksTransRelMPT),
-    InMemory(BatchMPT),
-}
-
-impl Tree {
-    fn batch_upsert(&mut self, entries: &[(Hash, Hash)]) {
-        match self {
-            Tree::Durable(tree) => tree.batch_upsert(entries),
-            Tree::InMemory(tree) => tree.batch_upsert(entries),
-        }
-    }
-
-    fn get_root_hash(&self) -> Option<Hash> {
-        match self {
-            Tree::Durable(tree) => tree.get_root_hash(),
-            Tree::InMemory(tree) => tree.get_root_hash(),
-        }
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            Tree::Durable(x) => x.len(),
-            Tree::InMemory(tree) => tree.enumerate_nodes().len(),
-        }
-    }
-}
-
 fn print_usage() {
     eprintln!(
-        "usage: build_durable_tree [--in-memory] <tree_size> <window_size> <batch_size> [db_path]\n\
-         tree_size, window_size, and batch_size must be positive integers\n\
-         when --in-memory is used, db_path cannot be specified"
+        "usage: build_durable_tree [--backend <rocks|sqlite|memory>] <tree_size> <window_size> <batch_size> [db_path]\n\
+         \n\
+         Backends:\n\
+         \x20 rocks   - RocksDB with frontier optimization (default)\n\
+         \x20 sqlite  - SQLite-backed durable tree\n\
+         \x20 memory  - In-memory only (db_path not allowed)\n\
+         \n\
+         All size arguments must be positive integers."
     );
 }
 
@@ -60,13 +35,20 @@ fn main() {
 fn run() -> Result<(), Box<dyn Error>> {
     init_logging();
 
-    let mut use_in_memory = false;
+    let mut backend = "rocks".to_string();
     let mut positional_args = Vec::new();
+    let mut args = env::args().skip(1);
 
-    for arg in env::args().skip(1) {
+    while let Some(arg) = args.next() {
         match arg.as_str() {
-            IN_MEMORY_FLAG => {
-                use_in_memory = true;
+            "--backend" | "-b" => {
+                backend = args
+                    .next()
+                    .ok_or("--backend requires a value (rocks, sqlite, memory)")?;
+            }
+            // Keep old flag working
+            "--in-memory" => {
+                backend = "memory".to_string();
             }
             "--help" | "-h" => exit_with_usage(0),
             _ if arg.starts_with("--") => {
@@ -77,16 +59,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let positional_len = positional_args.len();
-    if positional_len < 3 {
+    if positional_args.len() < 3 {
         eprintln!("tree_size, window_size, and batch_size are required");
         exit_with_usage(1);
     }
-    if use_in_memory && positional_len > 3 {
-        eprintln!("db_path is not supported when using --in-memory");
+    if backend == "memory" && positional_args.len() > 3 {
+        eprintln!("db_path is not supported with the memory backend");
         exit_with_usage(1);
     }
-    if !use_in_memory && positional_len > 4 {
+    if positional_args.len() > 4 {
         eprintln!("Too many arguments provided");
         exit_with_usage(1);
     }
@@ -104,45 +85,49 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err("batch_size must be greater than zero".into());
     }
 
-    let db_path = if use_in_memory {
-        None
-    } else {
-        positional_args.get(3).map(|s| s.as_str())
-    };
+    let db_path = positional_args.get(3).map(|s| s.as_str());
 
     let start = Instant::now();
-    let mut tree = if use_in_memory {
-        info!("Using in-memory BatchMPT implementation");
-        Tree::InMemory(BatchMPT::new())
-    } else if let Some(path) = db_path {
-        ensure_parent(path)?;
-        info!("Writing durable MPT to {}", path);
-        Tree::Durable(RocksTransRelMPT::new_with_path(path)?)
-    } else {
-        info!("Using temporary database path for durable MPT");
-        Tree::Durable(RocksTransRelMPT::new())
+    let mut tree: Box<dyn MerklePatriciaTree> = match backend.as_str() {
+        "memory" => {
+            info!("Using in-memory BatchMPT");
+            Box::new(BatchMPT::new())
+        }
+        "sqlite" => {
+            if let Some(path) = db_path {
+                ensure_parent(path)?;
+                info!("Using SQLite-backed DurableBatchMPT at {path}");
+                Box::new(DurableBatchMPT::new_with_path(path)?)
+            } else {
+                info!("Using SQLite-backed DurableBatchMPT (temporary)");
+                Box::new(DurableBatchMPT::new())
+            }
+        }
+        "rocks" => {
+            if let Some(path) = db_path {
+                ensure_parent(path)?;
+                info!("Using RocksDB-backed RocksTransRelMPT at {path}");
+                Box::new(RocksTransRelMPT::new_with_path(path)?)
+            } else {
+                info!("Using RocksDB-backed RocksTransRelMPT (temporary)");
+                Box::new(RocksTransRelMPT::new())
+            }
+        }
+        other => {
+            return Err(format!("Unknown backend: {other}. Use rocks, sqlite, or memory.").into());
+        }
     };
-    let startup_time = start.elapsed().as_secs_f64();
-    let current_tree_size = tree.len();
-    info!(
-        "Initialized MPT of size {} in {:.3} s. Rate: {} /s",
-        current_tree_size,
-        startup_time,
-        current_tree_size as f64 / startup_time
-    );
+    let startup_secs = start.elapsed().as_secs_f64();
+    info!("Initialized in {startup_secs:.3} s");
 
     info!(
-        "Building {} MPT with tree_size={}, insertions={}, window_size={}, and batch_size={}",
-        if use_in_memory {
-            "in-memory"
-        } else {
-            "durable"
-        },
-        human_count(current_tree_size),
+        "Building tree: backend={}, insertions={}, window_size={}, batch_size={}",
+        backend,
         human_count(tree_size),
         human_count(window_size),
         human_count(batch_size)
     );
+
     let mut total_inserted = 0usize;
     let start = Instant::now();
     let pb = ProgressBar::new(tree_size as u64).with_style(
@@ -152,8 +137,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         .unwrap(),
     );
     while total_inserted < tree_size {
-        let start_index = total_inserted;
-        let remaining = tree_size - start_index;
+        let remaining = tree_size - total_inserted;
         let current_window = remaining.min(window_size);
         let mut entries = generate_entries(current_window);
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -164,6 +148,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             tree.batch_upsert(chunk);
         }
     }
+    pb.finish();
 
     let total_secs = start.elapsed().as_secs_f64();
     let throughput = if total_secs > 0.0 {
@@ -179,11 +164,12 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     if let Some(root_hash) = tree.get_root_hash() {
         info!(
-            "Finished building tree. Root hash: {}",
-            root_hash.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            "Root hash: {}",
+            root_hash
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
         );
-    } else {
-        info!("Finished building tree, but root hash is empty (tree has no nodes)");
     }
 
     Ok(())
@@ -198,7 +184,6 @@ fn init_logging() {
 }
 
 fn human_count(n: usize) -> String {
-    // Format counts in SI units: K, M, B, T
     const UNITS: [&str; 5] = ["", "K", "M", "B", "T"];
     let mut value = n as f64;
     let mut unit_idx = 0usize;

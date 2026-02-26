@@ -207,7 +207,9 @@ pub(crate) fn sorted_unique_entries(entries: &[(Hash, Hash)]) -> Vec<(Hash, Hash
 
 pub trait MerklePatriciaTree {
     /// Construct a new in-memory (or temporary) instance.
-    fn new() -> Self;
+    fn new() -> Self
+    where
+        Self: Sized;
     /// Construct an instance backed by a persistent path (e.g. RocksDB directory).
     /// Implementations should create the store if missing.
     fn new_with_path<P: AsRef<std::path::Path>>(_path: P) -> storage::rocks::RocksResult<Self>
@@ -243,6 +245,7 @@ pub trait MerklePatriciaTree {
     #[inline]
     fn batch_upsert_iter<I>(&mut self, entries: I)
     where
+        Self: Sized,
         I: IntoIterator<Item = (Hash, Hash)>,
     {
         let vec: Vec<(Hash, Hash)> = entries.into_iter().collect();
