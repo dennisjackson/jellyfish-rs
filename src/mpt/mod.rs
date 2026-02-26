@@ -22,6 +22,8 @@ pub use rocks_frontier::RocksTransRelMPT;
 mod cache;
 pub use cache::Cache;
 
+mod batch_ops;
+
 #[derive(Clone, Debug)]
 pub struct LeafNode {
     pub value: Hash,
@@ -173,6 +175,12 @@ impl fmt::Display for Node {
             Node::Interior(interior) => write!(f, "{interior}"),
         }
     }
+}
+
+/// Abstraction over node storage backends used by the shared batch recursion.
+pub(crate) trait NodeStore: Sync {
+    fn get_node(&self, prefix: &Prefix) -> Option<Node>;
+    fn set_node(&self, prefix: Prefix, node: Node);
 }
 
 /// Order two children based on whether `key` goes right at the split point.

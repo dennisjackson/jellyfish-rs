@@ -12,7 +12,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use super::Node;
+use super::{Node, NodeStore};
 use crate::Prefix;
 
 /// A cache structure that wraps DashMap and provides SQLite-backed persistent storage.
@@ -622,6 +622,15 @@ impl Cache {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(nodes)
+    }
+}
+
+impl NodeStore for Cache {
+    fn get_node(&self, prefix: &Prefix) -> Option<Node> {
+        self.get(prefix).map(|guard| guard.value().clone())
+    }
+    fn set_node(&self, prefix: Prefix, node: Node) {
+        self.set(prefix, node);
     }
 }
 
