@@ -7,22 +7,26 @@ use std::error::Error;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+const DEFAULT_TIMEOUT_SECS: f64 = 30.0;
+const DEFAULT_WINDOW_SIZE: usize = 10_000;
+const DEFAULT_BATCH_SIZE: usize = 1_000;
+
 fn print_usage() {
     eprintln!(
-        "usage: build_durable_tree [OPTIONS] <tree_size> <window_size> <batch_size> [db_path]\n\
+        "usage: bench [OPTIONS] [db_path]\n\
+         \n\
+         Runs continuous insertion until the timeout expires.\n\
          \n\
          Options:\n\
-         \x20 --backend <rocks|sqlite|memory>  Storage backend (default: rocks)\n\
-         \x20 --timeout <seconds>              Stop after this many seconds\n\
-         \x20 --in-memory                      Alias for --backend memory\n\
+         \x20 -b, --backend <rocks|sqlite|memory>  Storage backend (default: rocks)\n\
+         \x20 -t, --timeout <seconds>              Run duration (default: {DEFAULT_TIMEOUT_SECS})\n\
+         \x20 -w, --window-size <n>                Entries generated per window (default: {DEFAULT_WINDOW_SIZE})\n\
+         \x20 -c, --batch-size <n>                 Entries per batch_upsert call (default: {DEFAULT_BATCH_SIZE})\n\
          \n\
          Backends:\n\
          \x20 rocks   - RocksDB with frontier optimization\n\
          \x20 sqlite  - SQLite-backed durable tree\n\
-         \x20 memory  - In-memory only (db_path not allowed)\n\
-         \n\
-         All size arguments must be positive integers.\n\
-         With --timeout, tree_size acts as a maximum; insertion stops at whichever limit is hit first."
+         \x20 memory  - In-memory only (db_path not allowed)"
     );
 }
 
@@ -42,7 +46,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     init_logging();
 
     let mut backend = "rocks".to_string();
-    let mut timeout_secs: Option<f64> = None;
+    let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
+    let mut window_size = DEFAULT_WINDOW_SIZE;
+    let mut batch_size = DEFAULT_BATCH_SIZE;
     let mut positional_args = Vec::new();
     let mut args = env::args().skip(1);
 
@@ -54,20 +60,31 @@ fn run() -> Result<(), Box<dyn Error>> {
                     .ok_or("--backend requires a value (rocks, sqlite, memory)")?;
             }
             "--timeout" | "-t" => {
-                let val: f64 = args
+                timeout_secs = args
                     .next()
                     .ok_or("--timeout requires a value in seconds")?
                     .parse()?;
-                if val <= 0.0 {
+                if timeout_secs <= 0.0 {
                     return Err("--timeout must be positive".into());
                 }
-                timeout_secs = Some(val);
+            }
+            "--window-size" | "-w" => {
+                window_size = args
+                    .next()
+                    .ok_or("--window-size requires a value")?
+                    .parse()?;
+            }
+            "--batch-size" | "-c" => {
+                batch_size = args
+                    .next()
+                    .ok_or("--batch-size requires a value")?
+                    .parse()?;
             }
             "--in-memory" => {
                 backend = "memory".to_string();
             }
             "--help" | "-h" => exit_with_usage(0),
-            _ if arg.starts_with("--") => {
+            _ if arg.starts_with("--") || arg.starts_with('-') && arg.len() == 2 => {
                 eprintln!("Unknown option: {arg}");
                 exit_with_usage(1);
             }
@@ -75,34 +92,23 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    if positional_args.len() < 3 {
-        eprintln!("tree_size, window_size, and batch_size are required");
-        exit_with_usage(1);
-    }
-    if backend == "memory" && positional_args.len() > 3 {
+    if backend == "memory" && !positional_args.is_empty() {
         eprintln!("db_path is not supported with the memory backend");
         exit_with_usage(1);
     }
-    if positional_args.len() > 4 {
+    if positional_args.len() > 1 {
         eprintln!("Too many arguments provided");
         exit_with_usage(1);
     }
-
-    let tree_size: usize = positional_args[0].parse()?;
-    let window_size: usize = positional_args[1].parse()?;
-    let batch_size: usize = positional_args[2].parse()?;
-    if tree_size == 0 {
-        return Err("tree_size must be greater than zero".into());
-    }
     if window_size == 0 {
-        return Err("window_size must be greater than zero".into());
+        return Err("--window-size must be greater than zero".into());
     }
     if batch_size == 0 {
-        return Err("batch_size must be greater than zero".into());
+        return Err("--batch-size must be greater than zero".into());
     }
 
-    let db_path = positional_args.get(3).map(|s| s.as_str());
-    let deadline = timeout_secs.map(|s| Instant::now() + Duration::from_secs_f64(s));
+    let db_path = positional_args.first().map(|s| s.as_str());
+    let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
 
     let init_start = Instant::now();
     let mut tree: Box<dyn MerklePatriciaTree> = match backend.as_str() {
@@ -136,12 +142,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
     let init_secs = init_start.elapsed().as_secs_f64();
 
-    let limit_desc = match timeout_secs {
-        Some(s) => format!("insertions={} (or {s}s timeout)", human_count(tree_size)),
-        None => format!("insertions={}", human_count(tree_size)),
-    };
     info!(
-        "Building tree: backend={backend}, {limit_desc}, window_size={}, batch_size={}",
+        "Benchmarking: backend={backend}, timeout={timeout_secs}s, window_size={}, batch_size={}",
         human_count(window_size),
         human_count(batch_size)
     );
@@ -149,41 +151,25 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut total_inserted = 0usize;
     let mut window_count = 0usize;
     let mut batch_times: Vec<f64> = Vec::new();
-    let stopped_early;
 
     let insert_start = Instant::now();
-    let pb = ProgressBar::new(tree_size as u64).with_style(
-        ProgressStyle::with_template(
-            "{wide_bar} {human_pos} / {human_len} - {percent}% - {per_sec} - {eta}",
-        )
-        .unwrap(),
+    let pb = ProgressBar::new_spinner().with_style(
+        ProgressStyle::with_template("{spinner} {human_pos} entries - {per_sec} - {elapsed}")
+            .unwrap(),
     );
 
-    while total_inserted < tree_size {
-        let remaining = tree_size - total_inserted;
-        let current_window = remaining.min(window_size);
-        let mut entries = generate_entries(current_window);
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+
+        let mut entries = generate_entries(window_size);
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         window_count += 1;
 
         for chunk in entries.chunks(batch_size) {
-            if let Some(dl) = deadline {
-                if Instant::now() >= dl {
-                    stopped_early = true;
-                    pb.finish();
-                    // Jump to stats reporting
-                    return print_stats(
-                        &backend,
-                        init_secs,
-                        insert_start,
-                        total_inserted,
-                        window_count,
-                        &batch_times,
-                        stopped_early,
-                        timeout_secs,
-                        &tree,
-                    );
-                }
+            if Instant::now() >= deadline {
+                break;
             }
 
             let batch_start = Instant::now();
@@ -195,7 +181,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
     pb.finish();
-    stopped_early = false;
 
     print_stats(
         &backend,
@@ -204,7 +189,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         total_inserted,
         window_count,
         &batch_times,
-        stopped_early,
         timeout_secs,
         &tree,
     )
@@ -218,8 +202,7 @@ fn print_stats(
     total_inserted: usize,
     window_count: usize,
     batch_times: &[f64],
-    stopped_early: bool,
-    timeout_secs: Option<f64>,
+    timeout_secs: f64,
     tree: &Box<dyn MerklePatriciaTree>,
 ) -> Result<(), Box<dyn Error>> {
     let insert_secs = insert_start.elapsed().as_secs_f64();
@@ -233,15 +216,8 @@ fn print_stats(
     eprintln!("=== Benchmark Results ===");
     eprintln!("Backend:            {backend}");
     eprintln!("Init time:          {init_secs:.3} s");
-    eprintln!(
-        "Inserted:           {} entries{}",
-        human_count(total_inserted),
-        if stopped_early {
-            format!(" (stopped at {:.1}s timeout)", timeout_secs.unwrap_or(0.0))
-        } else {
-            String::new()
-        }
-    );
+    eprintln!("Timeout:            {timeout_secs:.1} s");
+    eprintln!("Inserted:           {} entries", human_count(total_inserted));
     eprintln!("Insert time:        {insert_secs:.3} s");
     eprintln!("Throughput:         {throughput:.1} entries/s");
     eprintln!("Windows processed:  {window_count}");

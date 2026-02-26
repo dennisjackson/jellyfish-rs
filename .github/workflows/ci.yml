@@ -149,8 +149,8 @@ jobs:
 
     - name: Run benchmarks
       run: |
-        cargo run --features bins --release --bin bench -- --backend rocks --timeout 30 1000000 10000 1000
-        cargo run --features bins --release --bin bench -- --backend memory --timeout 30 1000000 10000 1000
+        cargo run --features bins --release --bin bench -- -b rocks -t 30
+        cargo run --features bins --release --bin bench -- -b memory -t 30
 
   mutants:
     name: Mutation Testing

@@ -1,4 +1,4 @@
-use log::{debug, info, warn};
+use log::{debug, warn};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Result as SqliteResult};
 use std::env;
 use std::sync::{Arc, Mutex};
@@ -299,8 +299,8 @@ impl MerklePatriciaTree for DurableBatchMPT {
             self.batch_upsert_optimized(chunk);
             self.cache.flush().unwrap();
             let batch_duration = batch_start.elapsed();
-            info!(
-                "Upserted batch of {} entries in {:.3} ms ()",
+            debug!(
+                "Upserted batch of {} entries in {:.3} ms",
                 chunk.len(),
                 batch_duration.as_secs_f64() * 1_000.0,
             );

@@ -1,5 +1,4 @@
 use dashmap::DashMap;
-use log::info;
 use std::sync::Arc;
 
 use crate::mpt::MerklePatriciaTree;
@@ -43,8 +42,6 @@ impl BatchMPT {
         if entries.is_empty() {
             return;
         }
-
-        info!("Batch upserting {} entries", entries.len());
 
         let entries_vec = super::sorted_unique_entries(entries);
         self.root = super::batch_ops::batch_upsert_recursive(&self.store, self.root, entries_vec);

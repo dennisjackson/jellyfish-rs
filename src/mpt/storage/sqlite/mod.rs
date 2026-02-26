@@ -1,5 +1,5 @@
 use dashmap::{DashMap, DashSet, mapref::one::Ref as DashMapRef};
-use log::{debug, info, warn};
+use log::{debug, warn};
 use rusqlite::{
     Connection, OptionalExtension, Result as SqliteResult, Row,
     limits::Limit,
@@ -350,7 +350,7 @@ impl SqliteStore {
                 current_usage, self.cache_memory_limit_bytes
             );
         }
-        info!("Released {} internal nodes and {} leaf nodes", ints, leaves);
+        debug!("Released {} internal nodes and {} leaf nodes", ints, leaves);
     }
 
     /// Helper function to batch query multiple nodes from the database.
@@ -515,7 +515,7 @@ impl SqliteStore {
             self.load_and_cache_nodes(&db, &remaining_to_query, &mut queried_nodes)?;
         }
 
-        info!(
+        debug!(
             "Pre-advise complete. Loaded nodes: {}, Cache size: {}",
             queried_nodes,
             self.len()
@@ -530,7 +530,7 @@ impl SqliteStore {
     pub fn flush(&self) -> SqliteResult<()> {
         let dirty_keys: Vec<Prefix> = self.dirty.iter().map(|entry| *entry).collect();
         let root_dirty = self.root_dirty.load(Ordering::SeqCst);
-        info!("Flushing {} dirty nodes", dirty_keys.len());
+        debug!("Flushing {} dirty nodes", dirty_keys.len());
         if dirty_keys.is_empty() && !root_dirty {
             // Even if no dirty keys, commit the transaction if one is active
             let db = self.db.lock().unwrap();
