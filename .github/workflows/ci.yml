@@ -148,14 +148,9 @@ jobs:
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Run benchmarks
-      run: cargo bench --verbose
-
-    - name: Upload benchmark results
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: benchmark-results
-        path: target/criterion/
+      run: |
+        cargo run --features bins --release --bin bench -- --backend rocks --timeout 30 1000000 10000 1000
+        cargo run --features bins --release --bin bench -- --backend memory --timeout 30 1000000 10000 1000
 
   mutants:
     name: Mutation Testing
