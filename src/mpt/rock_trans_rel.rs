@@ -138,8 +138,6 @@ impl RocksTransRelMPT {
         depth >= complete_depth && depth < complete_depth + self.config.depth_to_write
     }
 
-    // No longer needed: leaves are written opportunistically during recursion.
-
     fn recover_full_tree_from_storage(&mut self) -> RocksResult<()> {
         const RECOVERY_CHUNK: usize = 1024 * 1024;
         let mut leaf_entries: Vec<(Hash, Hash)> = Vec::with_capacity(RECOVERY_CHUNK);
@@ -220,7 +218,7 @@ impl RocksTransRelMPT {
                     prefix.length == current_depth,
                     "Unexpected prefix depth during rebuild"
                 );
-                let parent_prefix = Self::parent_prefix(*prefix);
+                let parent_prefix = prefix.parent().expect("non-root prefix has a parent");
                 let entry = parent_map
                     .entry(parent_prefix)
                     .or_insert_with(ParentChildren::default);
@@ -264,15 +262,6 @@ impl RocksTransRelMPT {
         }
     }
 
-    fn parent_prefix(prefix: Prefix) -> Prefix {
-        assert!(prefix.length > 0, "Root prefix has no parent");
-        let parent_length = prefix.length - 1;
-        Prefix {
-            hash: prefix.hash.zero_bits_from(parent_length),
-            length: parent_length,
-        }
-    }
-
     fn is_right_child(prefix: &Prefix) -> bool {
         assert!(
             prefix.length > 0,
@@ -296,11 +285,6 @@ impl RocksTransRelMPT {
     }
 
     fn load_subtree_from_storage(&self, prefix: Prefix) -> RocksResult<bool> {
-        // if self.loaded_subtrees.contains(&prefix) {
-        //     debug!("Subtree prefix {} already loaded", prefix.short_hex());
-        //     return Ok(false);
-        // }
-
         self.prefix_loads.fetch_add(1, Ordering::Relaxed);
         let leaf_nodes = self.storage.get_leaf_nodes_by_prefix(&prefix)?;
         let loaded_nodes = leaf_nodes.len();
@@ -437,9 +421,7 @@ impl RocksTransRelMPT {
             self.prefix_loads.load(Ordering::Relaxed),
             self.loaded_subtrees.len()
         );
-        let mut entries_vec: Vec<(Hash, Hash)> = entries.to_vec();
-        entries_vec.sort_unstable_by_key(|(k, _)| *k);
-        entries_vec.dedup_by_key(|(k, _)| *k);
+        let entries_vec = super::sorted_unique_entries(entries);
 
         debug!(
             "RocksSparse: batch_upsert_optimized start entries={} complete_depth={}",
@@ -485,9 +467,7 @@ impl RocksTransRelMPT {
             return;
         }
 
-        let mut entries_vec: Vec<(Hash, Hash)> = entries.to_vec();
-        entries_vec.sort_unstable_by_key(|(k, _)| *k);
-        entries_vec.dedup_by_key(|(k, _)| *k);
+        let entries_vec = super::sorted_unique_entries(entries);
 
         let mut dummy = false;
         let new_root =
@@ -648,7 +628,7 @@ impl RocksTransRelMPT {
         let existing_prefix = leaf_prefix;
         let merged_prefix = Prefix::common_prefix(&existing_prefix, &new_prefix);
 
-        let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
+        let (left_prefix, right_prefix, left_hash, right_hash) = super::order_children(
             &merged_prefix,
             first_key,
             new_prefix,
@@ -709,14 +689,12 @@ impl RocksTransRelMPT {
                 .write_batch(batch)
                 .expect("Failed to commit leaf-merge subtree batch");
             self.release_subtree(res);
-            // self.loaded_subtrees.insert(merged_prefix);
             *boundary_started = true;
             return res;
         }
 
         // Otherwise, still no active batch: start a local batch for this merge so both leaves persist
         let mut batch = self.storage.start_batch();
-        // let _ = batch.put_node(&merged_prefix, &Node::Interior(new_interior));
         let _ = batch.put_node(&existing_prefix, &Node::Leaf(leaf));
         let _ = batch.put_node(&new_prefix, &Node::Leaf(new_leaf));
         let res = Self::recursive_batch_upsert(
@@ -729,7 +707,6 @@ impl RocksTransRelMPT {
         self.storage
             .write_batch(batch)
             .expect("Failed to commit leaf-merge batch");
-        // self.release_subtree(res);
         res
     }
 
@@ -783,7 +760,6 @@ impl RocksTransRelMPT {
                 self.storage
                     .write_batch(batch)
                     .expect("Failed to commit diverge-all subtree batch");
-                // self.loaded_subtrees.insert(interior_prefix);
                 self.release_subtree(res);
                 *boundary_started = true;
                 return res;
@@ -852,7 +828,6 @@ impl RocksTransRelMPT {
                 self.storage
                     .write_batch(batch)
                     .expect("Failed to commit diverge-left subtree batch");
-                // self.loaded_subtrees.insert(interior_prefix);
                 self.release_subtree(res);
                 *boundary_started = true;
                 return res;
@@ -890,7 +865,6 @@ impl RocksTransRelMPT {
                 self.storage
                     .write_batch(batch)
                     .expect("Failed to commit diverge-right subtree batch");
-                // self.loaded_subtrees.insert(interior_prefix);
                 self.release_subtree(res);
                 *boundary_started = true;
                 return res;
@@ -926,14 +900,14 @@ impl RocksTransRelMPT {
                 right_entries.len()
             );
             let mut batch = self.storage.start_batch();
-            let new_left = Self::process_left_entries(
+            let new_left = Self::process_child_entries(
                 self,
                 interior.left,
                 &left_entries,
                 Some(&mut batch),
                 boundary_started,
             );
-            let new_right = Self::process_right_entries(
+            let new_right = Self::process_child_entries(
                 self,
                 interior.right,
                 &right_entries,
@@ -959,8 +933,6 @@ impl RocksTransRelMPT {
             self.storage
                 .write_batch(batch)
                 .expect("Failed to commit subtree batch");
-            // self.loaded_subtrees.insert(interior_prefix);
-            // self.release_subtree(interior_prefix);
             *boundary_started = true;
             return interior_prefix;
         } else if count > 64 && active_batch.is_none() {
@@ -970,7 +942,7 @@ impl RocksTransRelMPT {
             let mut right_started = false;
             let (new_left, new_right) = join(
                 || {
-                    Self::process_left_entries(
+                    Self::process_child_entries(
                         self,
                         interior.left,
                         &left_entries,
@@ -979,7 +951,7 @@ impl RocksTransRelMPT {
                     )
                 },
                 || {
-                    Self::process_right_entries(
+                    Self::process_child_entries(
                         self,
                         interior.right,
                         &right_entries,
@@ -992,14 +964,14 @@ impl RocksTransRelMPT {
             (new_left, new_right)
         } else {
             // Sequential when a batch is active; pass it through so updates persist.
-            let new_left = Self::process_left_entries(
+            let new_left = Self::process_child_entries(
                 self,
                 interior.left,
                 &left_entries,
                 active_batch.as_deref_mut(),
                 boundary_started,
             );
-            let new_right = Self::process_right_entries(
+            let new_right = Self::process_child_entries(
                 self,
                 interior.right,
                 &right_entries,
@@ -1083,7 +1055,7 @@ impl RocksTransRelMPT {
         let new_leaf_prefix = Prefix::from(first_key);
         let common = Prefix::common_prefix(&interior_prefix, &new_leaf_prefix);
 
-        let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
+        let (left_prefix, right_prefix, left_hash, right_hash) = super::order_children(
             &common,
             first_key,
             new_leaf_prefix,
@@ -1134,60 +1106,24 @@ impl RocksTransRelMPT {
         result_prefix
     }
 
-    fn process_left_entries(
+    fn process_child_entries(
         &self,
-        left_prefix: Prefix,
-        left_entries: &[(Hash, Hash)],
+        child_prefix: Prefix,
+        entries: &[(Hash, Hash)],
         active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
         boundary_started: &mut bool,
     ) -> Prefix {
-        if !left_entries.is_empty() {
+        if !entries.is_empty() {
             Self::recursive_batch_upsert(
                 self,
-                left_prefix,
-                left_entries,
+                child_prefix,
+                entries,
                 active_batch,
                 boundary_started,
             )
         } else {
-            self.ensure_node_loaded(left_prefix);
-            left_prefix
-        }
-    }
-
-    fn process_right_entries(
-        &self,
-        right_prefix: Prefix,
-        right_entries: &[(Hash, Hash)],
-        active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
-        boundary_started: &mut bool,
-    ) -> Prefix {
-        if !right_entries.is_empty() {
-            Self::recursive_batch_upsert(
-                self,
-                right_prefix,
-                right_entries,
-                active_batch,
-                boundary_started,
-            )
-        } else {
-            self.ensure_node_loaded(right_prefix);
-            right_prefix
-        }
-    }
-
-    fn order_children(
-        split_prefix: &Prefix,
-        key: Hash,
-        key_prefix: Prefix,
-        key_hash: Hash,
-        other_prefix: Prefix,
-        other_hash: Hash,
-    ) -> (Prefix, Prefix, Hash, Hash) {
-        if split_prefix.key_goes_right(key) {
-            (other_prefix, key_prefix, other_hash, key_hash)
-        } else {
-            (key_prefix, other_prefix, key_hash, other_hash)
+            self.ensure_node_loaded(child_prefix);
+            child_prefix
         }
     }
 

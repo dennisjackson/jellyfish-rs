@@ -26,22 +26,6 @@ impl SimpleMPT {
         }
     }
 
-    /// Helper to order two children based on whether the key goes right at the split point
-    fn order_children(
-        split_prefix: &Prefix,
-        key: Hash,
-        key_prefix: Prefix,
-        key_hash: Hash,
-        other_prefix: Prefix,
-        other_hash: Hash,
-    ) -> (Prefix, Prefix, Hash, Hash) {
-        if split_prefix.key_goes_right(key) {
-            (other_prefix, key_prefix, other_hash, key_hash)
-        } else {
-            (key_prefix, other_prefix, key_hash, other_hash)
-        }
-    }
-
     pub fn upsert(&mut self, key: Hash, value: Hash) {
         info!(
             "Upserting key: {}, value: {}",
@@ -96,7 +80,7 @@ impl SimpleMPT {
         let new_prefix = Prefix::from(key);
         let merged_prefix = Prefix::common_prefix(&existing_prefix, &new_prefix);
 
-        let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
+        let (left_prefix, right_prefix, left_hash, right_hash) = super::order_children(
             &merged_prefix,
             key,
             new_prefix,
@@ -141,7 +125,7 @@ impl SimpleMPT {
             let new_leaf_prefix = Prefix::from(key);
             let common = Prefix::common_prefix(&interior_prefix, &new_leaf_prefix);
 
-            let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
+            let (left_prefix, right_prefix, left_hash, right_hash) = super::order_children(
                 &common,
                 key,
                 new_leaf_prefix,
@@ -209,10 +193,6 @@ impl SimpleMPT {
 impl MerklePatriciaTree for SimpleMPT {
     fn new() -> Self {
         Self::new()
-    }
-
-    fn upsert(&mut self, key: Hash, value: Hash) {
-        self.upsert(key, value);
     }
 
     fn enumerate_nodes(&self) -> Vec<(Prefix, Node)> {

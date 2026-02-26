@@ -89,6 +89,18 @@ impl Prefix {
         }
     }
 
+    /// Return the parent prefix (one bit shorter), or `None` for the root prefix.
+    pub fn parent(&self) -> Option<Prefix> {
+        if self.length == 0 {
+            return None;
+        }
+        let parent_length = self.length - 1;
+        Some(Prefix {
+            hash: self.hash.zero_bits_from(parent_length),
+            length: parent_length,
+        })
+    }
+
     pub fn short_hex(&self) -> String {
         if self.length == 256 {
             return self.hash.short_hex();

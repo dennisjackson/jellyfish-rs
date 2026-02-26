@@ -13,7 +13,7 @@ use std::{
 };
 
 use super::Node;
-use crate::{Prefix, prefix::HashExt};
+use crate::Prefix;
 
 /// A cache structure that wraps DashMap and provides SQLite-backed persistent storage.
 /// This cache allows preloading keys from disk and batch writing keys back to disk.
@@ -43,7 +43,7 @@ pub struct Cache {
 
 pub(crate) const ROOT_METADATA_KEY: &str = "root_prefix";
 
-pub(crate) const DEFAULT_CACHE_MEMORY_LIMIT_BYTES: usize = 1024 * 1024 * 1024; //10 MB
+pub(crate) const DEFAULT_CACHE_MEMORY_LIMIT_BYTES: usize = 1024 * 1024 * 1024; // 1 GB
 
 const CACHE_ENTRY_SIZE_BYTES: usize = std::mem::size_of::<Prefix>() + std::mem::size_of::<Node>();
 
@@ -217,7 +217,7 @@ impl Cache {
         for mut key in needed_keys.iter().copied() {
             loop {
                 protected.insert(key);
-                match parent_prefix(key) {
+                match key.parent() {
                     Some(parent) => key = parent,
                     None => break,
                 }
@@ -412,7 +412,7 @@ impl Cache {
     /// This loads all nodes on the path from root to the needed keys, plus their siblings.
     /// Nodes that are already in the cache will not be reloaded.
     /// Begins a durable transaction that will remain active until flush() is called.
-    pub fn pre_advise(&self, _keys: &[Prefix]) -> SqliteResult<()> {
+    pub fn pre_advise(&self, keys: &[Prefix]) -> SqliteResult<()> {
         let db = self.db.lock().unwrap();
         let mut queried_nodes = 0;
 
@@ -422,7 +422,7 @@ impl Cache {
         drop(in_tx); // Release lock before querying
 
         //Currently pretty inefficient. O(n^2) so we limit the max we process at once
-        for (chunk_idx, keys_chunk) in _keys.chunks(100).enumerate() {
+        for (chunk_idx, keys_chunk) in keys.chunks(100).enumerate() {
             let mut needed_keys: HashSet<Prefix> = keys_chunk.iter().copied().collect();
             if needed_keys.is_empty() {
                 continue;
@@ -629,18 +629,6 @@ impl Cache {
 enum BatchQueryParam<'a> {
     Hash(&'a [u8]),
     Length(i64),
-}
-
-fn parent_prefix(prefix: Prefix) -> Option<Prefix> {
-    if prefix.length == 0 {
-        return None;
-    }
-
-    let parent_length = prefix.length - 1;
-    Some(Prefix {
-        hash: prefix.hash.zero_bits_from(parent_length),
-        length: parent_length,
-    })
 }
 
 fn read_node_from_row(row: &Row<'_>) -> SqliteResult<(Prefix, Node)> {

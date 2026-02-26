@@ -164,28 +164,6 @@ impl DurableBatchMPT {
         )
     }
 
-    fn sorted_unique_entries(entries: &[(Hash, Hash)]) -> Vec<(Hash, Hash)> {
-        let mut sorted = entries.to_vec();
-        sorted.sort_by_key(|(key, _)| *key);
-        sorted.dedup_by_key(|(key, _)| *key);
-        sorted
-    }
-
-    /// Helper to order two children based on whether the key goes right at the split point
-    fn order_children(
-        split_prefix: &Prefix,
-        key: Hash,
-        key_prefix: Prefix,
-        key_hash: Hash,
-        other_prefix: Prefix,
-        other_hash: Hash,
-    ) -> (Prefix, Prefix, Hash, Hash) {
-        if split_prefix.key_goes_right(key) {
-            (other_prefix, key_prefix, other_hash, key_hash)
-        } else {
-            (key_prefix, other_prefix, key_hash, other_hash)
-        }
-    }
 
     /// Batch upsert with recursive single-pass optimization.
     /// This method traverses the tree only once, partitioning entries at each interior node
@@ -198,7 +176,7 @@ impl DurableBatchMPT {
         debug!("Batch upserting {} entries", entries.len());
 
         // Convert to sorted vector for efficient partitioning
-        let entries_vec = Self::sorted_unique_entries(entries);
+        let entries_vec = super::sorted_unique_entries(entries);
 
         let batch_nodes = entries_vec.len();
         let limit_bytes = self.cache.cache_memory_limit_bytes();
@@ -310,7 +288,7 @@ impl DurableBatchMPT {
         let existing_prefix = leaf_prefix;
         let merged_prefix = Prefix::common_prefix(&existing_prefix, &new_prefix);
 
-        let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
+        let (left_prefix, right_prefix, left_hash, right_hash) = super::order_children(
             &merged_prefix,
             first_key,
             new_prefix,
@@ -355,7 +333,7 @@ impl DurableBatchMPT {
             let new_leaf_prefix = Prefix::from(first_key);
             let common = Prefix::common_prefix(&interior_prefix, &new_leaf_prefix);
 
-            let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
+            let (left_prefix, right_prefix, left_hash, right_hash) = super::order_children(
                 &common,
                 first_key,
                 new_leaf_prefix,
@@ -412,18 +390,6 @@ impl DurableBatchMPT {
             .expect("Expected right child to exist in cache")
             .value()
             .merkle_hash();
-
-        #[cfg(feature = "trace_compare")]
-        {
-            println!(
-                "TRACE_INTERIOR durable prefix={} left={} right={} left_hash={} right_hash={}",
-                interior_prefix.short_hex(),
-                new_left.short_hex(),
-                new_right.short_hex(),
-                left_hash.short_hex(),
-                right_hash.short_hex()
-            );
-        }
 
         let updated_interior =
             InteriorNode::new(interior_prefix, new_left, new_right, left_hash, right_hash);
@@ -492,7 +458,7 @@ impl MerklePatriciaTree for DurableBatchMPT {
         }
 
         // Sort entries by key so chunk boundaries follow key order
-        let sorted_entries = Self::sorted_unique_entries(entries);
+        let sorted_entries = super::sorted_unique_entries(entries);
 
         // Determine chunk size based on cache memory limit; fall back to whole batch if unlimited
         let limit_bytes = self.cache.cache_memory_limit_bytes();

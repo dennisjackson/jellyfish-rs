@@ -175,6 +175,31 @@ impl fmt::Display for Node {
     }
 }
 
+/// Order two children based on whether `key` goes right at the split point.
+/// Returns `(left_prefix, right_prefix, left_hash, right_hash)`.
+pub fn order_children(
+    split_prefix: &Prefix,
+    key: Hash,
+    key_prefix: Prefix,
+    key_hash: Hash,
+    other_prefix: Prefix,
+    other_hash: Hash,
+) -> (Prefix, Prefix, Hash, Hash) {
+    if split_prefix.key_goes_right(key) {
+        (other_prefix, key_prefix, other_hash, key_hash)
+    } else {
+        (key_prefix, other_prefix, key_hash, other_hash)
+    }
+}
+
+/// Sort entries by key and deduplicate, keeping the last value for each key.
+pub fn sorted_unique_entries(entries: &[(Hash, Hash)]) -> Vec<(Hash, Hash)> {
+    let mut sorted = entries.to_vec();
+    sorted.sort_by_key(|(k, _)| *k);
+    sorted.dedup_by_key(|(k, _)| *k);
+    sorted
+}
+
 pub trait MerklePatriciaTree {
     /// Construct a new in-memory (or temporary) instance.
     fn new() -> Self;

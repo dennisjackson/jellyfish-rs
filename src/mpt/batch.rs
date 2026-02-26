@@ -30,22 +30,6 @@ impl BatchMPT {
         }
     }
 
-    /// Helper to order two children based on whether the key goes right at the split point
-    fn order_children(
-        split_prefix: &Prefix,
-        key: Hash,
-        key_prefix: Prefix,
-        key_hash: Hash,
-        other_prefix: Prefix,
-        other_hash: Hash,
-    ) -> (Prefix, Prefix, Hash, Hash) {
-        if split_prefix.key_goes_right(key) {
-            (other_prefix, key_prefix, other_hash, key_hash)
-        } else {
-            (key_prefix, other_prefix, key_hash, other_hash)
-        }
-    }
-
     /// Batch upsert with recursive single-pass optimization.
     /// This method traverses the tree only once, partitioning entries at each interior node
     /// and updating hashes on the way back up the recursion.
@@ -56,11 +40,8 @@ impl BatchMPT {
 
         info!("Batch upserting {} entries", entries.len());
 
-        // Convert to sorted vector for efficient partitioning
-        let mut entries_vec: Vec<(Hash, Hash)> = entries.to_vec();
-        entries_vec.sort_by_key(|(k, _)| *k);
-        // Remove duplicates, keeping the last occurrence (latest value)
-        entries_vec.dedup_by_key(|(k, _)| *k);
+        // Convert to sorted, deduplicated vector for efficient partitioning
+        let entries_vec = super::sorted_unique_entries(entries);
 
         // Perform recursive batch upsert
         let new_root = Self::recursive_batch_upsert(&self.store, self.root, entries_vec);
@@ -145,7 +126,7 @@ impl BatchMPT {
         let existing_prefix = leaf_prefix;
         let merged_prefix = Prefix::common_prefix(&existing_prefix, &new_prefix);
 
-        let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
+        let (left_prefix, right_prefix, left_hash, right_hash) = super::order_children(
             &merged_prefix,
             first_key,
             new_prefix,
@@ -198,7 +179,7 @@ impl BatchMPT {
             let new_leaf_prefix = Prefix::from(first_key);
             let common = Prefix::common_prefix(&interior_prefix, &new_leaf_prefix);
 
-            let (left_prefix, right_prefix, left_hash, right_hash) = Self::order_children(
+            let (left_prefix, right_prefix, left_hash, right_hash) = super::order_children(
                 &common,
                 first_key,
                 new_leaf_prefix,

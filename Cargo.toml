@@ -25,9 +25,6 @@ divan = "0.1.21"
 [lib]
 bench = false
 
-[features]
-trace_compare = []
-
 [[bin]]
 name = "build-durable-tree"
 path = "src/bin/build_durable_tree.rs"
