@@ -4,8 +4,10 @@ use jellyfish_rs::{BatchMPT, DurableBatchMPT, Hash};
 use log::info;
 use std::env;
 use std::error::Error;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const DEFAULT_TIMEOUT_SECS: f64 = 30.0;
 const DEFAULT_WINDOW_SIZE: usize = 10_000;
@@ -22,6 +24,7 @@ fn print_usage() {
          \x20 -t, --timeout <seconds>              Run duration (default: {DEFAULT_TIMEOUT_SECS})\n\
          \x20 -w, --window-size <n>                Entries generated per window (default: {DEFAULT_WINDOW_SIZE})\n\
          \x20 -c, --batch-size <n>                 Entries per batch_upsert call (default: {DEFAULT_BATCH_SIZE})\n\
+         \x20 -l, --log-file <path>               Write insertion log (CSV) to file\n\
          \n\
          Backends:\n\
          \x20 rocks   - RocksDB with frontier optimization\n\
@@ -49,6 +52,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
     let mut window_size = DEFAULT_WINDOW_SIZE;
     let mut batch_size = DEFAULT_BATCH_SIZE;
+    let mut log_file_path: Option<String> = None;
     let mut positional_args = Vec::new();
     let mut args = env::args().skip(1);
 
@@ -79,6 +83,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                     .next()
                     .ok_or("--batch-size requires a value")?
                     .parse()?;
+            }
+            "--log-file" | "-l" => {
+                log_file_path = Some(
+                    args.next()
+                        .ok_or("--log-file requires a path")?,
+                );
             }
             "--in-memory" => {
                 backend = "memory".to_string();
@@ -148,6 +158,18 @@ fn run() -> Result<(), Box<dyn Error>> {
         human_count(batch_size)
     );
 
+    let mut log_writer = match &log_file_path {
+        Some(path) => {
+            ensure_parent(path)?;
+            let file = File::create(path)?;
+            let mut w = BufWriter::new(file);
+            writeln!(w, "timestamp,total_inserted")?;
+            info!("Writing insertion log to {path}");
+            Some(w)
+        }
+        None => None,
+    };
+
     let mut total_inserted = 0usize;
     let mut window_count = 0usize;
     let mut batch_times: Vec<f64> = Vec::new();
@@ -178,9 +200,21 @@ fn run() -> Result<(), Box<dyn Error>> {
 
             total_inserted += chunk.len();
             pb.inc(chunk.len() as u64);
+
+            if let Some(ref mut w) = log_writer {
+                let ts = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64();
+                writeln!(w, "{ts:.6},{total_inserted}")?;
+            }
         }
     }
     pb.finish();
+
+    if let Some(ref mut w) = log_writer {
+        w.flush()?;
+    }
 
     print_stats(
         &backend,
