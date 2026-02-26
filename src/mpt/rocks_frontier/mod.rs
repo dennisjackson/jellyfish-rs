@@ -1421,22 +1421,22 @@ impl RocksTransRelMPT {
         self.full_tree_loaded.store(false, Ordering::Relaxed);
         let max_depth =
             (depth + self.config.keep_below_frontier).max(self.config.depth_always_keep);
-        if let Some(node_ref) = self.store.get(&prefix) {
-            match node_ref.value() {
-                Node::Interior(interior) => {
-                    // Recursively release children and then remove them.
-                    self.release_subtree(interior.left);
-                    self.release_subtree(interior.right);
-                    if interior.left.length > max_depth {
-                        self.store.remove(&interior.left);
-                    }
-                    if interior.right.length > max_depth {
-                        self.store.remove(&interior.right);
-                    }
-                }
-                Node::Leaf(_) => {
-                    // Nothing to do for a leaf, as it has no children.
-                }
+        // Clone children before dropping the DashMap guard to avoid deadlock:
+        // holding a read lock (from get) while remove() needs a write lock on
+        // the same shard will deadlock.
+        let children = self.store.get(&prefix).and_then(|node_ref| match node_ref.value() {
+            Node::Interior(interior) => Some((interior.left, interior.right)),
+            Node::Leaf(_) => None,
+        });
+        // Guard is dropped here before any recursive calls or removes.
+        if let Some((left, right)) = children {
+            self.release_subtree(left);
+            self.release_subtree(right);
+            if left.length > max_depth {
+                self.store.remove(&left);
+            }
+            if right.length > max_depth {
+                self.store.remove(&right);
             }
         }
     }

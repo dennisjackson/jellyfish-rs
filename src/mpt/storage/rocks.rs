@@ -305,7 +305,6 @@ impl RocksStorage {
     }
 
     pub fn flush(&self) -> RocksResult<()> {
-        // self.db.flush()?;
         self.db.flush_wal(true)?;
         Ok(())
     }
