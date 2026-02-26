@@ -1,5 +1,6 @@
-use jellyfish_rs::{Hash, Node, Prefix, SimpleMPT};
+use jellyfish_rs::{Hash, MerklePatriciaTree, Node, Prefix, SimpleMPT};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 
@@ -32,7 +33,7 @@ fn append_mermaid_to_file(mpt: &SimpleMPT, path: &str, step: usize, key: &str, v
 }
 
 fn collect_mermaid_node(mpt: &SimpleMPT) -> String {
-    use std::collections::HashMap;
+    let nodes: HashMap<Prefix, Node> = mpt.enumerate_nodes().into_iter().collect();
     let mut lines = String::new();
     let mut name_cache: HashMap<Prefix, String> = HashMap::new();
     // Helper to get or create a friendly name for a prefix
@@ -47,7 +48,7 @@ fn collect_mermaid_node(mpt: &SimpleMPT) -> String {
         name_cache.insert(*prefix, name.clone());
         name
     };
-    for (prefix, node) in mpt.store.iter() {
+    for (prefix, node) in &nodes {
         let this_name = get_name(prefix, node);
         match node {
             Node::Leaf(_) => {
@@ -56,11 +57,11 @@ fn collect_mermaid_node(mpt: &SimpleMPT) -> String {
             Node::Interior(interior) => {
                 lines.push_str(&format!("  {}[\"I:{}\"]\n", this_name, &prefix.short_hex()));
                 // Edges to children
-                if let Some(left_node) = mpt.store.get(&interior.left) {
+                if let Some(left_node) = nodes.get(&interior.left) {
                     let left_name = get_name(&interior.left, left_node);
                     lines.push_str(&format!("  {this_name} --> {left_name}\n"));
                 }
-                if let Some(right_node) = mpt.store.get(&interior.right) {
+                if let Some(right_node) = nodes.get(&interior.right) {
                     let right_name = get_name(&interior.right, right_node);
                     lines.push_str(&format!("  {this_name} --> {right_name}\n"));
                 }
@@ -107,7 +108,7 @@ fn main() {
         println!(
             "Appended step {} diagram with {} nodes to {}",
             i + 1,
-            mpt.store.len(),
+            mpt.enumerate_nodes().len(),
             output_file
         );
     }

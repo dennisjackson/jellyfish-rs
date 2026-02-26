@@ -12,8 +12,8 @@ use super::{InteriorNode, LeafNode, Node};
 /// hash recalculations until after all insertions are complete.
 /// Uses a concurrent hashmap (DashMap) for thread-safe parallel operations.
 pub struct BatchMPT {
-    pub store: Arc<DashMap<Prefix, Node>>,
-    pub root: Prefix,
+    pub(crate) store: Arc<DashMap<Prefix, Node>>,
+    pub(crate) root: Prefix,
 }
 
 impl Default for BatchMPT {

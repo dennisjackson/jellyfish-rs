@@ -8,8 +8,8 @@ use crate::{Hash, Prefix};
 use super::{InteriorNode, LeafNode, Node};
 
 pub struct SimpleMPT {
-    pub store: HashMap<Prefix, Node>,
-    pub root: Prefix,
+    pub(crate) store: HashMap<Prefix, Node>,
+    pub(crate) root: Prefix,
 }
 
 impl Default for SimpleMPT {

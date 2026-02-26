@@ -16,8 +16,8 @@ pub use durable_batch::DurableBatchMPT;
 mod rocks_storage;
 pub use rocks_storage::RocksStorage;
 
-mod rock_trans_rel;
-pub use rock_trans_rel::RocksTransRelMPT;
+mod rocks_frontier;
+pub use rocks_frontier::RocksTransRelMPT;
 
 mod cache;
 pub use cache::Cache;
@@ -177,7 +177,7 @@ impl fmt::Display for Node {
 
 /// Order two children based on whether `key` goes right at the split point.
 /// Returns `(left_prefix, right_prefix, left_hash, right_hash)`.
-pub fn order_children(
+pub(crate) fn order_children(
     split_prefix: &Prefix,
     key: Hash,
     key_prefix: Prefix,
@@ -193,7 +193,7 @@ pub fn order_children(
 }
 
 /// Sort entries by key and deduplicate, keeping the last value for each key.
-pub fn sorted_unique_entries(entries: &[(Hash, Hash)]) -> Vec<(Hash, Hash)> {
+pub(crate) fn sorted_unique_entries(entries: &[(Hash, Hash)]) -> Vec<(Hash, Hash)> {
     let mut sorted = entries.to_vec();
     sorted.sort_by_key(|(k, _)| *k);
     sorted.dedup_by_key(|(k, _)| *k);

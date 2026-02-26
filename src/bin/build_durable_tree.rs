@@ -180,7 +180,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     if let Some(root_hash) = tree.get_root_hash() {
         info!(
             "Finished building tree. Root hash: {}",
-            hex::encode(root_hash)
+            root_hash.iter().map(|b| format!("{b:02x}")).collect::<String>()
         );
     } else {
         info!("Finished building tree, but root hash is empty (tree has no nodes)");
