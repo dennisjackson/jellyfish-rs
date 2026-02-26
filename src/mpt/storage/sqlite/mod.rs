@@ -12,13 +12,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use super::{Node, NodeStore};
 use crate::Prefix;
+use crate::mpt::{Node, NodeStore};
 
-/// A cache structure that wraps DashMap and provides SQLite-backed persistent storage.
-/// This cache allows preloading keys from disk and batch writing keys back to disk.
-/// It automatically tracks dirty (modified) keys for efficient flushing.
-pub struct Cache {
+/// SQLite-backed node store with in-memory DashMap cache.
+/// Preloads keys from disk and batch-writes modified keys back.
+/// Automatically tracks dirty (modified) keys for efficient flushing.
+pub struct SqliteStore {
     /// In-memory cache using DashMap for concurrent access
     map: Arc<DashMap<Prefix, Node>>,
     /// SQLite database connection for persistent storage
@@ -49,7 +49,7 @@ const CACHE_ENTRY_SIZE_BYTES: usize = std::mem::size_of::<Prefix>() + std::mem::
 
 pub type NodeReadGuard<'a> = DashMapRef<'a, Prefix, Node>;
 
-impl Cache {
+impl SqliteStore {
     /// Initialize the database schema by creating the necessary tables and indexes.
     /// This should be called after opening a database connection.
     pub fn initialize_database(conn: &Connection) -> SqliteResult<()> {
@@ -625,7 +625,7 @@ impl Cache {
     }
 }
 
-impl NodeStore for Cache {
+impl NodeStore for SqliteStore {
     fn get_node(&self, prefix: &Prefix) -> Option<Node> {
         self.get(prefix).map(|guard| guard.value().clone())
     }

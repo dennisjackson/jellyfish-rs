@@ -1,6 +1,6 @@
 use log::trace;
 
-use super::rocks_storage::RocksResult;
+use super::storage::rocks::RocksResult;
 use super::*;
 use std::{
     env, fs,

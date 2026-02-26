@@ -13,14 +13,11 @@ pub use batch::BatchMPT;
 mod durable_batch;
 pub use durable_batch::DurableBatchMPT;
 
-mod rocks_storage;
-pub use rocks_storage::RocksStorage;
+pub mod storage;
+pub use storage::{RocksStorage, SqliteStore};
 
 mod rocks_frontier;
 pub use rocks_frontier::RocksTransRelMPT;
-
-mod cache;
-pub use cache::Cache;
 
 mod batch_ops;
 
@@ -213,7 +210,7 @@ pub trait MerklePatriciaTree {
     fn new() -> Self;
     /// Construct an instance backed by a persistent path (e.g. RocksDB directory).
     /// Implementations should create the store if missing.
-    fn new_with_path<P: AsRef<std::path::Path>>(_path: P) -> rocks_storage::RocksResult<Self>
+    fn new_with_path<P: AsRef<std::path::Path>>(_path: P) -> storage::rocks::RocksResult<Self>
     where
         Self: Sized,
     {

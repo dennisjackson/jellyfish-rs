@@ -8,19 +8,19 @@ use crate::mpt::MerklePatriciaTree;
 use crate::{Hash, Prefix};
 
 use super::{
-    Cache, Node,
-    cache::{DEFAULT_CACHE_MEMORY_LIMIT_BYTES, ROOT_METADATA_KEY},
+    Node, SqliteStore,
+    storage::sqlite::{DEFAULT_CACHE_MEMORY_LIMIT_BYTES, ROOT_METADATA_KEY},
 };
 
 /// A durable batch-optimized Merkle Patricia Tree implementation backed by SQLite.
 /// This implementation performs batch upserts by:
-/// 1. Loading necessary nodes from SQLite into a Cache
+/// 1. Loading necessary nodes from SQLite into a SqliteStore
 /// 2. Performing the batch upsert in memory
 /// 3. Writing changed nodes back to SQLite
 ///
 /// The tree structure is persisted to disk, allowing for larger-than-memory trees.
 pub struct DurableBatchMPT {
-    cache: Cache,
+    cache: SqliteStore,
     db: Arc<Mutex<Connection>>,
     root: Prefix,
 }
@@ -92,10 +92,10 @@ impl DurableBatchMPT {
         }
 
         Self::configure_safety_pragmas(&conn, true)?;
-        Cache::initialize_database(&conn)?;
+        SqliteStore::initialize_database(&conn)?;
 
         let db = Arc::new(Mutex::new(conn));
-        let cache = Cache::new_with_limit(Arc::clone(&db), cache_memory_limit_bytes);
+        let cache = SqliteStore::new_with_limit(Arc::clone(&db), cache_memory_limit_bytes);
         let root = cache.get_root();
 
         Ok(Self { cache, db, root })

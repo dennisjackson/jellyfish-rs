@@ -9,7 +9,7 @@ use rocksdb::{
 
 use crate::{Hash, Prefix, prefix::HashExt};
 
-use super::Node;
+use crate::mpt::Node;
 
 pub const ROOT_KEY: &[u8] = b"__mpt_root__";
 pub const COMPLETE_DEPTH_KEY: &[u8] = b"__mpt_complete_depth__";

@@ -1,5 +1,5 @@
-use super::super::LeafNode;
 use super::*;
+use crate::mpt::LeafNode;
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 
@@ -7,13 +7,13 @@ fn create_test_db() -> Arc<Mutex<Connection>> {
     let conn = Connection::open_in_memory().unwrap();
 
     // Mirror production schema so cache logic exercises metadata handling too.
-    Cache::initialize_database(&conn).unwrap();
+    SqliteStore::initialize_database(&conn).unwrap();
 
     Arc::new(Mutex::new(conn))
 }
 
-fn create_test_cache(db: Arc<Mutex<Connection>>) -> Cache {
-    Cache::new_with_limit(db, 1024)
+fn create_test_cache(db: Arc<Mutex<Connection>>) -> SqliteStore {
+    SqliteStore::new_with_limit(db, 1024)
 }
 
 #[test]
@@ -221,7 +221,7 @@ fn test_enumerate_nodes() {
 
 #[test]
 fn test_pre_advise_efficiency() {
-    use super::super::InteriorNode;
+    use crate::InteriorNode;
 
     let db = create_test_db();
     let cache = create_test_cache(Arc::clone(&db));
@@ -358,7 +358,7 @@ fn test_pre_advise_efficiency() {
 
 #[test]
 fn test_pre_advise_large_tree_efficiency() {
-    use super::super::InteriorNode;
+    use crate::InteriorNode;
     use sha2::{Digest, Sha256};
 
     let db = create_test_db();
@@ -438,7 +438,7 @@ fn test_pre_advise_large_tree_efficiency() {
 
 #[test]
 fn test_pre_advise_loads_complete_paths_with_siblings() {
-    use super::super::InteriorNode;
+    use crate::InteriorNode;
 
     let db = create_test_db();
     let cache = create_test_cache(Arc::clone(&db));
@@ -549,7 +549,7 @@ fn test_pre_advise_loads_complete_paths_with_siblings() {
 
 #[test]
 fn test_pre_advise_shared_ancestors() {
-    use super::super::InteriorNode;
+    use crate::InteriorNode;
 
     let db = create_test_db();
     let cache = create_test_cache(Arc::clone(&db));
@@ -642,7 +642,7 @@ fn test_pre_advise_shared_ancestors() {
 
 #[test]
 fn test_pre_advise_with_nonexistent_keys() {
-    use super::super::InteriorNode;
+    use crate::InteriorNode;
 
     let db = create_test_db();
     let cache = create_test_cache(Arc::clone(&db));
@@ -695,7 +695,7 @@ fn test_pre_advise_with_nonexistent_keys() {
 
 #[test]
 fn test_pre_advise_keys_at_different_depths() {
-    use super::super::InteriorNode;
+    use crate::InteriorNode;
 
     let db = create_test_db();
     let cache = create_test_cache(Arc::clone(&db));
@@ -774,7 +774,7 @@ fn test_pre_advise_keys_at_different_depths() {
 
 #[test]
 fn test_pre_advise_loads_both_siblings() {
-    use super::super::InteriorNode;
+    use crate::InteriorNode;
 
     let db = create_test_db();
     let cache = create_test_cache(Arc::clone(&db));
@@ -878,7 +878,7 @@ fn test_pre_advise_loads_both_siblings() {
 
 #[test]
 fn test_pre_advise_sparse_keys_efficiency() {
-    use super::super::InteriorNode;
+    use crate::InteriorNode;
     use sha2::{Digest, Sha256};
 
     let db = create_test_db();
@@ -948,7 +948,7 @@ fn test_pre_advise_sparse_keys_efficiency() {
 
 #[test]
 fn test_pre_advise_with_partial_cache() {
-    use super::super::InteriorNode;
+    use crate::InteriorNode;
 
     let db = create_test_db();
     let cache = create_test_cache(Arc::clone(&db));
@@ -1018,7 +1018,7 @@ fn test_pre_advise_with_partial_cache() {
     cache.set(root_prefix, Node::Interior(root_interior.clone()));
     cache.flush().unwrap();
 
-    // Test scenario: Cache only some upper-level nodes, not the target leaves
+    // Test scenario: SqliteStore only some upper-level nodes, not the target leaves
     // This simulates a more realistic partial cache where some tree structure is known
     cache.clear();
     cache.set(root_prefix, Node::Interior(root_interior));
@@ -1059,7 +1059,7 @@ fn test_pre_advise_with_partial_cache() {
 
     let final_count = cache.len();
     println!(
-        "Cache size: initial={}, final={}",
+        "SqliteStore size: initial={}, final={}",
         initial_count, final_count
     );
 
@@ -1076,7 +1076,7 @@ fn test_pre_advise_with_partial_cache() {
 
 #[test]
 fn test_release_keys_retains_needed_keys() {
-    use super::super::LeafNode;
+    use crate::LeafNode;
 
     let db = create_test_db();
     let cache = create_test_cache(db);
@@ -1124,7 +1124,7 @@ fn test_release_keys_retains_needed_keys() {
 
 #[test]
 fn test_release_keys_prefers_deep_nodes_for_eviction() {
-    use super::super::{InteriorNode, LeafNode};
+    use crate::{InteriorNode, LeafNode};
 
     let db = create_test_db();
     let cache = create_test_cache(db);
@@ -1197,7 +1197,7 @@ fn test_release_keys_prefers_deep_nodes_for_eviction() {
 
 #[test]
 fn test_release_keys_with_root_node() {
-    use super::super::InteriorNode;
+    use crate::InteriorNode;
 
     let db = create_test_db();
     let cache = create_test_cache(db);
@@ -1293,7 +1293,7 @@ fn test_pre_advise_transaction_management() {
 
 #[test]
 fn test_pre_advise_loads_all_ancestors() {
-    use super::super::InteriorNode;
+    use crate::InteriorNode;
 
     let db = create_test_db();
     let cache = create_test_cache(Arc::clone(&db));

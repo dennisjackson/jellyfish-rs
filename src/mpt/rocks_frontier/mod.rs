@@ -10,7 +10,7 @@ use crate::mpt::MerklePatriciaTree;
 use crate::prefix::HashExt;
 use crate::{Hash, Prefix};
 
-use super::rocks_storage::{RocksResult, RocksStorage};
+use super::storage::rocks::{RocksResult, RocksStorage};
 use super::{InteriorNode, LeafNode, Node};
 
 
@@ -479,7 +479,7 @@ impl RocksTransRelMPT {
         &self,
         current_prefix: Prefix,
         entries: &[(Hash, Hash)],
-        mut active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
+        mut active_batch: Option<&mut super::storage::rocks::RocksWriteBatch>,
         boundary_started: &mut bool,
     ) -> Prefix {
         if entries.is_empty() {
@@ -534,7 +534,7 @@ impl RocksTransRelMPT {
     fn batch_insert_into_empty(
         &self,
         entries: &[(Hash, Hash)],
-        mut active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
+        mut active_batch: Option<&mut super::storage::rocks::RocksWriteBatch>,
         _boundary_started: &mut bool,
     ) -> Prefix {
         if entries.is_empty() {
@@ -562,7 +562,7 @@ impl RocksTransRelMPT {
         leaf_prefix: Prefix,
         leaf: LeafNode,
         entries: &[(Hash, Hash)],
-        mut active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
+        mut active_batch: Option<&mut super::storage::rocks::RocksWriteBatch>,
         boundary_started: &mut bool,
     ) -> Prefix {
         if let Ok(idx) = entries.binary_search_by_key(&leaf_prefix.hash, |(k, _)| *k) {
@@ -715,7 +715,7 @@ impl RocksTransRelMPT {
         interior_prefix: Prefix,
         interior: InteriorNode,
         entries: &[(Hash, Hash)],
-        mut active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
+        mut active_batch: Option<&mut super::storage::rocks::RocksWriteBatch>,
         boundary_started: &mut bool,
     ) -> Prefix {
         let len = entries.len();
@@ -1010,7 +1010,7 @@ impl RocksTransRelMPT {
         interior_prefix: Prefix,
         interior: InteriorNode,
         entries: &[(Hash, Hash)],
-        active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
+        active_batch: Option<&mut super::storage::rocks::RocksWriteBatch>,
         boundary_started: &mut bool,
         first_idx: usize,
     ) -> Prefix {
@@ -1046,7 +1046,7 @@ impl RocksTransRelMPT {
         interior_prefix: Prefix,
         interior: InteriorNode,
         entries: &[(Hash, Hash)],
-        mut active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
+        mut active_batch: Option<&mut super::storage::rocks::RocksWriteBatch>,
         boundary_started: &mut bool,
         first_idx: usize,
     ) -> Prefix {
@@ -1110,7 +1110,7 @@ impl RocksTransRelMPT {
         &self,
         child_prefix: Prefix,
         entries: &[(Hash, Hash)],
-        active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
+        active_batch: Option<&mut super::storage::rocks::RocksWriteBatch>,
         boundary_started: &mut bool,
     ) -> Prefix {
         if !entries.is_empty() {
@@ -1327,7 +1327,7 @@ impl RocksTransRelMPT {
     fn persist_interior_nodes_at_depth_in_tx(
         &self,
         depth: u16,
-        tx: &super::rocks_storage::RocksTransaction,
+        tx: &super::storage::rocks::RocksTransaction,
     ) -> RocksResult<()> {
         if depth >= 20 {
             // Too deep, too many nodes to handle
@@ -1358,7 +1358,7 @@ impl RocksTransRelMPT {
     /// Update the tracked complete interior depth by scanning upward from the current depth.
     /// This is called after a batch upsert to check if new levels have become complete.
     /// The updated depth is persisted to the database in the provided transaction.
-    fn update_complete_interior_depth(&self, tx: &super::rocks_storage::RocksTransaction) {
+    fn update_complete_interior_depth(&self, tx: &super::storage::rocks::RocksTransaction) {
         let mut current_depth = self.complete_interior_depth.load(Ordering::Relaxed);
 
         // Keep checking successive depths until we find one that's incomplete
@@ -1464,7 +1464,7 @@ impl MerklePatriciaTree for RocksTransRelMPT {
         Self::new_temporary().expect("Failed to create temporary RocksDB database")
     }
 
-    fn new_with_path<P: AsRef<Path>>(path: P) -> super::rocks_storage::RocksResult<Self>
+    fn new_with_path<P: AsRef<Path>>(path: P) -> super::storage::rocks::RocksResult<Self>
     where
         Self: Sized,
     {
