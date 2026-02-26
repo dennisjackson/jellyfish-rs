@@ -1,4 +1,5 @@
     use super::*;
+    use crate::mpt::DurableBatchMPT;
     use crate::Hash;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -350,4 +351,152 @@
             lower_bound,
             upper_bound
         );
+    }
+
+    /// Exercises release_subtree on a populated tree across multiple batch_upsert calls.
+    /// This is the scenario that triggered the DashMap deadlock (fixed in 4157dc4).
+    #[test]
+    fn test_incremental_batch_inserts() {
+        let mut tree = RocksTransRelMPT::new_temporary().expect("create tree");
+
+        for batch_num in 0..10 {
+            let entries: Vec<_> = (0..1000u32)
+                .map(|_| (make_random_hash(), make_random_hash()))
+                .collect();
+            tree.batch_upsert(&entries);
+
+            assert!(
+                tree.get_root_hash().is_some(),
+                "Root hash should exist after batch {}",
+                batch_num
+            );
+        }
+
+        tree.check_frontier_invariant();
+    }
+
+    /// Covers the exact benchmark scenario: open existing DB, recovery, insert more.
+    #[test]
+    fn test_reopen_and_insert() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("test.db");
+
+        // Phase 1: create and populate
+        {
+            let mut tree = RocksTransRelMPT::new_with_path(&path).expect("create tree");
+            let entries: Vec<_> = (0..5000u32)
+                .map(|_| (make_random_hash(), make_random_hash()))
+                .collect();
+            tree.batch_upsert(&entries);
+            assert!(tree.get_root_hash().is_some());
+        }
+        // tree is dropped, DB is closed
+
+        // Phase 2: reopen (triggers recovery) and insert more
+        {
+            let mut tree = RocksTransRelMPT::new_with_path(&path).expect("reopen tree");
+            assert!(
+                tree.get_root_hash().is_some(),
+                "Root hash should exist after reopen"
+            );
+
+            for _ in 0..5 {
+                let entries: Vec<_> = (0..1000u32)
+                    .map(|_| (make_random_hash(), make_random_hash()))
+                    .collect();
+                tree.batch_upsert(&entries);
+            }
+
+            assert!(tree.get_root_hash().is_some());
+        }
+    }
+
+    /// Validates that recovery correctly restores data.
+    #[test]
+    fn test_reopen_preserves_data() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("test.db");
+
+        let entries: Vec<_> = (0..1000u32)
+            .map(|_| (make_random_hash(), make_random_hash()))
+            .collect();
+
+        let root_hash;
+        let sample_keys: Vec<Hash> = entries.iter().take(10).map(|(k, _)| *k).collect();
+        let sample_values: Vec<Hash> = entries.iter().take(10).map(|(_, v)| *v).collect();
+
+        // Phase 1: create and populate
+        {
+            let mut tree = RocksTransRelMPT::new_with_path(&path).expect("create tree");
+            tree.batch_upsert(&entries);
+            root_hash = tree.get_root_hash().expect("root hash should exist");
+        }
+
+        // Phase 2: reopen and verify
+        {
+            let tree = RocksTransRelMPT::new_with_path(&path).expect("reopen tree");
+            assert_eq!(
+                tree.get_root_hash().expect("root hash after reopen"),
+                root_hash,
+                "Root hash must match after reopen"
+            );
+
+            for (key, expected_value) in sample_keys.iter().zip(sample_values.iter()) {
+                let actual = tree.get_leaf_value(*key);
+                assert_eq!(
+                    actual,
+                    Some(*expected_value),
+                    "Leaf value for key {:?} must match after reopen",
+                    &key[..4]
+                );
+            }
+        }
+    }
+
+    /// Uses the SQLite DurableBatchMPT as a reference oracle to verify RocksDB root hashes.
+    #[test]
+    fn test_root_hash_matches_sqlite_single_batch() {
+        let entries: Vec<_> = (0..5000u32)
+            .map(|_| (make_random_hash(), make_random_hash()))
+            .collect();
+
+        let mut rocks_tree = RocksTransRelMPT::new_temporary().expect("create rocks tree");
+        let mut sqlite_tree = DurableBatchMPT::new();
+
+        rocks_tree.batch_upsert(&entries);
+        sqlite_tree.batch_upsert(&entries);
+
+        let rocks_hash = rocks_tree.get_root_hash().expect("rocks root hash");
+        let sqlite_hash = sqlite_tree.get_root_hash().expect("sqlite root hash");
+
+        assert_eq!(
+            rocks_hash, sqlite_hash,
+            "RocksDB and SQLite root hashes must match after single batch"
+        );
+    }
+
+    /// Strongest test: validates correctness with incremental inserts AND exercises
+    /// the code path that triggered the DashMap deadlock, cross-checked against SQLite.
+    #[test]
+    fn test_root_hash_matches_sqlite_incremental() {
+        let mut rocks_tree = RocksTransRelMPT::new_temporary().expect("create rocks tree");
+        let mut sqlite_tree = DurableBatchMPT::new();
+
+        for batch_num in 0..10 {
+            let entries: Vec<_> = (0..1000u32)
+                .map(|_| (make_random_hash(), make_random_hash()))
+                .collect();
+
+            rocks_tree.batch_upsert(&entries);
+            sqlite_tree.batch_upsert(&entries);
+
+            let rocks_hash = rocks_tree.get_root_hash().expect("rocks root hash");
+            let sqlite_hash = sqlite_tree.get_root_hash().expect("sqlite root hash");
+
+            assert_eq!(
+                rocks_hash, sqlite_hash,
+                "RocksDB and SQLite root hashes must match after batch {}",
+                batch_num
+            );
+        }
     }
