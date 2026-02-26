@@ -25,12 +25,15 @@ def build_bench(project_root):
     print("Build complete.")
 
 
-def run_bench(project_root, backend, timeout, log_path):
+def run_bench(project_root, backend, timeout, log_path, extra_args=None):
     """Run the bench binary for a single backend."""
     bench_bin = os.path.join(project_root, "target", "release", "bench")
     cmd = [bench_bin, "-b", backend, "-t", str(timeout), "-l", log_path]
+    if extra_args:
+        cmd.extend(extra_args)
 
-    print(f"  Running {backend} backend for {timeout}s...")
+    label = " ".join(extra_args) if extra_args else backend
+    print(f"  Running {backend} ({label}) for {timeout}s...")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"  Bench failed for {backend}:", file=sys.stderr)
@@ -64,8 +67,29 @@ def parse_log(log_path):
     return elapsed, counts
 
 
+def compute_speed(elapsed, counts, window=10):
+    """Compute smoothed insertion speed (records/s) at each record count.
+
+    Uses a sliding window over consecutive samples to reduce noise.
+    Returns (record_counts, speeds) lists.
+    """
+    if len(elapsed) < 2:
+        return [], []
+
+    record_counts = []
+    speeds = []
+    for i in range(window, len(elapsed)):
+        dt = elapsed[i] - elapsed[i - window]
+        dn = counts[i] - counts[i - window]
+        if dt > 0:
+            record_counts.append(counts[i])
+            speeds.append(dn / dt)
+
+    return record_counts, speeds
+
+
 def plot_results(results, output_path):
-    """Plot insertion counts over time for each backend."""
+    """Plot insertion counts over time and speed vs record count."""
     try:
         import matplotlib.pyplot as plt
     except ImportError:
@@ -75,17 +99,29 @@ def plot_results(results, output_path):
         )
         sys.exit(1)
 
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
 
     for backend, (elapsed, counts) in results.items():
         if elapsed:
-            ax.plot(elapsed, counts, label=backend, linewidth=2)
+            ax1.plot(elapsed, counts, label=backend, linewidth=2)
 
-    ax.set_xlabel("Elapsed time (s)")
-    ax.set_ylabel("Total records inserted")
-    ax.set_title("Jellyfish MPT — Insertion Performance by Backend")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax1.set_xlabel("Elapsed time (s)")
+    ax1.set_ylabel("Total records inserted")
+    ax1.set_title("Jellyfish MPT — Insertion Performance by Backend")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    for backend, (elapsed, counts) in results.items():
+        if elapsed:
+            rc, speeds = compute_speed(elapsed, counts)
+            if rc:
+                ax2.plot(rc, speeds, label=backend, linewidth=2)
+
+    ax2.set_xlabel("Total records in tree")
+    ax2.set_ylabel("Insertion speed (records/s)")
+    ax2.set_title("Jellyfish MPT — Insertion Speed vs Tree Size")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
 
@@ -96,20 +132,84 @@ def plot_results(results, output_path):
         plt.show()
 
 
+SWEEP_BATCH_SIZES = [1, 100, 1_000, 10_000, 100_000]
+SWEEP_WINDOW_SIZE = 100_000
+
+
+def run_sweep(project_root, timeout, tmpdir):
+    """Run rocks backend with varying batch sizes, return {label: (elapsed, counts)}."""
+    results = {}
+    for bs in SWEEP_BATCH_SIZES:
+        label = f"batch_size={bs:,}"
+        log_path = os.path.join(tmpdir, f"sweep_bs{bs}.csv")
+        extra = ["-w", str(SWEEP_WINDOW_SIZE), "-c", str(bs)]
+        ok = run_bench(project_root, "rocks", timeout, log_path, extra_args=extra)
+        if ok and os.path.exists(log_path):
+            results[label] = parse_log(log_path)
+        else:
+            results[label] = ([], [])
+    return results
+
+
+def plot_sweep(sweep_results, output_path):
+    """Plot insertion speed vs tree size for each batch size."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print(
+            "matplotlib is required for plotting. Install it with: pip install matplotlib",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
+
+    for label, (elapsed, counts) in sweep_results.items():
+        if elapsed:
+            ax1.plot(elapsed, counts, label=label, linewidth=2)
+
+    ax1.set_xlabel("Elapsed time (s)")
+    ax1.set_ylabel("Total records inserted")
+    ax1.set_title(f"RocksDB — Insertion by Batch Size (window={SWEEP_WINDOW_SIZE:,})")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    for label, (elapsed, counts) in sweep_results.items():
+        if elapsed:
+            window = max(1, min(10, len(elapsed) // 20))
+            rc, speeds = compute_speed(elapsed, counts, window=window)
+            if rc:
+                ax2.plot(rc, speeds, label=label, linewidth=2)
+
+    ax2.set_xlabel("Total records in tree")
+    ax2.set_ylabel("Insertion speed (records/s)")
+    ax2.set_title(f"RocksDB — Insertion Speed vs Tree Size by Batch Size")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+
+    if output_path:
+        fig.savefig(output_path, dpi=150)
+        print(f"Sweep chart saved to {output_path}")
+    else:
+        plt.show()
+
+
 def print_summary(results):
     """Print a summary table of results."""
-    print("\n{:<10} {:>15} {:>15}".format("Backend", "Total Inserted", "Throughput"))
-    print("-" * 42)
+    label_width = max(10, max((len(k) for k in results), default=10))
+    header = f"{'Backend':<{label_width}} {'Total Inserted':>15} {'Throughput':>15}"
+    print(f"\n{header}")
+    print("-" * len(header))
     for backend, (elapsed, counts) in results.items():
         if elapsed and counts:
             total = counts[-1]
             duration = elapsed[-1]
             throughput = total / duration if duration > 0 else 0
-            print(
-                "{:<10} {:>15,} {:>12,.0f}/s".format(backend, total, throughput)
-            )
+            print(f"{backend:<{label_width}} {total:>15,} {throughput:>12,.0f}/s")
         else:
-            print("{:<10} {:>15}".format(backend, "(no data)"))
+            print(f"{backend:<{label_width}} {'(no data)':>15}")
 
 
 def main():
@@ -132,6 +232,11 @@ def main():
         default=None,
         help="Output PNG path (default: show interactively)",
     )
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="Also run a batch-size sweep for the rocks backend",
+    )
     args = parser.parse_args()
 
     backends = [b.strip() for b in args.backends.split(",")]
@@ -149,12 +254,24 @@ def main():
             else:
                 results[backend] = ([], [])
 
-    print_summary(results)
+        print_summary(results)
 
-    if any(elapsed for elapsed, _ in results.values()):
-        plot_results(results, args.output)
-    else:
-        print("No data to plot.", file=sys.stderr)
+        if any(elapsed for elapsed, _ in results.values()):
+            plot_results(results, args.output)
+        else:
+            print("No data to plot.", file=sys.stderr)
+
+        if args.sweep:
+            print("\n--- Batch-size sweep (rocks) ---")
+            sweep_results = run_sweep(project_root, args.timeout, tmpdir)
+            print_summary(sweep_results)
+            if any(elapsed for elapsed, _ in sweep_results.values()):
+                if args.output:
+                    stem, ext = os.path.splitext(args.output)
+                    sweep_output = f"{stem}_sweep{ext}"
+                else:
+                    sweep_output = None
+                plot_sweep(sweep_results, sweep_output)
 
 
 if __name__ == "__main__":
