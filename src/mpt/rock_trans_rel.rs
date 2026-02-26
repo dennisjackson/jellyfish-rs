@@ -1,4 +1,3 @@
-use bincode::config;
 use dashmap::{DashMap, DashSet};
 use log::{debug, info, warn};
 use rayon::{join, prelude::*};
@@ -14,7 +13,6 @@ use crate::{Hash, Prefix};
 use super::rocks_storage::{RocksResult, RocksStorage};
 use super::{InteriorNode, LeafNode, Node};
 
-type DirtyPrefixes = DashSet<Prefix>;
 
 #[derive(Default)]
 struct ParentChildren {
@@ -85,7 +83,6 @@ pub struct RocksTransRelMPT {
     storage: RocksStorage,
     store: DashMap<Prefix, Node>,
     root: Prefix,
-    dirty_prefixes: DirtyPrefixes,
     loaded_subtrees: DashSet<Prefix>,
     full_tree_loaded: AtomicBool,
     _temp_dir: Option<TempDir>,
@@ -397,12 +394,10 @@ impl RocksTransRelMPT {
         };
 
         let approx_entries = storage.approximate_entry_count();
-        let estimated_entries = approx_entries.max(1);
         let mut instance = Self {
             storage,
             store: DashMap::with_capacity(2_usize.pow(complete_depth as u32 + 4)),
             root,
-            dirty_prefixes: DashSet::new(),
             loaded_subtrees: DashSet::new(),
             full_tree_loaded: AtomicBool::new(false),
             _temp_dir: temp_dir,
@@ -1043,7 +1038,7 @@ impl RocksTransRelMPT {
         interior_prefix: Prefix,
         interior: InteriorNode,
         entries: &[(Hash, Hash)],
-        mut active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
+        active_batch: Option<&mut super::rocks_storage::RocksWriteBatch>,
         boundary_started: &mut bool,
         first_idx: usize,
     ) -> Prefix {

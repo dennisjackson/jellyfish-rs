@@ -24,14 +24,6 @@ macro_rules! test_all_impls {
             test_impl::<SimpleMPT>();
             test_impl::<BatchMPT>();
             test_impl::<DurableBatchMPT>();
-            test_impl::<SledBatchMPT>();
-            test_impl::<SledLeafMPT>();
-            test_impl::<SledAllMPT>();
-            test_impl::<SledTransMPT>();
-            test_impl::<SledChanMPT>();
-            test_impl::<RockLeafMPT>();
-            test_impl::<RockSparseMPT>();
-            test_impl::<RocksParTransMPT>();
             test_impl::<RocksTransRelMPT>();
         }
     };
@@ -42,14 +34,6 @@ macro_rules! for_each_impl {
         $macro!(SimpleMPT);
         $macro!(BatchMPT);
         $macro!(DurableBatchMPT);
-        $macro!(SledBatchMPT);
-        $macro!(SledLeafMPT);
-        $macro!(SledAllMPT);
-        $macro!(SledTransMPT);
-        $macro!(SledChanMPT);
-        $macro!(RockLeafMPT);
-        $macro!(RockSparseMPT);
-        $macro!(RocksParTransMPT);
         $macro!(RocksTransRelMPT);
     };
 }
@@ -101,54 +85,6 @@ fn verify_interior_node_structure<T: MerklePatriciaTree>(mpt: &T) -> bool {
         }
     }
     true
-}
-
-fn run_sled_persistence_test<T, F>(
-    label: &str,
-    path: &Path,
-    initial_entries: &[(Hash, Hash)],
-    additional_entries: &[(Hash, Hash)],
-    further_entries: &[(Hash, Hash)],
-    mut constructor: F,
-) -> (Hash, usize, Hash, usize, Hash, usize)
-where
-    T: MerklePatriciaTree,
-    F: FnMut(&Path) -> sled::Result<T>,
-{
-    let (root1, leaf_count1) = {
-        let mut tree =
-            constructor(path).unwrap_or_else(|e| panic!("{label} initial open failed: {e}"));
-        tree.batch_upsert(initial_entries);
-        let root = tree
-            .get_root_hash()
-            .unwrap_or_else(|| panic!("{label} root after batch 1 was None"));
-        let leaf_count = count_leaf_nodes(&tree);
-        (root, leaf_count)
-    };
-
-    let (root2, leaf_count2) = {
-        let mut tree = constructor(path).unwrap_or_else(|e| panic!("{label} reopen failed: {e}"));
-        tree.batch_upsert(additional_entries);
-        let root = tree
-            .get_root_hash()
-            .unwrap_or_else(|| panic!("{label} root after batch 2 was None"));
-        let leaf_count = count_leaf_nodes(&tree);
-        (root, leaf_count)
-    };
-
-    let (root3, leaf_count3) = {
-        let mut tree =
-            constructor(path).unwrap_or_else(|e| panic!("{label} third open failed: {e}"));
-        tree.batch_upsert(further_entries);
-        let root = tree
-            .get_root_hash()
-            .unwrap_or_else(|| panic!("{label} root after batch 3 was None"));
-        let leaf_count = count_leaf_nodes(&tree);
-        drop(tree);
-        (root, leaf_count)
-    };
-
-    (root1, leaf_count1, root2, leaf_count2, root3, leaf_count3)
 }
 
 fn run_sqlite_persistence_test<T, F>(
@@ -848,31 +784,6 @@ fn test_persistent_reopen_consistency() {
         }};
     }
 
-    // Macro to reduce repetition for Sled-based persistent implementations
-    macro_rules! test_sled_impl {
-        ($impl_type:ty, $name:expr, $subdir:expr) => {{
-            let dir = base_dir.join($subdir);
-            let (root1, leaf_count1, root2, leaf_count2, root3, leaf_count3) =
-                run_sled_persistence_test::<$impl_type, _>(
-                    $name,
-                    &dir,
-                    &initial_entries,
-                    &additional_entries,
-                    &further_entries,
-                    |p| <$impl_type>::new_with_path(p),
-                );
-            results.push((
-                $name,
-                root1,
-                leaf_count1,
-                root2,
-                leaf_count2,
-                root3,
-                leaf_count3,
-            ));
-        }};
-    }
-
     // Macro to reduce repetition for RocksDB-based persistent implementations
     macro_rules! test_rocks_impl {
         ($impl_type:ty, $name:expr, $subdir:expr) => {{
@@ -900,14 +811,6 @@ fn test_persistent_reopen_consistency() {
 
     // Test all implementations
     test_sqlite_impl!(DurableBatchMPT, "DurableBatchMPT", "durable.db");
-    test_sled_impl!(SledBatchMPT, "SledBatchMPT", "sled_batch");
-    test_sled_impl!(SledLeafMPT, "SledLeafMPT", "sled_leaf");
-    test_sled_impl!(SledAllMPT, "SledAllMPT", "sled_all");
-    test_sled_impl!(SledTransMPT, "SledTransMPT", "sled_trans");
-    test_sled_impl!(SledChanMPT, "SledChanMPT", "sled_chan");
-    test_rocks_impl!(RockLeafMPT, "RockLeafMPT", "rock_leaf");
-    test_rocks_impl!(RockSparseMPT, "RockSparseMPT", "rock_sparse");
-    test_rocks_impl!(RocksParTransMPT, "RocksParTransMPT", "rocks_par_trans");
     test_rocks_impl!(RocksTransRelMPT, "RocksTransRelMPT", "rocks_tran_rel");
 
     // Use the first implementation as reference
@@ -1017,27 +920,6 @@ fn test_persistent_reopen_small() {
         }};
     }
 
-    macro_rules! test_sled_impl_small {
-        ($impl_type:ty, $name:expr, $subdir:expr) => {{
-            let dir = base_dir.join($subdir);
-            let mut tree = <$impl_type>::new_with_path(&dir).expect("initial open failed");
-            tree.batch_upsert(&entries);
-            let root1 = tree.get_root_hash().expect("root1 none");
-            let count1 = count_leaf_nodes(&tree);
-            drop(tree);
-            let mut tree = <$impl_type>::new_with_path(&dir).expect("reopen failed");
-            let root2 = tree.get_root_hash().expect("root2 none");
-            let count2 = count_leaf_nodes(&tree);
-            let second_entries: Vec<(Hash, Hash)> = (6u8..=10u8)
-                .map(|b| (create_hash(b), create_hash(100 + b)))
-                .collect();
-            tree.batch_upsert(&second_entries);
-            let root3 = tree.get_root_hash().expect("root3 none");
-            let count3 = count_leaf_nodes(&tree);
-            results.push(($name, root1, count1, root2, count2, root3, count3));
-        }};
-    }
-
     macro_rules! test_rocks_impl_small {
         ($impl_type:ty, $name:expr, $subdir:expr) => {{
             let dir = base_dir.join($subdir);
@@ -1061,18 +943,6 @@ fn test_persistent_reopen_small() {
 
     // Run small reopen across all implementations
     test_sqlite_impl_small!(DurableBatchMPT, "DurableBatchMPT", "durable_small.db");
-    test_sled_impl_small!(SledBatchMPT, "SledBatchMPT", "sled_batch_small");
-    test_sled_impl_small!(SledLeafMPT, "SledLeafMPT", "sled_leaf_small");
-    test_sled_impl_small!(SledAllMPT, "SledAllMPT", "sled_all_small");
-    test_sled_impl_small!(SledTransMPT, "SledTransMPT", "sled_trans_small");
-    test_sled_impl_small!(SledChanMPT, "SledChanMPT", "sled_chan_small");
-    test_rocks_impl_small!(RockLeafMPT, "RockLeafMPT", "rock_leaf_small");
-    test_rocks_impl_small!(RockSparseMPT, "RockSparseMPT", "rock_sparse_small");
-    test_rocks_impl_small!(
-        RocksParTransMPT,
-        "RocksParTransMPT",
-        "rocks_par_trans_small"
-    );
     test_rocks_impl_small!(RocksTransRelMPT, "RocksTransRelMPT", "rocks_tran_rel_small");
 
     // Reference = first implementation
@@ -1139,7 +1009,7 @@ fn test_rocks_impl_randomized_reopen_batches() {
 
     let batches: Vec<Vec<(Hash, Hash)>> = (0..BATCH_COUNT)
         .map(|_| {
-            let batch_len = rng.gen_range(1..=MAX_BATCH_SIZE);
+            let batch_len = rng.random_range(1..=MAX_BATCH_SIZE);
             (0..batch_len)
                 .map(|_| (make_random_hash(&mut rng), make_random_hash(&mut rng)))
                 .collect()
@@ -1186,7 +1056,7 @@ fn test_rocks_impl_randomized_reopen_batches() {
                 drop(tree);
             }
 
-            let mut final_tree = <$impl_type>::new_with_path(&dir).unwrap_or_else(|e| {
+            let final_tree = <$impl_type>::new_with_path(&dir).unwrap_or_else(|e| {
                 panic!("{name} final reopen failed: {e}", name = $name)
             });
             let disk_root = final_tree.get_root_hash().unwrap_or_else(|| {
@@ -1202,13 +1072,6 @@ fn test_rocks_impl_randomized_reopen_batches() {
         }};
     }
 
-    test_randomized_rocks_impl!(RockLeafMPT, "RockLeafMPT", "rock_leaf_randomized");
-    test_randomized_rocks_impl!(RockSparseMPT, "RockSparseMPT", "rock_sparse_randomized");
-    test_randomized_rocks_impl!(
-        RocksParTransMPT,
-        "RocksParTransMPT",
-        "rocks_par_trans_randomized"
-    );
     test_randomized_rocks_impl!(
         RocksTransRelMPT,
         "RocksTransRelMPT",

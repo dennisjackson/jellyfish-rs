@@ -10,10 +10,59 @@ use rocksdb::{
 use crate::{Hash, Prefix, prefix::HashExt};
 
 use super::Node;
-use super::sled_storage::{
-    COMPLETE_DEPTH_KEY, ROOT_KEY, decode_node, decode_prefix, encode_node, encode_prefix,
-    prefix_key,
-};
+
+pub const ROOT_KEY: &[u8] = b"__mpt_root__";
+pub const COMPLETE_DEPTH_KEY: &[u8] = b"__mpt_complete_depth__";
+
+pub fn prefix_key(prefix: &Prefix) -> Vec<u8> {
+    let mut key = Vec::with_capacity(34);
+    key.extend_from_slice(&prefix.length.to_be_bytes());
+    key.extend_from_slice(&prefix.hash);
+    key
+}
+
+pub fn encode_prefix(prefix: Prefix) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(34);
+    buffer.extend_from_slice(&prefix.length.to_be_bytes());
+    buffer.extend_from_slice(&prefix.hash);
+    buffer
+}
+
+pub fn decode_prefix(bytes: &[u8]) -> Result<Prefix, String> {
+    if bytes.len() != 34 {
+        return Err(format!("Prefix bytes must be 34 long, got {}", bytes.len()));
+    }
+    let length = u16::from_be_bytes([bytes[0], bytes[1]]);
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&bytes[2..34]);
+    Ok(Prefix { hash, length })
+}
+
+pub fn encode_node(node: &Node) -> Vec<u8> {
+    let (node_type, data) = node.serialize().expect("Failed to serialize node");
+    let mut encoded = Vec::with_capacity(1 + data.len());
+    let discriminator = match node_type {
+        "leaf" => 0u8,
+        "interior" => 1u8,
+        _ => panic!("Unexpected node type {}", node_type),
+    };
+    encoded.push(discriminator);
+    encoded.extend_from_slice(&data);
+    encoded
+}
+
+pub fn decode_node(bytes: &[u8]) -> Result<Node, String> {
+    if bytes.is_empty() {
+        return Err("Node bytes are empty".into());
+    }
+    let (tag, data) = bytes.split_first().unwrap();
+    let node_type = match tag {
+        0 => "leaf",
+        1 => "interior",
+        other => return Err(format!("Unknown node tag {}", other)),
+    };
+    Node::deserialize(node_type, data)
+}
 
 pub type RocksResult<T> = Result<T, RocksStorageError>;
 
@@ -66,7 +115,8 @@ impl From<io::Error> for RocksStorageError {
 
 pub struct RocksStorage {
     db: OptimisticTransactionDB,
-    cache: Cache,
+    /// Kept alive so the LRU cache set via `set_row_cache` isn't dropped.
+    _cache: Cache,
 }
 
 impl RocksStorage {
@@ -82,7 +132,7 @@ impl RocksStorage {
         options.set_inplace_update_support(false);
         options.set_manual_wal_flush(true);
         let db = OptimisticTransactionDB::open(&options, path)?;
-        Ok(Self { db, cache })
+        Ok(Self { db, _cache: cache })
     }
 
     pub fn start_transaction(&self) -> RocksTransaction<'_> {

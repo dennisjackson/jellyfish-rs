@@ -13,34 +13,8 @@ pub use batch::BatchMPT;
 mod durable_batch;
 pub use durable_batch::DurableBatchMPT;
 
-mod sled_leaf;
-pub use sled_leaf::SledLeafMPT;
-
-mod sled_batch;
-pub use sled_batch::SledBatchMPT;
-
-mod sled_storage;
-
 mod rocks_storage;
 pub use rocks_storage::RocksStorage;
-
-mod sled_all;
-pub use sled_all::SledAllMPT;
-
-mod sled_trans;
-pub use sled_trans::SledTransMPT;
-
-mod sled_chan;
-pub use sled_chan::SledChanMPT;
-
-mod rock_leaf;
-pub use rock_leaf::RockLeafMPT;
-
-mod rock_sparse;
-pub use rock_sparse::RockSparseMPT;
-
-mod rock_par_trans;
-pub use rock_par_trans::RocksParTransMPT;
 
 mod rock_trans_rel;
 pub use rock_trans_rel::RocksTransRelMPT;
