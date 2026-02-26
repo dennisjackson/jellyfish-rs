@@ -237,7 +237,36 @@ def main():
         action="store_true",
         help="Also run a batch-size sweep for the rocks backend",
     )
+    parser.add_argument(
+        "--input",
+        nargs="+",
+        metavar="LABEL=PATH",
+        help="Plot existing CSV log files instead of running benchmarks. "
+        "Each argument is LABEL=PATH (e.g. rocks=run1.csv sqlite=run2.csv). "
+        "A bare path without LABEL= uses the filename stem as the label.",
+    )
     args = parser.parse_args()
+
+    if args.input:
+        results = {}
+        for spec in args.input:
+            if "=" in spec:
+                label, path = spec.split("=", 1)
+            else:
+                label = os.path.splitext(os.path.basename(spec))[0]
+                path = spec
+            if not os.path.exists(path):
+                print(f"File not found: {path}", file=sys.stderr)
+                sys.exit(1)
+            results[label] = parse_log(path)
+
+        print_summary(results)
+
+        if any(elapsed for elapsed, _ in results.values()):
+            plot_results(results, args.output)
+        else:
+            print("No data to plot.", file=sys.stderr)
+        return
 
     backends = [b.strip() for b in args.backends.split(",")]
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
