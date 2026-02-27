@@ -90,9 +90,13 @@ def parse_log_dir(dir_path, cutoff=0):
     for fpath in files:
         with open(fpath) as f:
             reader = csv.DictReader(f)
-            for row in reader:
-                all_timestamps.append(float(row["timestamp"]))
-                all_counts.append(cumulative + int(row["total_inserted"]))
+            for line_num, row in enumerate(reader, start=2):
+                try:
+                    all_timestamps.append(float(row["timestamp"]))
+                    all_counts.append(cumulative + int(row["total_inserted"]))
+                except (TypeError, ValueError) as e:
+                    print(f"Bad row in {fpath}:{line_num}: {e} (row={row})", file=sys.stderr)
+                    raise
         if all_counts:
             cumulative = all_counts[-1]
 
@@ -117,10 +121,11 @@ def parse_log_dir(dir_path, cutoff=0):
     return elapsed, all_counts
 
 
-def compute_speed(elapsed, counts, window=10):
+def compute_speed(elapsed, counts, window=10, window_secs=None):
     """Compute smoothed insertion speed (records/s) at each sample point.
 
-    Uses a sliding window over consecutive samples to reduce noise.
+    If *window_secs* is given, uses a time-based sliding window (in seconds)
+    instead of the fixed sample-count *window*.
     Returns (elapsed_times, record_counts, speeds) lists.
     """
     if len(elapsed) < 2:
@@ -129,13 +134,30 @@ def compute_speed(elapsed, counts, window=10):
     times = []
     record_counts = []
     speeds = []
-    for i in range(window, len(elapsed)):
-        dt = elapsed[i] - elapsed[i - window]
-        dn = counts[i] - counts[i - window]
-        if dt > 0:
-            times.append(elapsed[i])
-            record_counts.append(counts[i])
-            speeds.append(dn / dt)
+
+    if window_secs is not None:
+        # Time-based sliding window
+        left = 0
+        for i in range(1, len(elapsed)):
+            while elapsed[i] - elapsed[left] > window_secs:
+                left += 1
+            if left == i:
+                continue
+            dt = elapsed[i] - elapsed[left]
+            dn = counts[i] - counts[left]
+            if dt > 0:
+                times.append(elapsed[i])
+                record_counts.append(counts[i])
+                speeds.append(dn / dt)
+    else:
+        # Fixed sample-count window (original behaviour)
+        for i in range(window, len(elapsed)):
+            dt = elapsed[i] - elapsed[i - window]
+            dn = counts[i] - counts[i - window]
+            if dt > 0:
+                times.append(elapsed[i])
+                record_counts.append(counts[i])
+                speeds.append(dn / dt)
 
     return times, record_counts, speeds
 
@@ -191,13 +213,13 @@ def plot_results(results, output_path):
 
     for backend, (elapsed, counts) in results.items():
         if elapsed:
-            times, rc, speeds = compute_speed(elapsed, counts)
+            times, rc, speeds = compute_speed(elapsed, counts, window_secs=60)
             if times:
                 ax2.plot(times, speeds, label=backend, linewidth=2)
 
     ax2.set_xlabel("Elapsed time")
     ax2.set_ylabel("Insertion speed (records/s)")
-    ax2.set_title("Jellyfish MPT — Insertion Speed over Time")
+    ax2.set_title("Jellyfish MPT — Insertion Speed over Time (1 min avg)")
     ax2.xaxis.set_major_formatter(FuncFormatter(_time_formatter))
     ax2.yaxis.set_major_formatter(FuncFormatter(_thousands_formatter))
     ax2.legend()
@@ -205,7 +227,7 @@ def plot_results(results, output_path):
 
     for backend, (elapsed, counts) in results.items():
         if elapsed:
-            _times, rc, speeds = compute_speed(elapsed, counts)
+            _times, rc, speeds = compute_speed(elapsed, counts, window_secs=60)
             if rc:
                 ax3.plot(rc, speeds, label=backend, linewidth=2)
 
