@@ -129,8 +129,9 @@ impl RocksStorage {
         options.set_row_cache(&cache);
         options.increase_parallelism(32);
         options.set_allow_concurrent_memtable_write(true);
-        options.set_inplace_update_support(false);
         options.set_manual_wal_flush(true);
+        options.set_max_subcompactions(4);
+        options.set_max_background_jobs(8);
         let db = OptimisticTransactionDB::open(&options, path)?;
         Ok(Self { db, _cache: cache })
     }

@@ -17,7 +17,7 @@ DB_DIR = "bigdb"
 LOG_DIR = "bench_logs"
 
 BACKEND = "rocks"
-TIMEOUT = 3600
+TIMEOUT = 7200
 WINDOW_SIZE = 100_000
 BATCH_SIZE = 10_000
 
