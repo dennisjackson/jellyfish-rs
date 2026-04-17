@@ -1,45 +1,90 @@
 # jellyfish-rs
 
-A Rust crate for the jellyfish data structure.
+A Rust implementation of the Jellyfish Merkle Patricia Tree, with multiple storage backends and batch insertion support.
 
-## Planned Features
+## Features
 
-* [ ] Merkle Patricia Tree
-  * [x] A simple in-memory implementation.
-  * [x] A batched in-memory implementation
-  * [x] A batched persistent implementation (Sqlite)
-  * [ ] A batched persistent implementation (RocksDB)
-* [ ] Hashchains
-* [ ] Tree Heads and Client Proofs
-* [ ] HTTP API
-* [ ] Witnessing Proofs and API
+* **Merkle Patricia Tree** with SHA-256 hashing
+  * `SimpleMPT` -- single-key in-memory implementation
+  * `BatchMPT` -- batch-optimized in-memory implementation using concurrent DashMap
+  * `DurableBatchMPT` -- batch-optimized, crash-safe implementation backed by SQLite
+  * `RocksTransRelMPT` -- batch-optimized, crash-safe implementation backed by RocksDB with frontier-based memory management and parallel insertion via Rayon
+* Common `MerklePatriciaTree` trait across all implementations
 
-## Current Status
+### Planned
 
-Pretty messy, pre-alpha code.
+* Hashchains
+* Tree heads and client proofs
+* HTTP API
+* Witnessing proofs and API
 
-The batched persistent implementation runs >1000 insertions / second with full crash-safety / durability. Currently 90% of CPU-time is spent inside sqlite functions for reading / persisting MPT values. This doesn't happen in parallel currently - the code follows a fetch - compute - store cycle.
+## Usage
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+jellyfish-rs = { path = "." }
+```
+
+Basic example:
+
+```rust
+use jellyfish_rs::{MerklePatriciaTree, RocksTransRelMPT, Hash};
+
+let mut tree = RocksTransRelMPT::new(); // temporary RocksDB
+tree.batch_upsert(&entries);
+let root = tree.get_root_hash();
+```
 
 ## Tooling
 
-### Demo Binaries
+### Binaries
 
-* build-durable-tree - Allows large trees to be built and reports the performance.
-* test_mermaid - Dumps a mermaid representation of an in-memory tree.
-* dump-sqlite - Generates a small tree and dumps its SQL representation.
+Build with `cargo build --release --features bins`.
 
-### Benchmarking
+* **bench** -- Configurable insertion benchmark supporting all three backends.
 
-Benchmarks can be run with `cargo bench` or `cargo criterion` and are stored in `benches/mpt_benchmark.rs`. The benchmarks evaluate insertion performance in various scenarios:
+  ```
+  cargo run --release --features bins --bin bench -- [OPTIONS] [db_path]
 
-* Empty or full trees
-* Cold or warm caches
-* SQLite tuned for durability or default settings
+  Options:
+    -b, --backend <rocks|sqlite|memory>  Storage backend (default: rocks)
+    -t, --timeout <seconds>              Run duration (default: 30)
+    -w, --window-size <n>                Entries generated per window (default: 10,000)
+    -c, --batch-size <n>                 Entries per batch_upsert call (default: 1,000)
+    -l, --log-file <path>                Write insertion log (CSV) to file
+  ```
 
-### Profiling
+* **test-mermaid** -- Builds a small tree step-by-step and outputs Mermaid diagrams to `mpt_diagrams.md`.
 
-Profiling is best handled with [samply](https://github.com/mstange/samply). Invoke `samply record <command>` e.g. for a test binary or benchmark and it will open a profile in the Firefox Profiler.
+* **dump-sqlite** -- Creates a small SQLite-backed tree and dumps its schema and contents.
+
+### Plotting (`tools/`)
+
+Requires Python 3 and matplotlib.
+
+* **bench_plot.py** -- Runs benchmarks across backends and produces performance charts (insertion count over time, insertion speed over time, speed vs tree size). Can also plot from existing CSV logs or log directories.
+
+  ```
+  python3 tools/bench_plot.py --timeout 60 --output chart.png
+  python3 tools/bench_plot.py --input-dir rocks=bench_logs/ --output chart.png
+  ```
+
+* **bench_loop.py** -- Runs the bench binary in an infinite loop against a persistent RocksDB, growing the database across runs. Logs CSV data, CLI output, and peak RSS per run.
 
 ### Testing
 
-Tests can be ran with `cargo test`. Test quality can be evaluated with `cargo mutants` ([mutants.rs](https://mutants.rs)).
+```
+cargo test
+```
+
+Test quality can be evaluated with [`cargo mutants`](https://mutants.rs).
+
+### Profiling
+
+Profiling is best handled with [samply](https://github.com/mstange/samply):
+
+```
+samply record cargo run --release --features bins --bin bench -- -t 30
+```
