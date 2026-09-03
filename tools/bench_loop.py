@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
-"""Run the jellyfish bench binary in a loop, growing the database across runs.
-
-Each invocation runs for 600 seconds with RocksDB. CLI output and CSV logs
-are preserved per-run with timestamps. Peak RSS of each invocation is recorded.
-"""
+"""Run the bench binary in a loop, growing one database across runs. CLI output and peak
+RSS are kept per run; the per-batch log is bench's own, inside the database."""
 
 import os
 import subprocess
@@ -79,7 +76,7 @@ def main():
 
         log_msg(meta_f, "Building release binary...")
         result = subprocess.run(
-            ["cargo", "build", "--release", "--features", "bins", "--bin", "bench"],
+            ["cargo", "build", "--release", "--bin", "bench"],
             cwd=project_root,
         )
         if result.returncode != 0:
@@ -90,11 +87,10 @@ def main():
         run = 1
         while True:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_csv = os.path.join(LOG_DIR, f"log_{timestamp}.csv")
             cli_log = os.path.join(LOG_DIR, f"cli_{timestamp}.log")
 
             log_msg(meta_f, f"=== Run {run} starting at {datetime.now():%Y-%m-%d %H:%M:%S} ===")
-            log_msg(meta_f, f"  CSV log:  {log_csv}")
+            log_msg(meta_f, f"  batch log: {os.path.join(DB_DIR, 'bench-log.jsonl')}")
             log_msg(meta_f, f"  CLI log:  {cli_log}")
 
             cmd = [
@@ -103,7 +99,6 @@ def main():
                 "-t", str(TIMEOUT),
                 "-w", str(WINDOW_SIZE),
                 "-c", str(BATCH_SIZE),
-                "-l", log_csv,
                 DB_DIR,
             ]
 

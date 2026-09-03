@@ -1,3 +1,24 @@
 /target
 /mutants.out.old
 /mutants.out
+
+# Benchmark databases and output
+/bigdb
+/tempdb
+/bench_logs
+/log.csv
+/tools/*.png
+# bench_plot.py output: regenerated from the log, never reviewed as source
+/*.html
+/*.png
+/refdb*
+/ref62_*
+/tier0_k3
+/ab_*
+/bench_out
+
+# Agent scratch, not part of the project
+/.claude/
+/.host-git-identity
+.worktrees/
+/tools/__pycache__/

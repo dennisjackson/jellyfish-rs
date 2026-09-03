@@ -1,8 +1,10 @@
+pub mod census;
+pub(crate) mod hash;
 pub mod mpt;
 pub mod prefix;
+#[cfg(test)]
+mod testing;
 
-pub use mpt::{
-    BatchMPT, DurableBatchMPT, InteriorNode, LeafNode, MerklePatriciaTree, Node,
-    RocksTransRelMPT, SimpleMPT,
-};
-pub use prefix::{Hash, HashExt, Prefix};
+pub use census::{Census, CensusSnapshot, Metric};
+pub use mpt::{RocksFrontierConfig, RocksFrontierMPT};
+pub use prefix::{Digest, Entry, Key, Prefix, Side, Value};

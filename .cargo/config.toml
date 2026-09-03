@@ -1,0 +1,5 @@
+# Make RocksDB's PhysicalCoreID() use sched_getcpu(). Without this clang's __cpuid
+# fallback clobbers callee-saved %rbx and ConcurrentArena::Repick() segfaults under
+# concurrent memtable writes. DESIGN.md §7. Ignored if CXXFLAGS is already set.
+[env]
+CXXFLAGS = "-DROCKSDB_SCHED_GETCPU_PRESENT"
