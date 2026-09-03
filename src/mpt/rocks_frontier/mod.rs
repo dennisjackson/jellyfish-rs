@@ -1,4 +1,4 @@
-//! The RocksDB-backed tree (DESIGN.md §2–§5).
+//! The RocksDB-backed tree (DESIGN.md).
 //!
 //! Disk holds leaves plus one persisted interior level, the frontier F. [`Levels`] holds
 //! every hash for depths `0..=F+1` and caches deeper ones. A batch is one positional descent
@@ -24,7 +24,7 @@ use levels::{Levels, Position, Slot, levels_bytes};
 use storage::{LEAVES_PER_BLOCK, RocksResult, RocksStorage, RocksStorageError, RocksWriteBatch};
 
 /// A ceiling on the tree top held in memory and the deepest frontier to persist. Both are
-/// limits, not targets: the depth actually held is [`Self::deepest_level`] (DESIGN.md §8).
+/// limits, not targets: the depth actually held is [`Self::deepest_level`] (DESIGN.md, Representation).
 #[derive(Clone, Copy, Debug)]
 pub struct RocksFrontierConfig {
     max_depth: u16,
@@ -97,7 +97,7 @@ impl RocksFrontierConfig {
 }
 
 /// Shallowest depth at which a positional subtree's leaves fit one data block; past it a
-/// deeper level buys nothing (DESIGN.md §2). Zero for a tree of at most one block.
+/// deeper level buys nothing (DESIGN.md, Representation). Zero for a tree of at most one block.
 fn block_floor(leaves: u64, leaves_per_block: u64) -> u16 {
     let blocks = leaves.div_ceil(leaves_per_block.max(1));
     blocks
@@ -124,23 +124,23 @@ pub struct RocksFrontierMPT {
     storage: RocksStorage,
     /// F: every position at F holds an interior node. Written only by `advance_frontier`.
     frontier: u16,
-    /// Exact for this process; a lower bound across a crash (DESIGN.md §4). `Relaxed`: read
+    /// Exact for this process; a lower bound across a crash (DESIGN.md, Safety and Correctness). `Relaxed`: read
     /// only after the joins that incremented it have returned.
     leaf_count: AtomicU64,
     levels: Levels,
     config: RocksFrontierConfig,
     /// Set for the duration of a batch. A panic mid-batch leaves the tree top and count
-    /// ahead of disk, so every later call refuses; drop and reopen (DESIGN.md §4).
+    /// ahead of disk, so every later call refuses; drop and reopen (DESIGN.md, Safety and Correctness).
     poisoned: bool,
     /// Debug check that the descent enters each position at most once per batch
-    /// (DESIGN.md §3).
+    /// (DESIGN.md, Safety and Correctness).
     #[cfg(debug_assertions)]
     visited: std::sync::Mutex<std::collections::HashSet<Position>>,
 }
 
 impl RocksFrontierMPT {
     /// Open or create. Anything on disk outside the format is refused, not guessed at, and
-    /// left as found (DESIGN.md §6, §9).
+    /// left as found (DESIGN.md, Safety and Correctness).
     pub fn open(path: impl AsRef<Path>, config: RocksFrontierConfig) -> RocksResult<Self> {
         let storage = RocksStorage::open(path)?;
         let (leaves, frontier) = match storage.read_metadata()? {
@@ -196,7 +196,7 @@ impl RocksFrontierMPT {
     fn load_frontier_level(&self, depth: u16) -> RocksResult<()> {
         debug_assert!(depth >= 1, "a frontier level to rebuild from sits below 0");
         let expected = 1u64 << depth;
-        // Ranges sized by stride so none starts past the level (DESIGN.md §9).
+        // Ranges sized by stride so none starts past the level.
         let per_range = expected.div_ceil(rayon::current_num_threads() as u64 * 4);
         let ranges = expected.div_ceil(per_range);
 
@@ -249,7 +249,7 @@ impl RocksFrontierMPT {
     }
 
     /// Apply a batch, persist any frontier advance and the metadata, flush the WAL. Durable
-    /// per call, not atomic; the commit order is the crash story (DESIGN.md §4). Panics on a
+    /// per call, not atomic; the commit order is the crash story (DESIGN.md, Safety and Correctness). Panics on a
     /// write failure and poisons the tree.
     pub fn batch_upsert(&mut self, entries: &[Entry]) {
         if entries.is_empty() {
@@ -300,7 +300,7 @@ impl RocksFrontierMPT {
     /// a leaf record, one frontier row per touched subtree from the hashes at `F + 1`. Only
     /// after [`Self::upsert`] has returned. Cuts are advanced to subtree boundaries so a
     /// subtree's leaves and its row share a batch — a crash-safety invariant, since the
-    /// batches commit independently (DESIGN.md §3–§4).
+    /// batches commit independently (DESIGN.md, Updating the Representation).
     fn stage_batches(&self, entries: &[Entry]) -> Vec<RocksWriteBatch> {
         let depth = self.frontier;
         debug_assert!(!entries.is_empty(), "caller guarantees entries");
@@ -351,7 +351,7 @@ impl RocksFrontierMPT {
     /// record its hash and return it. Parallel above the frontier; at the first position
     /// whose children are unknown the subtree is merged from disk. Children are addressed by
     /// position: a compressed child prefix covers the same leaf range, so the scan is the
-    /// same (DESIGN.md §3).
+    /// same (DESIGN.md, Updating the Representation).
     fn upsert(&self, position: Position, entries: &[Entry]) -> Digest {
         debug_assert!(!entries.is_empty(), "caller guarantees entries");
         debug_assert!(
@@ -525,7 +525,7 @@ impl RocksFrontierMPT {
 
     /// Persist the level at `depth` as frontier rows, `chunk` per `WriteBatch`. The last
     /// chunk carries the metadata naming `depth`, so a level is complete on disk exactly when
-    /// the metadata names it (DESIGN.md §4). Returns the batch count.
+    /// the metadata names it (DESIGN.md, Safety and Correctness). Returns the batch count.
     fn persist_level(&self, depth: u16, chunk: u64) -> RocksResult<usize> {
         debug_assert!(chunk > 0, "persist chunk size must be non-zero");
         let mut batch = RocksWriteBatch::default();
@@ -592,7 +592,7 @@ impl RocksFrontierMPT {
         }
     }
 
-    /// O(1). Exact for this process's batches; a lower bound across a crash (DESIGN.md §4).
+    /// O(1). Exact for this process's batches; a lower bound across a crash (DESIGN.md, Safety and Correctness).
     pub fn leaf_count(&self) -> usize {
         self.refuse_if_poisoned();
         usize::try_from(self.leaf_count.load(Ordering::Relaxed)).unwrap_or(usize::MAX)

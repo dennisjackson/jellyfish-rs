@@ -32,7 +32,7 @@ impl Counter {
     }
 }
 
-/// What the census counts (DESIGN.md §12). The last three are sampled from RocksDB's tickers
+/// What the census counts. The last three are sampled from RocksDB's tickers
 /// at snapshot time, so a phase must be opened through `RocksStorage::census_reset`, which
 /// re-baselines them; [`Census::reset`] alone is not enough.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,7 +51,7 @@ pub enum Metric {
     /// block cost has stopped falling; not the read headline.
     LeavesReadByLoads,
     /// Data blocks fetched from an SST (block-cache data miss). The read headline: a scan
-    /// costs about one block per sorted run whatever range it covers (DESIGN.md §2).
+    /// costs about one block per sorted run whatever range it covers (DESIGN.md, Performance).
     DataBlocksRead,
     /// Index and filter blocks fetched from an SST.
     IndexBlocksRead,

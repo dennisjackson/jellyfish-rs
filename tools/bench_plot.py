@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["matplotlib"]
 # ///
-"""Turn bench logs (`<db>/bench-log.jsonl`, DESIGN.md §12) into a performance report.
+"""Turn bench logs (`<db>/bench-log.jsonl`) into a performance report.
 
 Panels: throughput (rate, batch-latency percentiles with stalls marked), per-insert traffic
 (differenced between census records) and shape/memory. Plotted against tree size or wall

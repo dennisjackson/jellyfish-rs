@@ -95,7 +95,7 @@ pub enum Side {
 
 /// A node's name: the first `length` bits of `key`, MSB first. Leaves have `length == 256`.
 /// Invariants: `length <= 256` and every bit at or past `length` is zero, since `Eq`/`Ord`/
-/// `Hash` and the interior hash read all 32 bytes (DESIGN.md §1). Debug-checked in
+/// `Hash` and the interior hash read all 32 bytes (DESIGN.md, Desired Functionality). Debug-checked in
 /// [`Prefix::new`]; enforced for disk rows by the storage decoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Prefix {

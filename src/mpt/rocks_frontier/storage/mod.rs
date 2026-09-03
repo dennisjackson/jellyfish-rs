@@ -1,5 +1,5 @@
 //! The RocksDB layer: one key space ([`codec`]), bounded scans, the write batch. Options are
-//! hardcoded; the sweeps behind each are in DESIGN.md §7.
+//! hardcoded; the sweeps behind each are in docs/old/REVIEW.md.
 
 use std::fmt;
 use std::path::Path;
@@ -76,7 +76,7 @@ const MAX_SUBCOMPACTIONS: u32 = 4;
 /// The default (REVIEW.md §3.3.6).
 const BLOCK_SIZE: usize = 4096;
 
-/// Leaf rows per data block: the granularity every scan is charged at (DESIGN.md §2).
+/// Leaf rows per data block: the granularity every scan is charged at (DESIGN.md, Representation).
 pub(crate) const LEAVES_PER_BLOCK: u64 = (BLOCK_SIZE / (NODE_KEY_LEN + LEAF_RECORD_LEN)) as u64;
 
 /// Sampled metrics and the tickers each sums.
@@ -148,7 +148,7 @@ impl RocksStorage {
             .sum()
     }
 
-    /// Collapse the LSM to one sorted run; blocks until done (DESIGN.md §10).
+    /// Collapse the LSM to one sorted run; blocks until done (DESIGN.md, Performance).
     pub fn compact_all(&self) {
         self.db.compact_range::<&[u8], &[u8]>(None, None);
     }

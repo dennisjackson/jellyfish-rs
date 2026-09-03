@@ -10,14 +10,14 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
 const DEFAULT_TIMEOUT_SECS: f64 = 30.0;
-/// The recorded protocol (DESIGN.md §12); `ab.py`'s defaults match.
+/// The recorded protocol; `ab.py`'s defaults match.
 const DEFAULT_WINDOW_SIZE: usize = 100_000;
 const DEFAULT_BATCH_SIZE: usize = 10_000;
 
 const DEFAULT_MAX_DEPTH: u16 = RocksFrontierConfig::DEFAULT_MAX_DEPTH;
 
-/// Appended inside the database directory, so a database carries its whole history
-/// (DESIGN.md §12). RocksDB ignores file names it does not recognise.
+/// Appended inside the database directory, so a database carries its whole history.
+/// RocksDB ignores file names it does not recognise.
 const LOG_FILE_NAME: &str = "bench-log.jsonl";
 
 /// Parse a flag's value, naming the flag in either failure.
@@ -177,7 +177,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         human_count(batch_size)
     );
 
-    // JSON lines (DESIGN.md §12); `tools/bench_plot.py` reads them.
+    // JSON lines; `tools/bench_plot.py` reads them.
     let log_path = log_file_path.unwrap_or_else(|| default_log_path(db_path));
     let mut log_writer = {
         ensure_parent(&log_path)?;
@@ -220,7 +220,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
 
         let mut entries = generate_entries(&mut rng, window_size);
-        // Sorted windows are the recorded protocol (DESIGN.md §12).
+        // Sorted windows are the recorded protocol.
         entries.sort_unstable_by_key(|a| a.0);
         window_count += 1;
 
@@ -434,7 +434,7 @@ fn write_census_record(
 }
 
 /// Per-insert traffic. `puts/insert` is the write headline, `blocks read/insert` the read
-/// one; `leaves read/insert` is structural (DESIGN.md §12).
+/// one; `leaves read/insert` is structural.
 fn print_census(census: &CensusSnapshot, entries: usize) {
     if entries == 0 {
         return;

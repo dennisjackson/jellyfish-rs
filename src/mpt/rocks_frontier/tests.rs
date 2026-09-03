@@ -380,7 +380,7 @@ fn the_levels_stay_counted_and_never_forget_across_batches_advances_and_a_reopen
     );
 }
 
-/// Every refusal in DESIGN.md §6, by name, plus a whole deep level as the positive control.
+/// Every refusal in DESIGN.md (Safety and Correctness), by name, plus a whole deep level as the positive control.
 #[test]
 fn the_open_refuses_everything_outside_the_format_and_loads_a_whole_level() {
     let row = |depth, index| {
@@ -736,7 +736,7 @@ fn a_merge_does_not_rewrite_the_leaves_it_read() {
     );
 }
 
-/// Half the staged batches dropped on the floor (DESIGN.md §4): the reopened root must be
+/// Half the staged batches dropped on the floor (DESIGN.md, Safety and Correctness): the reopened root must be
 /// the oracle's root over the leaves that reached disk, since a subtree's row and its
 /// leaves share a batch.
 #[test]
@@ -846,7 +846,7 @@ fn a_wrong_leaf_count_does_not_stall_the_frontier() {
     tree.check_persisted_rows();
 }
 
-/// The level scan's parallel ranges are sized by stride (DESIGN.md §9); frontier 6 lies in
+/// The level scan's parallel ranges are sized by stride; frontier 6 lies in
 /// the window each of these pool sizes once double-counted.
 #[test]
 fn a_frontier_level_loads_under_any_thread_count() {
@@ -874,7 +874,7 @@ fn a_frontier_level_loads_under_any_thread_count() {
     }
 }
 
-/// A crash inside an advance (DESIGN.md §4): the durable prefix names a level it holds
+/// A crash inside an advance (DESIGN.md, Safety and Correctness): the durable prefix names a level it holds
 /// whole, orphan rows of the next level are ignored, and the next batch finishes the advance.
 #[test]
 fn a_crash_inside_an_advance_leaves_an_openable_database() {
@@ -944,7 +944,7 @@ fn a_slot_set_by_several_threads_is_counted_once() {
     assert_eq!(levels.hashed_count(DEPTH), 1 << DEPTH);
 }
 
-/// A batch that panics part-way poisons the tree (DESIGN.md §4); the reopened database is
+/// A batch that panics part-way poisons the tree (DESIGN.md, Safety and Correctness); the reopened database is
 /// untouched by the failed batch.
 #[test]
 fn a_tree_whose_batch_panicked_refuses_further_use() {

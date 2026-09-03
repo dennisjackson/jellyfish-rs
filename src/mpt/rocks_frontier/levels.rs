@@ -1,4 +1,4 @@
-//! The tree top: one dense array per depth, addressed by `(depth, index)` (DESIGN.md §2).
+//! The tree top: one dense array per depth, addressed by `(depth, index)` (DESIGN.md, Representation).
 //!
 //! Above the frontier the trie is perfect, so position determines prefix and only the hash
 //! is stored. Below it a positional prefix covers the same leaf range as the compressed
@@ -172,7 +172,7 @@ impl Levels {
 }
 
 /// All-default slice without `unsafe`. Out of line so the release build folds it into the
-/// allocator's zeroed path and untouched pages stay non-resident (DESIGN.md §2).
+/// allocator's zeroed path and untouched pages stay non-resident.
 #[inline(never)]
 fn zeroed_slice<T: Default>(len: usize) -> Box<[T]> {
     let mut slice = Vec::with_capacity(len);

@@ -1,4 +1,4 @@
-//! Collapse a database's LSM to one sorted run, in place (DESIGN.md §10).
+//! Collapse a database's LSM to one sorted run, in place (DESIGN.md, Performance).
 
 use std::env;
 use std::error::Error;

@@ -1,4 +1,4 @@
-//! On-disk format v4 (DESIGN.md §6). The only module that knows the key layout: callers ask
+//! On-disk format v4 (DESIGN.md, Representation). The only module that knows the key layout: callers ask
 //! for a key or a range. Records are untagged; the key's length says the kind.
 
 use super::{RocksResult, RocksStorageError};

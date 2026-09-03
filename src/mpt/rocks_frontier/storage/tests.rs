@@ -352,7 +352,7 @@ fn has_interior_rows_sees_exactly_the_interior_lengths() {
     assert!(storage.has_interior_rows().expect("interior row present"));
 }
 
-/// Regression test for the `PhysicalCoreID()` miscompile (DESIGN.md §7): concurrent writes
+/// Regression test for the `PhysicalCoreID()` miscompile (DESIGN.md §8): concurrent writes
 /// contend on a memtable arena shard, which calls it.
 #[test]
 fn concurrent_batch_writes_do_not_corrupt_the_memtable() {

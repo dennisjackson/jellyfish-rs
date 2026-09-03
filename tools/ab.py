@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interleaved fixed-work A/B harness for the bench binary (DESIGN.md §12).
+"""Interleaved fixed-work A/B harness for the bench binary.
 
 Each variant inserts exactly ``--entries`` entries from one seed into a fresh copy of the
 reference database with the page cache dropped (``--keep-cache`` to skip); variants run
