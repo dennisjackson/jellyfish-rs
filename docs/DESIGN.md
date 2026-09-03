@@ -1,12 +1,8 @@
 # jellyfish-rs — Design
 
-A binary, path-compressed Merkle-Patricia trie over 256-bit keys, backed by RocksDB, built
-to measure how cheaply a durable authenticated map absorbs high-rate batch inserts. One
-production type, `RocksFrontierMPT`; one test-only oracle, `SimpleMPT`.
+## Overview
 
-Present tense throughout. Numbers cite the measurement record: `§n` is
-[docs/REVIEW.md](docs/REVIEW.md), `BASELINE §n` is
-[docs/BENCHMARK-BASELINE.md](docs/BENCHMARK-BASELINE.md).
+The jellyfish-rs approach is the result of
 
 ## 1. Tree model
 
