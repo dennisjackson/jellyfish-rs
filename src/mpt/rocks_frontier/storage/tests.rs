@@ -1,14 +1,14 @@
 use super::*;
 use crate::Entry;
-use crate::testing::fresh_dir;
+use crate::testing::{TestRng, fresh_dir};
 
 // Test-only storage surface: observe or plant state no production caller needs.
 impl RocksStorage {
-    /// The raw stored value under a node key in the leaf column family, undecoded.
-    pub(crate) fn get_raw(&self, prefix: &Prefix) -> RocksResult<Option<Vec<u8>>> {
+    /// The raw leaf record under `key`, undecoded.
+    pub(crate) fn get_raw_leaf(&self, key: &Key) -> RocksResult<Option<Vec<u8>>> {
         Ok(self
             .db
-            .get_pinned(prefix_key(prefix))?
+            .get_pinned(leaf_key(key))?
             .map(|raw| raw.as_ref().to_vec()))
     }
 
@@ -35,11 +35,13 @@ impl RocksStorage {
 
     /// `COMPLETE_DEPTH_KEY` alone: torn metadata no production path can write.
     pub(crate) fn plant_frontier_depth(&self, depth: u16) -> RocksResult<()> {
-        self.db.put(COMPLETE_DEPTH_KEY, depth.to_be_bytes())?;
+        self.db
+            .put_cf(self.frontier(), COMPLETE_DEPTH_KEY, depth.to_be_bytes())?;
         Ok(())
     }
 
-    /// Count and depth without a format version: what a v4 build committed.
+    /// Count and depth among the leaves, without a format version: what a v4 build
+    /// committed.
     pub(crate) fn plant_v4_metadata(&self, leaf_count: u64, depth: u16) -> RocksResult<()> {
         let mut batch = WriteBatch::default();
         batch.put(LEAF_COUNT_KEY, leaf_count.to_be_bytes());
@@ -48,8 +50,16 @@ impl RocksStorage {
         Ok(())
     }
 
-    pub(crate) fn plant_format_version(&self, version: u16) -> RocksResult<()> {
+    /// A format version among the leaves: where v5 and v6 kept it.
+    pub(crate) fn plant_legacy_format_version(&self, version: u16) -> RocksResult<()> {
         self.db.put(FORMAT_KEY, version.to_be_bytes())?;
+        Ok(())
+    }
+
+    /// The format version where this build keeps it.
+    pub(crate) fn plant_format_version(&self, version: u16) -> RocksResult<()> {
+        self.db
+            .put_cf(self.frontier(), FORMAT_KEY, version.to_be_bytes())?;
         Ok(())
     }
 
@@ -59,14 +69,20 @@ impl RocksStorage {
         Ok(())
     }
 
+    /// Raw bytes under the leaf key of `key`, bypassing the record codec.
+    pub(crate) fn plant_raw_leaf(&self, key: &Key, value: &[u8]) -> RocksResult<()> {
+        self.db.put(leaf_key(key), value)?;
+        Ok(())
+    }
+
     /// Raw bytes under a raw key in the frontier column family, bypassing the codec.
     pub(crate) fn plant_raw_frontier(&self, key: &[u8], value: &[u8]) -> RocksResult<()> {
         self.db.put_cf(self.frontier(), key, value)?;
         Ok(())
     }
 
-    pub(crate) fn delete_raw(&self, key: &[u8]) -> RocksResult<()> {
-        self.db.delete(key)?;
+    pub(crate) fn delete_raw_leaf(&self, key: &Key) -> RocksResult<()> {
+        self.db.delete(leaf_key(key))?;
         Ok(())
     }
 
@@ -144,6 +160,11 @@ fn v5_leaf_record() -> Vec<u8> {
     vec![0x5A; 72]
 }
 
+/// Format v6: `leaf_hash || head_seq || version_u64`.
+fn v6_leaf_record() -> Vec<u8> {
+    vec![0x5A; 48]
+}
+
 fn frontier_rows_at(storage: &RocksStorage, depth: u16) -> RocksResult<Vec<Prefix>> {
     let mut rows = Vec::new();
     storage.for_each_frontier_row(depth, &positional(&[], depth), None, |prefix, _, _| {
@@ -174,8 +195,77 @@ fn write_chain(storage: &RocksStorage, key: Key, values: &[Value]) -> Vec<Versio
     versions
 }
 
+/// The leaf key spreads the fourth byte so the first 26 bits are a whole number of bytes:
+/// it round-trips, keeps the keys' order, and its decoder refuses every other shape.
+#[test]
+fn leaf_keys_split_the_fourth_byte_and_keep_their_order() {
+    let mut rng = TestRng::seed(7);
+    let mut keys: Vec<Key> = (0..2000).map(|_| Key(rng.bytes())).collect();
+    keys.extend([
+        Key::ZERO,
+        Key([0xFF; 32]),
+        key(&[0, 0, 0, 0x3F]),
+        key(&[0, 0, 0, 0x40]),
+    ]);
+    keys.sort();
+    let encoded: Vec<[u8; LEAF_KEY_LEN]> = keys.iter().map(leaf_key).collect();
+    assert!(
+        encoded.windows(2).all(|pair| pair[0] < pair[1]),
+        "encoding preserves order"
+    );
+    for (k, e) in keys.iter().zip(&encoded) {
+        assert_eq!(&e[..3], &k.0[..3]);
+        assert_eq!(e[3] & 0x3F, 0, "the high half holds two bits");
+        assert_eq!(e[4] & 0xC0, 0, "the low half holds six");
+        assert_eq!(e[3] | e[4], k.0[3]);
+        assert_eq!(&e[5..], &k.0[4..]);
+        assert_eq!(decode_leaf_key(e).expect("decode"), *k);
+        // The bloom prefix is exactly the key's first 26 bits.
+        let prefix = Prefix::new(k.zero_bits_from(LEAF_PREFIX_BITS), LEAF_PREFIX_BITS);
+        assert_eq!(
+            &leaf_key(&prefix.key())[..LEAF_PREFIX_LEN],
+            &e[..LEAF_PREFIX_LEN]
+        );
+        let mut past = k.0;
+        past[3] ^= 0x20; // bit 26
+        assert_eq!(
+            &leaf_key(&Key(past))[..LEAF_PREFIX_LEN],
+            &e[..LEAF_PREFIX_LEN]
+        );
+        past[3] ^= 0x60; // bit 25 too
+        assert_ne!(
+            &leaf_key(&Key(past))[..LEAF_PREFIX_LEN],
+            &e[..LEAF_PREFIX_LEN]
+        );
+    }
+    let mut dirty = leaf_key(&key(&[1, 2, 3, 0xC3]));
+    dirty[3] |= 0x01;
+    let err = decode_leaf_key(&dirty)
+        .expect_err("dirty high half")
+        .to_string();
+    assert!(err.contains("split fourth byte"), "{err}");
+    let mut dirty = leaf_key(&key(&[1, 2, 3, 0xC3]));
+    dirty[4] |= 0x80;
+    assert!(decode_leaf_key(&dirty).is_err(), "dirty low half");
+    for len in [0, 32, 34] {
+        let err = decode_leaf_key(&vec![0; len])
+            .expect_err("length")
+            .to_string();
+        assert!(err.contains(&format!("{len}-byte key")), "{err}");
+    }
+    let (start, end) = leaf_scan_range(&Prefix::root());
+    assert_eq!((start, end), ([0; LEAF_KEY_LEN], None));
+    let (start, end) = leaf_scan_range(&positional(&[0x80], 1));
+    assert_eq!((start, end), (leaf_key(&key(&[0x80])), None));
+    let (start, end) = leaf_scan_range(&positional(&[0x40], 2));
+    assert_eq!(
+        (start, end),
+        (leaf_key(&key(&[0x40])), Some(leaf_key(&key(&[0x80]))))
+    );
+}
+
 /// No metadata until a batch commits (distinct from a zero count); the triple round-trips;
-/// a partial triple is refused, and count-and-depth alone is named as v4.
+/// a partial triple is refused; metadata among the leaves names the legacy format.
 #[test]
 fn metadata_is_absent_until_committed_and_round_trips() {
     let storage = open();
@@ -187,6 +277,22 @@ fn metadata_is_absent_until_committed_and_round_trips() {
             Some((count, depth))
         );
     }
+    for other in [4, FORMAT_VERSION - 1, FORMAT_VERSION + 1] {
+        storage.plant_format_version(other).expect("plant format");
+        let err = storage
+            .read_metadata()
+            .expect_err("wrong format")
+            .to_string();
+        assert!(err.contains(&format!("format v{other}")), "{err}");
+    }
+    assert!(
+        storage.get_raw_leaf(&Key::ZERO).expect("get").is_none()
+            && storage
+                .count_leaves_by_prefix(&Prefix::root())
+                .expect("count")
+                == 0,
+        "no metadata key sits among the leaves"
+    );
 
     let torn = open();
     torn.plant_frontier_depth(4).expect("plant depth");
@@ -196,18 +302,25 @@ fn metadata_is_absent_until_committed_and_round_trips() {
     let v4 = open();
     v4.plant_v4_metadata(7, 4).expect("plant v4 metadata");
     let err = v4.read_metadata().expect_err("v4").to_string();
-    assert!(err.contains("format v4"), "{err}");
-    v4.plant_format_version(FORMAT_VERSION)
-        .expect("plant format");
-    assert_eq!(v4.read_metadata().expect("metadata"), Some((7, 4)));
-    for old in [4, 5] {
-        v4.plant_format_version(old).expect("plant format");
-        let err = v4.read_metadata().expect_err("wrong format").to_string();
-        assert!(err.contains(&format!("format v{old}")), "{err}");
+    assert!(
+        err.contains("format v4") && err.contains("7f87873"),
+        "{err}"
+    );
+
+    for legacy in [5, 6] {
+        let old = open();
+        old.plant_v4_metadata(7, 4).expect("plant metadata");
+        old.plant_legacy_format_version(legacy)
+            .expect("plant format");
+        let err = old.read_metadata().expect_err("legacy").to_string();
+        assert!(
+            err.contains(&format!("format v{legacy}")) && err.contains("among the leaves"),
+            "{err}"
+        );
     }
 }
 
-/// A key of another length inside the leaf range is refused, not skipped.
+/// A key of another shape in the leaf column family is refused, not skipped.
 #[test]
 fn a_foreign_key_inside_the_leaf_range_is_refused() {
     let storage = open();
@@ -215,12 +328,13 @@ fn a_foreign_key_inside_the_leaf_range_is_refused() {
         .write_leaves(&leaves([0x10, 0x20]))
         .expect("write leaves");
     storage
-        .plant_raw(
-            &[&256u16.to_be_bytes()[..], &[0x18u8][..]].concat(),
-            &[0; LEAF_RECORD_LEN],
-        )
+        .plant_raw(&[0x18u8, 0, 0], &[0; LEAF_RECORD_LEN])
         .expect("plant a 3-byte key");
-    assert!(storage.get_leaf_rows_by_prefix(&Prefix::root()).is_err());
+    let err = storage
+        .get_leaf_rows_by_prefix(&Prefix::root())
+        .expect_err("scan")
+        .to_string();
+    assert!(err.contains("3-byte key"), "{err}");
     assert!(storage.count_leaves_by_prefix(&Prefix::root()).is_err());
     assert_eq!(
         storage.get_leaf_value(&key(&[0x20])).expect("point get"),
@@ -229,9 +343,9 @@ fn a_foreign_key_inside_the_leaf_range_is_refused() {
 }
 
 /// Leaf scans see exactly the leaves under a prefix: the root and all-ones prefixes (no
-/// successor; must stop before the metadata keys), leaves at both range boundaries, a
-/// full-length prefix, and prefixes at and past the bloom prefix length, where the seek
-/// consults the filters instead of scanning in total order.
+/// successor), leaves at both range boundaries, a full-length prefix, and prefixes around
+/// the bloom prefix length, where the seek consults the filters instead of scanning in total
+/// order.
 #[test]
 fn leaf_scans_see_exactly_the_leaves_under_a_prefix() {
     let storage = open();
@@ -241,8 +355,10 @@ fn leaf_scans_see_exactly_the_leaves_under_a_prefix() {
         (key(&[0xDF; 32]), Value([1; 32])), // last key before "1110"
         (key(&[0xEF; 32]), Value([2; 32])), // last key under "1110"
         (Key([0xFF; 32]), Value([3; 32])),  // the largest key there is
-        (key(&[0x40, 0x00, 0x00, 0x80]), Value([4; 32])), // shares 24 bits with 0x40
-        (key(&[0x40, 0x00, 0x01]), Value([5; 32])), // parts from 0x40 at bit 23
+        (key(&[0x40, 0x00, 0x00, 0x20]), Value([4; 32])), // shares 26 bits with 0x40
+        (key(&[0x40, 0x00, 0x00, 0x40]), Value([5; 32])), // parts from 0x40 at bit 25
+        (key(&[0x40, 0x00, 0x00, 0x80]), Value([6; 32])), // parts from 0x40 at bit 24
+        (key(&[0x40, 0x00, 0x01]), Value([7; 32])), // parts from 0x40 at bit 23
     ]);
     entries.sort();
     // Half the leaves in a table file, half in the memtable: both hold filters.
@@ -252,12 +368,16 @@ fn leaf_scans_see_exactly_the_leaves_under_a_prefix() {
     storage.write_leaves(resident).expect("write leaves");
 
     let mut prefixes = vec![Prefix::root(), Prefix::from(entries[5].0)];
-    for length in [1, 2, 3, 4, 8, 23, 24, 25, 31, 32, 40] {
+    for length in [1, 2, 3, 4, 8, 23, 24, 25, 26, 27, 28, 31, 32, 40] {
         for byte in [0x00, 0x40, 0x80, 0xC0, 0xE0, 0xF0, 0xFF] {
             prefixes.push(positional(&[byte], length));
         }
     }
-    prefixes.push(positional(&[0x40, 0x00, 0x00, 0x80], 25));
+    for length in [24, 25, 26, 27, 28] {
+        for tail in [0x20, 0x40, 0x80] {
+            prefixes.push(positional(&[0x40, 0x00, 0x00, tail], length));
+        }
+    }
     prefixes.push(positional(&[0x40, 0x00, 0x01], 24));
     for prefix in prefixes {
         let expected: Vec<Entry> = entries
@@ -445,7 +565,8 @@ fn history_walks_follow_prev_pointers_within_their_bounds() {
     assert!(err.contains("ends at version 1"), "{err}");
 }
 
-/// The level scan sees one length, in positional order, within its bounds.
+/// The level scan sees one length, in positional order, within its bounds; the metadata
+/// beside the rows in its column family is outside every level.
 #[test]
 fn frontier_row_scans_see_one_length_within_their_bounds() {
     let storage = open();
@@ -456,6 +577,7 @@ fn frontier_row_scans_see_one_length_within_their_bounds() {
             frontier_row(&[0x40], 4),
             frontier_row(&[0x80], 4),
             frontier_row(&[0x80], 8),
+            frontier_row(&[0xFF; 32], 255),
         ])
         .expect("write frontier rows");
     storage
@@ -473,6 +595,7 @@ fn frontier_row_scans_see_one_length_within_their_bounds() {
         [positional(&[0x80], 8)]
     );
     assert_eq!(frontier_rows_at(&storage, 5).expect("5"), []);
+    assert_eq!(frontier_rows_at(&storage, 255).expect("255").len(), 1);
 
     let mut bounded = Vec::new();
     storage
@@ -489,13 +612,13 @@ fn frontier_row_scans_see_one_length_within_their_bounds() {
 #[test]
 fn records_are_bare_and_round_trip_through_their_writers() {
     let storage = open();
-    let (k, v) = (key(&[0x77]), Value([0x33; 32]));
+    let (k, v) = (key(&[0x77, 0x66, 0x55, 0xC3]), Value([0x33; 32]));
     let (left, right) = (Digest([0xAA; 32]), Digest([0xBB; 32]));
     let version = Version {
         key: k,
         seq: 0x0102030405060708,
         prev: 0x1112131415161718,
-        version: 0x2122232425262728,
+        version: 0x21222324,
         record: Record {
             value: v,
             link: Digest([0x44; 32]),
@@ -508,15 +631,16 @@ fn records_are_bare_and_round_trip_through_their_writers() {
     batch.put_frontier_node(&positional(&[], 3), left, right);
     storage.write_batch(batch).expect("write batch");
 
-    let stored = storage
-        .get_raw(&Prefix::from(k))
-        .expect("raw get")
-        .expect("present");
+    let stored = storage.get_raw_leaf(&k).expect("raw get").expect("present");
     assert_eq!(stored.len(), LEAF_RECORD_LEN);
     assert_eq!(&stored[..32], version.record.leaf_hash(k).as_bytes());
     assert_eq!(&stored[32..40], &version.seq.to_be_bytes());
-    assert_eq!(&stored[40..], &version.version.to_be_bytes());
+    assert_eq!(&stored[40..], &(version.version as u32).to_be_bytes());
     assert_eq!(leaf_from_record(k, &stored).expect("decode"), leaf);
+    assert_eq!(
+        leaf_key(&k).to_vec(),
+        [&[0x77u8, 0x66, 0x55, 0xC0, 0x03][..], &[0u8; 28][..]].concat()
+    );
     assert!(
         storage
             .get_raw_frontier(&Prefix::from(k))
@@ -554,13 +678,6 @@ fn records_are_bare_and_round_trip_through_their_writers() {
         (&left.as_bytes()[..], &right.as_bytes()[..])
     );
     assert_eq!(frontier_child_hashes(&row).expect("decode"), (left, right));
-    assert!(
-        storage
-            .get_raw(&positional(&[], 3))
-            .expect("raw get")
-            .is_none(),
-        "a frontier row is not in the leaf column family"
-    );
 
     // The next version of a leaf takes its link from the stored hash and points back at it.
     let next = leaf.next(Value([0x55; 32]), 99);
@@ -571,10 +688,15 @@ fn records_are_bare_and_round_trip_through_their_writers() {
         (leaf.head, leaf.version + 1, 99)
     );
     assert_eq!(next.leaf_row().head, 99);
+
+    // A version past 32 bits cannot be encoded.
+    let mut absurd = leaf;
+    absurd.version = u64::from(u32::MAX) + 1;
+    assert!(std::panic::catch_unwind(|| encode_leaf(&absurd)).is_err());
 }
 
-/// Decoders accept exactly their own record length; v3, v4 and v5 records are refused with
-/// the format named; a leaf pointing at no history row, a node key past length 256 or with a
+/// Decoders accept exactly their own record length; v3 to v6 records are refused with the
+/// format named; a leaf pointing at no history row, a node key past length 256 or with a
 /// dirty tail are refused.
 #[test]
 fn decoders_refuse_every_other_shape_by_name() {
@@ -606,7 +728,7 @@ fn decoders_refuse_every_other_shape_by_name() {
         |bytes| history_record(bytes).map(drop),
     ];
     for decode in decoders {
-        for payload in [0, 1, 20, 33, 47, 49, 65, 71, 73, 100] {
+        for payload in [0, 1, 20, 33, 43, 45, 47, 49, 65, 71, 73, 100] {
             assert!(decode(&vec![0; payload]).is_err(), "{payload} bytes");
         }
         for legacy in [v3_leaf_record(), v3_frontier_record()] {
@@ -622,10 +744,15 @@ fn decoders_refuse_every_other_shape_by_name() {
             "{err}"
         );
     }
-    let err = leaf_from_record(Key::ZERO, &v5_leaf_record())
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("format v5"), "{err}");
+    for (legacy, name) in [
+        (v5_leaf_record(), "format v5"),
+        (v6_leaf_record(), "format v6"),
+    ] {
+        let err = leaf_from_record(Key::ZERO, &legacy)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(name), "{err}");
+    }
 
     let mut node_key = vec![0u8; NODE_KEY_LEN];
     node_key[..2].copy_from_slice(&257u16.to_be_bytes());
@@ -656,11 +783,16 @@ fn decoders_refuse_every_other_shape_by_name() {
 /// decodes.
 #[test]
 fn legacy_records_are_refused_through_every_read_path() {
-    for legacy in [v3_leaf_record(), v4_leaf_record(), v5_leaf_record()] {
+    for legacy in [
+        v3_leaf_record(),
+        v4_leaf_record(),
+        v5_leaf_record(),
+        v6_leaf_record(),
+    ] {
         let storage = open();
         let leaf_key_ = Key([1; 32]);
         storage
-            .plant_raw(&leaf_key(&leaf_key_), &legacy)
+            .plant_raw_leaf(&leaf_key_, &legacy)
             .expect("plant record");
         storage
             .plant_raw_frontier(&prefix_key(&positional(&[0x80], 1)), &v3_frontier_record())
@@ -681,8 +813,8 @@ fn legacy_records_are_refused_through_every_read_path() {
     }
 }
 
-/// Rows at lengths 1..=255 in the frontier column family trip it; leaves and a depth-0 root
-/// row do not.
+/// Rows at lengths 1..=255 in the frontier column family trip it; leaves, metadata and a
+/// depth-0 root row do not.
 #[test]
 fn has_interior_rows_sees_exactly_the_interior_lengths() {
     let storage = open();
@@ -690,13 +822,18 @@ fn has_interior_rows_sees_exactly_the_interior_lengths() {
     storage
         .write_leaves(&leaves([0x01, 0xF0]))
         .expect("write leaves");
+    storage.commit_metadata(2, 0).expect("commit metadata");
     storage
         .plant_raw_frontier(
             &prefix_key(&Prefix::root()),
             &encode_frontier_node(Digest([1; 32]), Digest([2; 32])),
         )
         .expect("plant depth-0 row");
-    assert!(!storage.has_interior_rows().expect("leaves and a root row"));
+    assert!(
+        !storage
+            .has_interior_rows()
+            .expect("leaves, metadata and a root row")
+    );
     storage
         .write_frontier_rows(&[frontier_row(&[], 255)])
         .expect("write frontier row");
@@ -817,10 +954,6 @@ fn the_measured_rocksdb_options_are_in_force() {
         "memtable history is retained for conflict checks"
     );
     assert_eq!(
-        recorded(&text, "write_buffer_size"),
-        WRITE_BUFFER_SIZE.to_string()
-    );
-    assert_eq!(
         recorded(&text, "use_direct_io_for_flush_and_compaction"),
         "true"
     );
@@ -837,26 +970,42 @@ fn the_measured_rocksdb_options_are_in_force() {
     );
     assert_eq!(recorded(frontier_section, "prefix_extractor"), "nullptr");
     assert_eq!(recorded(history_section, "prefix_extractor"), "nullptr");
+    assert_eq!(
+        recorded(leaves_section, "write_buffer_size"),
+        LEAF_WRITE_BUFFER_SIZE.to_string()
+    );
+    assert_eq!(
+        recorded(leaves_section, "max_write_buffer_number"),
+        LEAF_WRITE_BUFFERS.to_string()
+    );
+    assert_eq!(
+        recorded(leaves_section, "max_bytes_for_level_base"),
+        LEAF_LEVEL_BASE.to_string()
+    );
+    assert_eq!(
+        recorded(frontier_section, "write_buffer_size"),
+        WRITE_BUFFER_SIZE.to_string()
+    );
+    assert_eq!(
+        recorded(history_section, "write_buffer_size"),
+        WRITE_BUFFER_SIZE.to_string()
+    );
     for section in [leaves_section, frontier_section, history_section] {
         assert_eq!(
             recorded(section, "compaction_style"),
             "kCompactionStyleLevel"
         );
+        assert_eq!(
+            recorded(section, "level_compaction_dynamic_level_bytes"),
+            "true"
+        );
     }
-    let table = |section: &str, option: &str| {
-        section
-            .lines()
-            .find_map(|line| line.trim().strip_prefix(option)?.strip_prefix('='))
-            .unwrap_or_else(|| panic!("the dump records {option}"))
-            .trim()
-            .to_owned()
-    };
     assert!(
-        table(leaves_section, "filter_policy").contains("bloomfilter"),
+        recorded(leaves_section, "filter_policy").contains("bloomfilter"),
         "leaves carry bloom filters"
     );
-    assert_eq!(table(leaves_section, "whole_key_filtering"), "false");
-    assert_eq!(table(frontier_section, "filter_policy"), "nullptr");
+    assert_eq!(recorded(leaves_section, "whole_key_filtering"), "false");
+    assert_eq!(recorded(frontier_section, "filter_policy"), "nullptr");
 
     if cfg!(target_os = "linux") {
         let low = std::fs::read_dir("/proc/self/task")

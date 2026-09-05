@@ -70,7 +70,9 @@ impl Lcg {
     }
 }
 
-/// Decoding the 200K planted rows below would be ~27 MB; a bounded open is kilobytes.
+/// Decoding the 200K planted rows below would be ~27 MB; a bounded open is kilobytes. The
+/// trees below open without the scan floor, whose 26 levels are a 4.4 GB reservation by
+/// policy (lazily resident) rather than a read of anything.
 const PEAK_LIMIT: usize = 8 * 1024 * 1024;
 
 #[test]
@@ -83,7 +85,8 @@ fn opening_reads_only_the_frontier_level() {
         .collect();
     let root = {
         let mut tree =
-            RocksFrontierMPT::open(&path, RocksFrontierConfig::default()).expect("create tree");
+            RocksFrontierMPT::open(&path, RocksFrontierConfig::default().with_scan_floor(0))
+                .expect("create tree");
         tree.batch_upsert(&entries);
         assert!(
             tree.frontier_depth() >= 1,
@@ -103,7 +106,8 @@ fn opening_reads_only_the_frontier_level() {
     }
 
     let (tree, peak) = peak_during(|| {
-        RocksFrontierMPT::open(&path, RocksFrontierConfig::default()).expect("reopen tree")
+        RocksFrontierMPT::open(&path, RocksFrontierConfig::default().with_scan_floor(0))
+            .expect("reopen tree")
     });
     assert_eq!(
         tree.get_root_hash(),
@@ -133,7 +137,8 @@ fn opening_a_frontierless_database_allocates_next_to_nothing() {
     }
 
     let (tree, peak) = peak_during(|| {
-        RocksFrontierMPT::open(&path, RocksFrontierConfig::default()).expect("recover tree")
+        RocksFrontierMPT::open(&path, RocksFrontierConfig::default().with_scan_floor(0))
+            .expect("recover tree")
     });
     assert_eq!(tree.get_leaf_value(key), Some(value));
     assert_eq!(tree.get_history(key), [jellyfish_rs::Record::first(value)]);

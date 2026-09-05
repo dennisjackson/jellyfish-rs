@@ -155,7 +155,17 @@ const LEAF_BLOOM_BITS: f64 = 10.0;
 const HISTORY_BLOCK_CACHE_SIZE: usize = 64 * 1024 * 1024;
 
 /// Leaf rows per data block: the granularity every scan is charged at (DESIGN.md, Representation).
-pub(crate) const LEAVES_PER_BLOCK: u64 = (BLOCK_SIZE / (NODE_KEY_LEN + LEAF_RECORD_LEN)) as u64;
+pub(crate) const LEAVES_PER_BLOCK: u64 = (BLOCK_SIZE / (LEAF_KEY_LEN + LEAF_RECORD_LEN)) as u64;
+
+/// The leaf column family's LSM shape. With dynamic level sizing the number of populated
+/// levels is about log10(data / base): at 44 GB of leaves a 256 MB base gave four (L3–L6),
+/// each a bloom probe and often a block per scan and each a rewrite per byte compacted; a
+/// 2 GB base gives two. L0 is kept at about the base size so the L0→base compaction stays
+/// cheap: bigger memtables, and enough of them that a 512 MB flush cannot stall writes
+/// (HASHCHAINS.md, Cost).
+const LEAF_LEVEL_BASE: u64 = 2 * 1024 * 1024 * 1024;
+const LEAF_WRITE_BUFFER_SIZE: usize = 512 * 1024 * 1024;
+const LEAF_WRITE_BUFFERS: i32 = 4;
 
 /// Sampled metrics and the tickers each sums.
 const TICKER_METRICS: [(Metric, &[Ticker]); 3] = [
@@ -268,7 +278,7 @@ impl RocksStorage {
     /// node batch.
     pub fn commit_metadata(&self, leaf_count: u64, frontier_depth: u16) -> RocksResult<()> {
         let mut batch = WriteBatch::default();
-        put_metadata(&mut batch, leaf_count, frontier_depth);
+        put_metadata(&mut batch, self.frontier(), leaf_count, frontier_depth);
         self.db.write(batch)?;
         Ok(())
     }
@@ -280,13 +290,19 @@ impl RocksStorage {
         leaf_count: u64,
         frontier_depth: u16,
     ) -> RocksResult<()> {
-        put_metadata(&mut batch.batch, leaf_count, frontier_depth);
+        put_metadata(
+            &mut batch.batch,
+            self.frontier(),
+            leaf_count,
+            frontier_depth,
+        );
         self.write_batch(batch)
     }
 
     /// `(leaf_count, frontier_depth)`, or `None` if no batch ever committed. The three
     /// metadata records commit together, so some without the others is refused, and a
-    /// count and depth without a format version is a v4 database.
+    /// count and depth without a format version is a v4 database. Formats up to v6 kept the
+    /// metadata in the leaf column family; finding it there names the format.
     pub fn read_metadata(&self) -> RocksResult<Option<(u64, u16)>> {
         fn fixed<const N: usize>(
             raw: Option<rocksdb::DBPinnableSlice<'_>>,
@@ -302,12 +318,34 @@ impl RocksStorage {
             })
             .transpose()
         }
-        let count = fixed::<8>(self.db.get_pinned(LEAF_COUNT_KEY)?, "the leaf count")?;
+        if let Some(legacy) = self.db.get_pinned(FORMAT_KEY)? {
+            let format = fixed::<2>(Some(legacy), "the format version")?.expect("present");
+            return Err(RocksStorageError::corrupt(format!(
+                "the database is format v{}, whose metadata sits among the leaves; this \
+                 build reads format v{FORMAT_VERSION}. Rebuild the database",
+                u16::from_be_bytes(format)
+            )));
+        }
+        if self.db.get_pinned(LEAF_COUNT_KEY)?.is_some() {
+            return Err(RocksStorageError::corrupt(format!(
+                "the database is format v4 (bare 32-byte leaf values, metadata among the \
+                 leaves); this build reads format v{FORMAT_VERSION}. Open it with a build at \
+                 commit 7f87873, or rebuild"
+            )));
+        }
+        let frontier = self.frontier();
+        let count = fixed::<8>(
+            self.db.get_pinned_cf(frontier, LEAF_COUNT_KEY)?,
+            "the leaf count",
+        )?;
         let depth = fixed::<2>(
-            self.db.get_pinned(COMPLETE_DEPTH_KEY)?,
+            self.db.get_pinned_cf(frontier, COMPLETE_DEPTH_KEY)?,
             "the frontier depth",
         )?;
-        let format = fixed::<2>(self.db.get_pinned(FORMAT_KEY)?, "the format version")?;
+        let format = fixed::<2>(
+            self.db.get_pinned_cf(frontier, FORMAT_KEY)?,
+            "the format version",
+        )?;
         match (count, depth, format) {
             (None, None, None) => Ok(None),
             (Some(count), Some(depth), Some(format)) => {
@@ -399,11 +437,12 @@ impl RocksStorage {
         Ok(count)
     }
 
-    /// The leaf scan. The upper bound is `256 ‖ successor` (or `257`), so every key returned
-    /// is a leaf key under `prefix` and bytes `2..34` are the leaf's key. A key of another
-    /// length in the range is corrupt: skipping it would silently hash a prefix of the leaves.
-    /// Under a prefix of at least [`LEAF_PREFIX_BITS`] bits every key in range shares the
-    /// bloom prefix, so the seek may consult the filters; shallower scans seek in total order.
+    /// The leaf scan. The upper bound is the successor's leaf key, or none for the root and
+    /// all-ones prefixes, since the column family holds nothing but leaves; so every key
+    /// returned is a leaf key under `prefix`. A key of another shape is corrupt: skipping it
+    /// would silently hash a prefix of the leaves. Under a prefix of at least
+    /// [`LEAF_PREFIX_BITS`] bits every key in range shares the bloom prefix, so the seek may
+    /// consult the filters; shallower scans seek in total order.
     fn for_each_leaf_record<F>(&self, prefix: &Prefix, mut f: F) -> RocksResult<()>
     where
         F: FnMut(Key, &[u8]) -> RocksResult<()>,
@@ -411,26 +450,16 @@ impl RocksStorage {
         let (start_key, end_key) = leaf_scan_range(prefix);
 
         let mut read_opts = ReadOptions::default();
-        read_opts.set_iterate_upper_bound(end_key);
+        if let Some(end_key) = end_key {
+            read_opts.set_iterate_upper_bound(end_key.to_vec());
+        }
         read_opts.set_total_order_seek(prefix.length() < LEAF_PREFIX_BITS);
 
         let mode = IteratorMode::From(start_key.as_slice(), Direction::Forward);
 
         for entry in self.db.iterator_opt(mode, read_opts) {
             let (key, value) = entry?;
-            if key.len() != NODE_KEY_LEN {
-                return Err(RocksStorageError::corrupt(format!(
-                    "a {}-byte key sits inside the leaf range; node keys are {NODE_KEY_LEN} \
-                     bytes and nothing this tree writes puts another key there",
-                    key.len()
-                )));
-            }
-            debug_assert_eq!(
-                &key[..2],
-                256u16.to_be_bytes(),
-                "the bound admits only leaf keys"
-            );
-            let leaf = Key(key[2..].try_into().expect("34-byte key"));
+            let leaf = decode_leaf_key(key.as_ref())?;
             debug_assert!(
                 prefix.contains(&leaf),
                 "the bound admits only keys under the scanned prefix"
@@ -624,6 +653,9 @@ impl RocksStorage {
 fn leaf_options(base: &Options, cache: &Cache) -> Options {
     let mut options = base.clone();
     options.set_prefix_extractor(SliceTransform::create_fixed_prefix(LEAF_PREFIX_LEN));
+    options.set_max_bytes_for_level_base(LEAF_LEVEL_BASE);
+    options.set_write_buffer_size(LEAF_WRITE_BUFFER_SIZE);
+    options.set_max_write_buffer_number(LEAF_WRITE_BUFFERS);
     let mut block_options = BlockBasedOptions::default();
     block_options.set_block_cache(cache);
     block_options.set_bloom_filter(LEAF_BLOOM_BITS, false);
@@ -646,10 +678,10 @@ fn history_options(base: &Options) -> Options {
     options
 }
 
-fn put_metadata(batch: &mut WriteBatch, leaf_count: u64, frontier_depth: u16) {
-    batch.put(LEAF_COUNT_KEY, leaf_count.to_be_bytes());
-    batch.put(COMPLETE_DEPTH_KEY, frontier_depth.to_be_bytes());
-    batch.put(FORMAT_KEY, FORMAT_VERSION.to_be_bytes());
+fn put_metadata(batch: &mut WriteBatch, cf: &ColumnFamily, leaf_count: u64, frontier_depth: u16) {
+    batch.put_cf(cf, LEAF_COUNT_KEY, leaf_count.to_be_bytes());
+    batch.put_cf(cf, COMPLETE_DEPTH_KEY, frontier_depth.to_be_bytes());
+    batch.put_cf(cf, FORMAT_KEY, FORMAT_VERSION.to_be_bytes());
 }
 
 #[derive(Default)]

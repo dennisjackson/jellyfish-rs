@@ -25,8 +25,8 @@ mod tests;
 
 use levels::{Levels, Position, Slot, levels_bytes};
 use storage::{
-    LEAVES_PER_BLOCK, LeafRow, RocksResult, RocksStorage, RocksStorageError, RocksWriteBatch,
-    Version,
+    LEAF_PREFIX_BITS, LEAVES_PER_BLOCK, LeafRow, RocksResult, RocksStorage, RocksStorageError,
+    RocksWriteBatch, Version,
 };
 
 /// A ceiling on the tree top held in memory and the deepest frontier to persist. Both are
@@ -37,6 +37,11 @@ pub struct RocksFrontierConfig {
     frontier_cap: u16,
     /// [`LEAVES_PER_BLOCK`]; 1 in tests, so a few hundred leaves exercise every level rule.
     leaves_per_block: u64,
+    /// Levels held whatever the tree's size, so that every subtree scan starts at least this
+    /// deep: at [`LEAF_PREFIX_BITS`] the scan's prefix is the bloom filters' prefix and each
+    /// sorted run without a leaf under it is skipped (HASHCHAINS.md, Database Schema). Zero
+    /// in tests, where the levels must follow the tree.
+    scan_floor: u16,
 }
 
 impl Default for RocksFrontierConfig {
@@ -74,7 +79,21 @@ impl RocksFrontierConfig {
             max_depth,
             frontier_cap,
             leaves_per_block: LEAVES_PER_BLOCK,
+            scan_floor: LEAF_PREFIX_BITS.min(max_depth),
         }
+    }
+
+    /// Hold at least `depth` levels from the start (see `scan_floor`). Zero lets the levels
+    /// follow the tree alone, which is what the memory tests measure. Panics past
+    /// `max_depth`.
+    pub fn with_scan_floor(mut self, depth: u16) -> Self {
+        assert!(
+            depth <= self.max_depth,
+            "a scan floor at {depth} exceeds the max_depth of {}",
+            self.max_depth
+        );
+        self.scan_floor = depth;
+        self
     }
 
     fn frontier_cap(&self) -> u16 {
@@ -82,22 +101,24 @@ impl RocksFrontierConfig {
     }
 
     /// Deepest level to hold: the frontier's children, plus the gate level while the frontier
-    /// can still advance, or the block floor if deeper, capped at `max_depth`. Monotone in
-    /// both arguments: the levels never shrink.
+    /// can still advance, or the block floor if deeper, capped at `max_depth`; never above
+    /// the scan floor. Monotone in both arguments: the levels never shrink.
     fn deepest_level(&self, frontier_depth: u16, leaves: u64) -> u16 {
         let gate = if frontier_depth < self.frontier_cap {
             2
         } else {
             1
         };
-        (frontier_depth + gate).max(block_floor(leaves, self.leaves_per_block).min(self.max_depth))
+        (frontier_depth + gate)
+            .max(block_floor(leaves, self.leaves_per_block).min(self.max_depth))
+            .max(self.scan_floor)
     }
 
     #[cfg(test)]
     pub fn test_config() -> Self {
         Self {
             leaves_per_block: 1,
-            ..Self::with_depths(6, 4)
+            ..Self::with_depths(6, 4).with_scan_floor(0)
         }
     }
 }

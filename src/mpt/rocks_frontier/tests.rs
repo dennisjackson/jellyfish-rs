@@ -5,8 +5,8 @@
 
 use super::levels::Slot;
 use super::storage::{
-    FORMAT_VERSION, FRONTIER_RECORD_LEN, HISTORY_KEY_LEN, HISTORY_RECORD_LEN, LEAF_RECORD_LEN,
-    NODE_KEY_LEN,
+    FORMAT_VERSION, FRONTIER_RECORD_LEN, HISTORY_KEY_LEN, HISTORY_RECORD_LEN, LEAF_KEY_LEN,
+    LEAF_RECORD_LEN, NODE_KEY_LEN,
 };
 use super::*;
 use crate::census::Metric;
@@ -303,7 +303,7 @@ fn a_tree_matches_the_oracle_through_growth_advances_reopens_and_cold_batches() 
     assert_eq!(census[Metric::InteriorPuts], touched);
     assert_eq!(
         census[Metric::BytesStaged],
-        200 * (NODE_KEY_LEN + LEAF_RECORD_LEN) as u64
+        200 * (LEAF_KEY_LEN + LEAF_RECORD_LEN) as u64
             + 200 * (HISTORY_KEY_LEN + HISTORY_RECORD_LEN) as u64
             + touched * (NODE_KEY_LEN + FRONTIER_RECORD_LEN) as u64
     );
@@ -408,7 +408,13 @@ fn every_batch_shape_survives_a_reopen() {
             .map(|&p| (key(p << 5), random_value()))
             .collect();
         for batch in [1, entries.len()] {
-            shapes.push((entries.clone(), batch, RocksFrontierConfig::default()));
+            // The production depths; the scan floor would hold 26 levels regardless of the
+            // tree, which is not what these shapes exercise.
+            shapes.push((
+                entries.clone(),
+                batch,
+                RocksFrontierConfig::default().with_scan_floor(0),
+            ));
         }
     }
 
@@ -518,7 +524,7 @@ fn a_key_written_many_times_carries_every_version_in_order() {
 /// the slots across it (via the model's check), and a known position stays known.
 #[test]
 fn the_levels_stay_counted_and_never_forget_across_batches_advances_and_a_reopen() {
-    let config = RocksFrontierConfig::with_max_depth(9);
+    let config = RocksFrontierConfig::with_max_depth(9).with_scan_floor(0);
     let path = fresh_dir().join("counts.db");
     let mut model = Model::default();
     let mut rng = TestRng::seed(0xC0117);
@@ -600,11 +606,21 @@ fn the_open_refuses_everything_outside_the_format_and_loads_a_whole_level() {
 
     let err = plant("future", &|s| {
         s.write_frontier_rows(&[row(1, 0), row(1, 1)]).unwrap();
-        s.plant_v4_metadata(2, 1).unwrap();
+        s.commit_metadata(2, 1).unwrap();
         s.plant_format_version(FORMAT_VERSION + 1).unwrap();
     });
     assert!(
         err.contains(&format!("format v{}", FORMAT_VERSION + 1)),
+        "{err}"
+    );
+
+    // Formats v5 and v6 kept the metadata among the leaves.
+    let err = plant("v6", &|s| {
+        s.write_frontier_rows(&[row(1, 0), row(1, 1)]).unwrap();
+        s.plant_legacy_format_version(6).unwrap();
+    });
+    assert!(
+        err.contains("format v6") && err.contains("among the leaves"),
         "{err}"
     );
 
@@ -630,15 +646,13 @@ fn the_open_refuses_everything_outside_the_format_and_loads_a_whole_level() {
         ("v3.db", [&[2u8][..], &[0x5Au8; 32][..]].concat(), "got 33"),
         ("v4.db", vec![0x5Au8; 32], "format v4"),
         ("v5.db", vec![0x5Au8; 72], "format v5"),
+        ("v6.db", vec![0x5Au8; 48], "format v6"),
     ] {
         let path = fresh_dir().join(name);
         {
             let storage = RocksStorage::open(&path).expect("open storage");
             storage
-                .plant_raw(
-                    &[&256u16.to_be_bytes()[..], &[7u8; 32][..]].concat(),
-                    &record,
-                )
+                .plant_raw_leaf(&Key([7u8; 32]), &record)
                 .expect("plant record");
             storage.flush().expect("flush wal");
         }
@@ -712,9 +726,9 @@ fn the_frontier_advances_to_the_deepest_complete_level_within_the_cap() {
     // Top five bits enumerate 0..32: depths 0..=4 complete, depth 5 one leaf per position.
     let entries: Vec<Entry> = (0..32u8).map(|i| (key(i << 3), Value([i; 32]))).collect();
     for (config, expected) in [
-        (RocksFrontierConfig::default(), 4),
+        (RocksFrontierConfig::default().with_scan_floor(0), 4),
         (RocksFrontierConfig::test_config(), 4),
-        (RocksFrontierConfig::with_max_depth(5), 3),
+        (RocksFrontierConfig::with_max_depth(5).with_scan_floor(0), 3),
     ] {
         let mut tree = RocksFrontierMPT::open(fresh_dir(), config).expect("create tree");
         let mut model = Model::default();
@@ -753,8 +767,8 @@ fn the_tree_top_follows_the_block_floor_up_to_the_budget() {
         );
     }
 
-    // 82 bytes a leaf row: 49 to a 4 KiB block (HASHCHAINS.md, Database Schema).
-    assert_eq!(LEAVES_PER_BLOCK, 49);
+    // 77 bytes a leaf row: 53 to a 4 KiB block (HASHCHAINS.md, Database Schema).
+    assert_eq!(LEAVES_PER_BLOCK, 53);
     for (leaves, expected) in [
         (0, 0),
         (LEAVES_PER_BLOCK, 0),
@@ -770,12 +784,14 @@ fn the_tree_top_follows_the_block_floor_up_to_the_budget() {
         );
     }
 
-    // At a billion leaves the production ceiling does not bind; a higher ceiling buys the
-    // gate level and nothing more.
-    let production = RocksFrontierConfig::with_max_depth(26);
+    // Without the scan floor, at a billion leaves the production ceiling does not bind and a
+    // higher ceiling buys the gate level and nothing more.
+    let production = RocksFrontierConfig::with_max_depth(26).with_scan_floor(0);
     assert_eq!(production.deepest_level(24, 1_000_000_000), 25);
     assert_eq!(
-        RocksFrontierConfig::with_max_depth(28).deepest_level(24, 1_000_000_000),
+        RocksFrontierConfig::with_max_depth(28)
+            .with_scan_floor(0)
+            .deepest_level(24, 1_000_000_000),
         26
     );
 
@@ -796,6 +812,24 @@ fn the_tree_top_follows_the_block_floor_up_to_the_budget() {
     assert!(catch_unwind(|| RocksFrontierConfig::with_depths(9, 9)).is_err());
     assert_eq!(RocksFrontierConfig::with_depths(9, 8).frontier_cap(), 8);
     assert_eq!(RocksFrontierConfig::with_depths(28, 4).frontier_cap(), 4);
+
+    // The scan floor holds the bloom prefix depth from the first batch, within the budget.
+    let production = RocksFrontierConfig::default();
+    assert_eq!(production.deepest_level(0, 0), 26);
+    assert_eq!(production.deepest_level(24, 1_000_000_000), 26);
+    assert_eq!(production.with_scan_floor(0).deepest_level(0, 0), 2);
+    assert_eq!(
+        RocksFrontierConfig::with_max_depth(9).deepest_level(0, 0),
+        9,
+        "the floor is capped at the budget"
+    );
+    assert_eq!(
+        RocksFrontierConfig::with_max_depth(28)
+            .with_scan_floor(27)
+            .deepest_level(0, 0),
+        27
+    );
+    assert!(catch_unwind(|| RocksFrontierConfig::with_max_depth(9).with_scan_floor(10)).is_err());
     assert_eq!(
         levels::levels_bytes(0),
         33,
@@ -1005,7 +1039,7 @@ fn a_torn_commit_leaves_the_rows_agreeing_with_the_leaves_and_their_history() {
 /// cache, and the tree top always holds the levels the gate reads.
 #[test]
 fn a_wrong_leaf_count_does_not_stall_the_frontier() {
-    let config = RocksFrontierConfig::with_max_depth(9);
+    let config = RocksFrontierConfig::with_max_depth(9).with_scan_floor(0);
     let path = fresh_dir().join("count.db");
     let mut model = Model::default();
     let mut tree = RocksFrontierMPT::open(&path, config).expect("create tree");
@@ -1058,7 +1092,7 @@ fn a_wrong_leaf_count_does_not_stall_the_frontier() {
 /// the window each of these pool sizes once double-counted.
 #[test]
 fn a_frontier_level_loads_under_any_thread_count() {
-    let config = RocksFrontierConfig::with_max_depth(9);
+    let config = RocksFrontierConfig::with_max_depth(9).with_scan_floor(0);
     let path = fresh_dir().join("pools.db");
     // Top seven bits enumerate 0..128: depth 6 complete, depth 7 leaves.
     let entries: Vec<Entry> = (0..128u8).map(|i| (key(i << 1), Value([i; 32]))).collect();
@@ -1086,7 +1120,7 @@ fn a_frontier_level_loads_under_any_thread_count() {
 /// whole, orphan rows of the next level are ignored, and the next batch finishes the advance.
 #[test]
 fn a_crash_inside_an_advance_leaves_an_openable_database() {
-    let config = RocksFrontierConfig::with_max_depth(9);
+    let config = RocksFrontierConfig::with_max_depth(9).with_scan_floor(0);
     let path = fresh_dir().join("advance.db");
     let mut model = Model::default();
     let mut tree = RocksFrontierMPT::open(&path, config).expect("create tree");
@@ -1156,9 +1190,9 @@ fn a_tree_whose_batch_panicked_refuses_further_use() {
     let (&existing, _) = model.contents.iter().next().expect("contents");
     let mut beside = existing.0;
     beside[31] ^= 1;
-    let corrupt_key = [&256u16.to_be_bytes()[..], &beside[..]].concat();
+    let beside = Key(beside);
     tree.storage
-        .plant_raw(&corrupt_key, &[&[2u8][..], &[0x5A; 32][..]].concat())
+        .plant_raw_leaf(&beside, &[&[2u8][..], &[0x5A; 32][..]].concat())
         .expect("plant a corrupt record");
 
     let message = |panic: Box<dyn std::any::Any + Send>| -> String {
@@ -1179,7 +1213,7 @@ fn a_tree_whose_batch_panicked_refuses_further_use() {
     assert!(catch_unwind(AssertUnwindSafe(|| tree.get_history(existing))).is_err());
 
     tree.storage
-        .delete_raw(&corrupt_key)
+        .delete_raw_leaf(&beside)
         .expect("clear the record");
     drop(tree);
     model.check(&open_test(&path).expect("reopen tree"));
