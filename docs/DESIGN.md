@@ -87,18 +87,21 @@ hash of the non-empty half otherwise. So the same arrays serve above and below t
 
 How far below the frontier to cache is decided by the storage medium rather than by a memory
 budget. Once the leaves under a position fit in one disk block, caching deeper reduces the
-leaves scanned but not the blocks read, and buys nothing. The arrays are sized so that the
-tree top is a few gigabytes at 10^9 leaves.
+leaves scanned but not the blocks read, and buys nothing on its own. The exception is the
+prefix bloom filters (HASHCHAINS.md): a scan whose prefix is at least the filters' 26 bits
+skips every sorted run that holds no leaf under it, so the tree top is held to depth 26 from
+the start. The arrays are then 4.4 GB, resident as positions are touched.
 
 **On disk.** The store is an ordered key-value store (RocksDB) with three column families.
-Leaves are keyed by `(256, key)`, so every leaf under a given prefix falls in one contiguous
-key range; a leaf's record is its Merkle hash, a pointer to the history row holding its
-value and link, and its version. Frontier nodes live in their own column family keyed by
-`(length, key)`, so a whole level is one contiguous range; a frontier node's record is its
-two child hashes. Every version of every leaf is a row in the history column family, keyed
-by write order (HASHCHAINS.md). Three small metadata records hold the frontier depth, the
-leaf count and the format version. Only leaves and the current frontier level are stored;
-interior nodes between them are recomputed.
+Leaves are keyed by the key (in an order-preserving encoding whose first 4 bytes are the
+key's first 26 bits, for the prefix bloom filters), so every leaf under a given prefix falls
+in one contiguous key range; a leaf's record is its Merkle hash, a pointer to the history row
+holding its value and link, and its version. Frontier nodes live in their own column family
+keyed by `(length, key)`, so a whole level is one contiguous range; a frontier node's record
+is its two child hashes. Every version of every leaf is a row in the history column family,
+keyed by write order (HASHCHAINS.md). Three small metadata records beside the frontier rows
+hold the frontier depth, the leaf count and the format version. Only leaves and the current
+frontier level are stored; interior nodes between them are recomputed.
 
 **Advancing the frontier.** As leaves are added, the level below the frontier fills. When
 every position at F+2 is hashed, level F+1 is written out as frontier nodes and F increases

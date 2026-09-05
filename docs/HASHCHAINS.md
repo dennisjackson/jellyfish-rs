@@ -119,48 +119,73 @@ can still be compared root for root.
 
 ## Database Schema
 
-Format version 6. Three column families; RocksDB write batches span them atomically, so the
-crash-safety argument below holds. v4 and v5 databases are refused at open with a message
-naming the version; there is no in-place migration (see Migration).
+Format version 7. Three column families; RocksDB write batches span them atomically, so the
+crash-safety argument below holds. Databases of formats 4 to 6 are refused at open with a
+message naming the version; there is no in-place migration (see Migration).
 
 The first implementation (v5) kept `value ‖ link ‖ version` in the leaf record and a
 second column family keyed by `key ‖ version`. It worked, and it was measured (see Cost): the
 leaf row on the scan path grew from 66 to 106 bytes, and history landed in random key order,
-so compaction rewrote it about ten times and competed with the leaves for the disk. v6 is the
-same chain with the storage laid out around those two measurements.
+so compaction rewrote it about ten times and competed with the leaves for the disk. v6 laid
+the storage out around those two measurements; v7 is v6 with the leaf column family reshaped
+around what the v6 billion-entry run measured in turn.
 
 ### Column family `default` — leaves
 
-Key `256_be_u16 ‖ key`, as before. The record holds no value:
+The key is the 32-byte key with its fourth byte spread over two:
 
 ```
-leaf record:  leaf_hash (32) ‖ head_seq_be_u64 (8) ‖ version_be_u64 (8)    48 bytes
+leaf key:     k[0..3] ‖ (k[3] & 0xC0) ‖ (k[3] & 0x3F) ‖ k[4..]                33 bytes
+leaf record:  leaf_hash (32) ‖ head_seq_be_u64 (8) ‖ version_be_u32 (4)      44 bytes
 ```
 
-The subtree rebuild needs each leaf's Merkle hash and nothing else, so that is what is
-stored; no untouched sibling is ever rehashed. `head_seq` names the history row holding the
-key's current record; `version` is how many records preceded it. An overwrite needs all three
-and reads nothing beyond the leaf row it already scanned: the new link *is* the stored hash,
-the new row's `prev` is `head_seq`, the new version is `version + 1`.
+Lexicographic order is unchanged. The split puts the key's first 26 bits into exactly 4
+bytes, which is what RocksDB's fixed-prefix extractor, and so the prefix bloom filters, can
+use; the extractor cannot mask bits. No length prefix, since the column family holds nothing
+but leaves.
 
-A leaf row is 82 bytes against 66 in v4 and 106 in v5, so `LEAVES_PER_BLOCK` is 49 (62 in
-v4, 38 in v5).
+The record holds no value. The subtree rebuild needs each leaf's Merkle hash and nothing
+else, so that is what is stored; no untouched sibling is ever rehashed. `head_seq` names the
+history row holding the key's current record; `version` is how many records preceded it, and
+32 bits of it are enough (the encoder refuses more rather than wrapping). An overwrite needs
+all three and reads nothing beyond the leaf row it already scanned: the new link *is* the
+stored hash, the new row's `prev` is `head_seq`, the new version is `version + 1`.
 
-The column family carries **prefix bloom filters** over the first 5 key bytes (the length
-and 24 bits of key), with whole-key filtering off. A subtree scan under a prefix of at least
-24 bits, which is every scan once the frontier passes 23, seeks in prefix mode: each sorted
-run's filter says whether it holds any leaf under the prefix before a data block is read
-from it. Scans under shorter prefixes seek in total order. Whole-key filters were measured to
-do nothing (DESIGN.md, Performance); they cannot serve a range scan. With 16 M distinct
-prefixes at most, the filters are small.
+A leaf row is 77 bytes against 66 in v4, 106 in v5 and 82 in v6, so `LEAVES_PER_BLOCK` is 53
+(62, 38, 49).
 
-### Column family `frontier` — the persisted level
+**Prefix bloom filters** over the first 4 key bytes, the key's first 26 bits, with whole-key
+filtering off. A subtree scan under a prefix of at least 26 bits seeks in prefix mode: each
+sorted run's filter says whether it holds any leaf under the prefix before a data block is
+read from it. To make every scan that deep, the tree top is held to depth 26 from the first
+batch (`RocksFrontierConfig`'s scan floor; 4.4 GB, resident as positions are touched), so a
+subtree scan covers about `leaves / 2^26` leaves and its prefix is the filters' prefix.
+Scans under shorter prefixes, which only happen with the floor lowered, seek in total order.
+Whole-key filters were measured to do nothing (DESIGN.md, Performance); they cannot serve a
+range scan. With 67 M distinct prefixes at most, the filters are small.
+
+Why 26 bits: the v6 run, with 24-bit prefixes and scans at depth 25, read 2.5 data blocks
+per scan for 13 leaves that fit in half a block. About 30 leaves share a 24-bit prefix at
+500 M leaves, so every populated level held one: L6 always, L5 (10% of the leaves) about 95%
+of the time, L3 and L4 (3%) about 60%. At 26 bits about 7 leaves share a prefix, so L5 is
+present about half the time and the small levels a fifth: about 1.8 blocks per scan. Going
+deeper costs RAM (each level doubles the tree top) and the extractor needs whole bytes, so
+26 was the point.
+
+**LSM shape.** Level base 2 GB, 512 MB memtables, four of them. With dynamic level sizing
+the number of populated levels is about log10(data / base): the v6 run's 44 GB of leaves sat
+in four levels (L3–L6) at write amplification 9.4, each level a bloom probe and often a block
+per scan; a 2 GB base gives two. L0 is kept at about the base size, as RocksDB advises, so
+the L0-to-base compaction is not the amplifier the larger base would otherwise make it.
+
+### Column family `frontier` — the persisted level and the metadata
 
 Key `length_be_u16 ‖ key`, record `left ‖ right` (64 bytes), exactly the v4 frontier row,
 in its own column family. Frontier rows are 0.99 puts per insert and were 48% of the bytes
 flushed into the node column family in v5, riding through leveled compaction with 100 GB of
 leaves although only 0.8 GB of them are live. Alone they are a shallow LSM that compacts
-almost for free.
+almost for free. The three metadata records live here too, since v7's leaf keys fill the
+leaf column family's key space; formats up to v6 kept them among the leaves.
 
 ### Column family `history` — every version
 
@@ -192,16 +217,17 @@ output would otherwise evict the blocks the scans want.
 ### Metadata
 
 ```
-__mpt_format__          u16 be, = 6
+__mpt_format__          u16 be, = 7      (in the frontier column family)
 __mpt_complete_depth__  unchanged
 __mpt_leaf_count__      unchanged
 ```
 
-Written with every metadata commit. Open refuses a database whose metadata has a count and
-a depth but no format key (a v4 database that had committed a batch), or a format key other
-than 6. A legacy database that never committed metadata is indistinguishable at open from a
-v6 one in the same state, since the open decodes no leaf; its first read refuses the 32- or
-72-byte record by name, exactly as v3 records are refused.
+Written with every metadata commit. Open refuses a database whose metadata sits among the
+leaves, naming v4 (count and depth, no format key) or the format key it finds there (v5,
+v6); and one whose format key in the frontier column family is not 7. A legacy database that
+never committed metadata is indistinguishable at open from a v7 one in the same state, since
+the open decodes no leaf; its first read refuses the 34-byte key or the 32-, 72- or 48-byte
+record by name, exactly as v3 records are refused.
 
 ## Updating the Representation
 
@@ -438,6 +464,25 @@ since main's tree has twice the leaves at equal entries, but v6's 164 k/s averag
 billion entries and 146 k/s past RAM sit inside main's range rather than 30–40% below it,
 which is where v5 sat. Leaf compaction (write amplification 9.4) is now the largest single
 cost and is shared with v4; the frontier rows' compaction is the next.
+
+**v7: 26-bit bloom prefixes, a two-level leaf LSM, 77-byte leaf rows** (2026-09-05,
+`tools/ab.py`, v6 is commit 8cde6f6). Building the 50 M references from empty: v6 235 k/s
+with 0.95 data blocks read per insert, v7 300 k/s with 0.23; same root. Then:
+
+| protocol | v6 | v7 |
+|---|---:|---:|
+| 2 M fresh inserts into the 50 M reference, cold cache, median of 3 | 191 k/s, 1.86 blocks/insert, p99 152 ms | **220 k/s** (+15%), 1.22 blocks/insert, p99 118 ms |
+| 10 M from empty, warm, median of 2 | 338 k/s | 310 k/s (−8%) |
+| peak RSS | 2.0 GB | 6.2 GB |
+
+The cold-cache case is the one that matters and it moved as the block model predicted:
+fewer blocks per scan (the reference is still small enough that most of the saving is the
+two-level shape rather than the narrower prefix), and 15.6 leaves read per insert against
+19.6 because scans start at depth 26. The from-empty case is slower because a 10 M-leaf
+tree does not need a 26-level tree top: the descent is five levels deeper than it would
+otherwise be and 4.4 GB of slots are touched for nothing. That cost is fixed while the read
+saving grows with the tree, so at a billion entries v7 should be ahead of v6 by more than
+15%; that run has not been done.
 
 ## Testing
 
