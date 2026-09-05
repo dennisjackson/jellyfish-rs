@@ -232,8 +232,10 @@ class Run:
         *pair* of them differences into the traffic over just the inserts between -- which is why
         the window slides here exactly as it does in `rates`, rather than taking consecutive
         records and hoping the cadence matches."""
-        fields = field.split("+")
-        if not all(f in c for c in self.census[:1] for f in fields):
+        # A summed series tolerates fields a log predates (history_puts, from the hashchains
+        # format): they count as zero, so old and new logs plot on one axis.
+        fields = [f for f in field.split("+") if all(f in c for c in self.census[:1])]
+        if not fields:
             return [], [], []
         out_leaves, out_elapsed, out_values = [], [], []
         left = 0
@@ -292,9 +294,10 @@ class Run:
 
 # name, log field(s) -- summed when joined by '+'
 CENSUS_FIELDS = [
-    ("puts", "leaf_puts+interior_puts"),
+    ("puts", "leaf_puts+interior_puts+history_puts"),
     ("leaf puts", "leaf_puts"),
     ("interior puts", "interior_puts"),
+    ("history puts", "history_puts"),
     ("subtree loads", "subtree_loads"),
     ("bytes staged", "bytes_staged"),
     ("write batches", "write_batches"),
@@ -465,8 +468,9 @@ def build_panels(runs, window_entries):
     # that one window flattens the whole rest of the run into a hairline.
     traffic = facet(
         "write", "Write cost per insert", "Operations per insert",
-        [("puts", ratio("leaf_puts+interior_puts")), ("leaf puts", ratio("leaf_puts")),
-         ("interior puts", ratio("interior_puts")), ("subtree loads", ratio("subtree_loads"))],
+        [("puts", ratio("leaf_puts+interior_puts+history_puts")),
+         ("leaf puts", ratio("leaf_puts")), ("interior puts", ratio("interior_puts")),
+         ("history puts", ratio("history_puts")), ("subtree loads", ratio("subtree_loads"))],
         note="The write-path headline: REVIEW.md tracks puts/insert 11.301 -> 2.556 -> 1.910. "
              "The spikes are frontier deepenings rewriting the tree top.", ylog=True)
     traffic += facet(

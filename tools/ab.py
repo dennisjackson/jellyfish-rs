@@ -257,15 +257,27 @@ def main():
               f"{s['peak_rss_gb'] or 0:>8.2f}"
               f"{s['sorted_runs'] or 0:>6.0f}{delta}")
 
-    # The correctness gate.
-    all_hashes = {h for s in summaries for h in s.get("root_hashes", [])}
+    # The correctness gate: every run of a variant ends at one root, and variants sharing a
+    # reference database share it. A variant with its own reference is a different format,
+    # whose root is expected to differ.
     print()
-    if len(all_hashes) == 1:
-        print(f"root hash agrees across all variants and runs: {next(iter(all_hashes))[:16]}...")
-    else:
-        print("!!! ROOT HASH MISMATCH - a variant computed a different tree:")
-        for s in summaries:
-            print(f"    {s['label']:<24} {s.get('root_hashes')}")
+    mismatch = False
+    by_ref = {}
+    for v, s in zip(variants, summaries):
+        hashes = s.get("root_hashes", [])
+        if len(hashes) > 1:
+            mismatch = True
+            print(f"!!! ROOT HASH MISMATCH within {v['label']}: {hashes}")
+        by_ref.setdefault(v["ref"] or args.ref, {})[v["label"]] = hashes
+    for ref, labels in by_ref.items():
+        all_hashes = {h for hashes in labels.values() for h in hashes}
+        if len(all_hashes) == 1:
+            print(f"root hash agrees across {', '.join(labels)}: {next(iter(all_hashes))[:16]}...")
+        elif len(all_hashes) > 1:
+            mismatch = True
+            print(f"!!! ROOT HASH MISMATCH over {ref} - a variant computed a different tree:")
+            for label, hashes in labels.items():
+                print(f"    {label:<24} {hashes}")
 
     if args.out:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
@@ -273,7 +285,7 @@ def main():
             json.dump({"config": vars(args), "runs": results, "summaries": summaries}, fh, indent=2)
         print(f"\nraw results -> {args.out}")
 
-    return 0 if len(all_hashes) <= 1 else 1
+    return 1 if mismatch else 0
 
 
 if __name__ == "__main__":

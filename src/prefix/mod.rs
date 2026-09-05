@@ -84,7 +84,56 @@ impl Key {
     }
 }
 
+/// What callers write: a key and its new value. The tree derives the [`Record`].
 pub type Entry = (Key, Value);
+
+/// What a leaf stores: the value and the link to the record it replaced (HASHCHAINS.md).
+/// Successive records under one key form a hash chain; the Merkle leaf hash covers both
+/// fields, so a root commits to every key's history.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct Record {
+    pub value: Value,
+    pub link: Digest,
+}
+
+impl Record {
+    /// The link of a key's first record.
+    pub const GENESIS_LINK: Digest = Digest([0u8; 32]);
+
+    /// A key's first record.
+    pub fn first(value: Value) -> Self {
+        Self {
+            value,
+            link: Self::GENESIS_LINK,
+        }
+    }
+
+    /// `H("leaf" ‖ key ‖ value ‖ link)`: the Merkle leaf hash, and the next record's link.
+    pub fn leaf_hash(&self, key: Key) -> Digest {
+        crate::hash::leaf(key, self)
+    }
+
+    /// The record that replaces `self` under `key` with `value`.
+    pub fn next(&self, key: Key, value: Value) -> Self {
+        Self {
+            value,
+            link: self.leaf_hash(key),
+        }
+    }
+
+    /// `history` is a valid chain for `key`: non-empty, starting at [`Self::GENESIS_LINK`],
+    /// every record linking to the leaf hash of the one before it.
+    pub fn verify_chain(key: Key, history: &[Record]) -> bool {
+        let Some((first, rest)) = history.split_first() else {
+            return false;
+        };
+        first.link == Self::GENESIS_LINK
+            && history
+                .iter()
+                .zip(rest)
+                .all(|(previous, record)| record.link == previous.leaf_hash(key))
+    }
+}
 
 /// Which child: 0 = left, 1 = right.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

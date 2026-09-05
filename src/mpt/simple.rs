@@ -1,21 +1,22 @@
 //! The oracle: single-key, in-memory, materialises every node. Deliberately a different
-//! algorithm from the production tree so the two cannot share a bug.
+//! algorithm from the production tree so the two cannot share a bug. Each key's chain is kept
+//! whole, so history reads can be checked too.
 
 use std::collections::HashMap;
 
-use crate::{Digest, Entry, Key, Prefix, Value, hash};
+use crate::{Digest, Entry, Key, Prefix, Record, Value, hash};
 
 #[derive(Clone, Debug)]
 pub struct LeafNode {
-    pub value: Value,
+    pub record: Record,
     pub merkle_hash: Digest,
 }
 
 impl LeafNode {
-    pub fn new(key: Key, value: Value) -> Self {
+    pub fn new(key: Key, record: Record) -> Self {
         Self {
-            value,
-            merkle_hash: hash::leaf(key, value),
+            record,
+            merkle_hash: hash::leaf(key, &record),
         }
     }
 }
@@ -63,6 +64,8 @@ impl Node {
 pub struct SimpleMPT {
     store: HashMap<Prefix, Node>,
     root: Option<Prefix>,
+    /// Every record written under each key, oldest first; the last is the leaf's.
+    history: HashMap<Key, Vec<Record>>,
 }
 
 impl SimpleMPT {
@@ -85,34 +88,55 @@ impl SimpleMPT {
     }
 
     pub fn get_leaf_value(&self, key: Key) -> Option<Value> {
-        match self.store.get(&Prefix::from(key)) {
-            Some(Node::Leaf(leaf)) => Some(leaf.value),
-            _ => None,
-        }
+        self.get_record(key).map(|(_, record)| record.value)
     }
 
+    pub fn get_record(&self, key: Key) -> Option<(u64, Record)> {
+        let chain = self.history.get(&key)?;
+        let leaf = match self.store.get(&Prefix::from(key)) {
+            Some(Node::Leaf(leaf)) => leaf,
+            _ => panic!("a key with a history has a leaf"),
+        };
+        assert_eq!(
+            chain.last(),
+            Some(&leaf.record),
+            "the leaf is the chain's head"
+        );
+        Some((chain.len() as u64 - 1, leaf.record))
+    }
+
+    pub fn get_history(&self, key: Key) -> Vec<Record> {
+        self.history.get(&key).cloned().unwrap_or_default()
+    }
+
+    /// One link: the record chains from the key's current record, if any.
     pub fn upsert(&mut self, key: Key, value: Value) {
+        let record = match self.history.get(&key).and_then(|chain| chain.last()) {
+            Some(previous) => previous.next(key, value),
+            None => Record::first(value),
+        };
+        self.history.entry(key).or_default().push(record);
         let root = self.root.unwrap_or_else(Prefix::root);
-        self.root = Some(self.recursive_upsert(root, key, value));
+        self.root = Some(self.recursive_upsert(root, key, record));
     }
 
-    fn recursive_upsert(&mut self, current_prefix: Prefix, key: Key, value: Value) -> Prefix {
+    fn recursive_upsert(&mut self, current_prefix: Prefix, key: Key, record: Record) -> Prefix {
         let key_prefix = Prefix::from(key);
         let Some(node) = self.store.get(&current_prefix).cloned() else {
             self.store
-                .insert(key_prefix, Node::Leaf(LeafNode::new(key, value)));
+                .insert(key_prefix, Node::Leaf(LeafNode::new(key, record)));
             return key_prefix;
         };
 
         match node {
             Node::Leaf(_) if current_prefix.key() == key => {
                 self.store
-                    .insert(current_prefix, Node::Leaf(LeafNode::new(key, value)));
+                    .insert(current_prefix, Node::Leaf(LeafNode::new(key, record)));
                 current_prefix
             }
-            Node::Leaf(leaf) => self.split(current_prefix, leaf.merkle_hash, key, value),
+            Node::Leaf(leaf) => self.split(current_prefix, leaf.merkle_hash, key, record),
             Node::Interior(interior) => {
-                self.recursive_interior_upsert(current_prefix, interior, key, value)
+                self.recursive_interior_upsert(current_prefix, interior, key, record)
             }
         }
     }
@@ -124,9 +148,9 @@ impl SimpleMPT {
         sibling_prefix: Prefix,
         sibling_hash: Digest,
         key: Key,
-        value: Value,
+        record: Record,
     ) -> Prefix {
-        let new_leaf = LeafNode::new(key, value);
+        let new_leaf = LeafNode::new(key, record);
         let new_prefix = Prefix::from(key);
         let split = Prefix::common_prefix(&sibling_prefix, &new_prefix);
 
@@ -159,21 +183,21 @@ impl SimpleMPT {
         interior_prefix: Prefix,
         interior: InteriorNode,
         key: Key,
-        value: Value,
+        record: Record,
     ) -> Prefix {
         if !interior_prefix.contains(&key) {
-            return self.split(interior_prefix, interior.merkle_hash, key, value);
+            return self.split(interior_prefix, interior.merkle_hash, key, record);
         }
 
         let goes_right = interior_prefix.key_goes_right(key);
         let (new_left, new_right) = if goes_right {
             (
                 interior.left,
-                self.recursive_upsert(interior.right, key, value),
+                self.recursive_upsert(interior.right, key, record),
             )
         } else {
             (
-                self.recursive_upsert(interior.left, key, value),
+                self.recursive_upsert(interior.left, key, record),
                 interior.right,
             )
         };

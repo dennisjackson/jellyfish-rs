@@ -10,17 +10,11 @@ pub(crate) use simple::SimpleMPT;
 pub mod rocks_frontier;
 pub use rocks_frontier::{RocksFrontierConfig, RocksFrontierMPT};
 
-/// Sort by key and deduplicate, last value wins.
-pub(crate) fn sorted_unique_entries(entries: &[Entry]) -> Vec<Entry> {
+/// Sort by key, keeping every occurrence of a key in slice order: each one is a link of the
+/// key's chain (HASHCHAINS.md). `sort_by_key` is stable.
+pub(crate) fn sorted_entries(entries: &[Entry]) -> Vec<Entry> {
     let mut sorted = entries.to_vec();
     sorted.sort_by_key(|(k, _)| *k);
-    sorted.dedup_by(|later, kept| {
-        let same_key = later.0 == kept.0;
-        if same_key {
-            kept.1 = later.1;
-        }
-        same_key
-    });
     sorted
 }
 

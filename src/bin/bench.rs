@@ -15,6 +15,8 @@ const DEFAULT_WINDOW_SIZE: usize = 100_000;
 const DEFAULT_BATCH_SIZE: usize = 10_000;
 
 const DEFAULT_MAX_DEPTH: u16 = RocksFrontierConfig::DEFAULT_MAX_DEPTH;
+/// Every entry a fresh key: the recorded protocol.
+const DEFAULT_UPDATE_FRACTION: f64 = 0.0;
 
 /// Appended inside the database directory, so a database carries its whole history.
 /// RocksDB ignores file names it does not recognise.
@@ -50,6 +52,8 @@ fn print_usage() {
          \x20 -l, --log-file <path>                Write the log here instead of with the database\n\
          \x20 -n, --max-entries <n>                Stop after inserting n entries (fixed-work A/B)\n\
          \x20 -s, --seed <u64>                     Key-stream seed (default: random; recorded in report and log)\n\
+         \x20 -u, --update-fraction <f>            Fraction of entries that overwrite a key already inserted,\n\
+         \x20                                      chosen uniformly over them (default: {DEFAULT_UPDATE_FRACTION})\n\
          \x20     --census-from <n>                Reset the write census once n entries are in\n\
          \x20     --max-depth <n>                  Ceiling on the tree-top level held in RAM (default\n\
          \x20                                      {DEFAULT_MAX_DEPTH}, max 28); the depth actually held\n\
@@ -83,6 +87,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut seed = random_seed();
     let mut max_depth: u16 = RocksFrontierConfig::DEFAULT_MAX_DEPTH;
     let mut frontier_cap: Option<u16> = None;
+    let mut update_fraction = DEFAULT_UPDATE_FRACTION;
     let mut positional_args = Vec::new();
     let mut args = env::args().skip(1);
 
@@ -115,6 +120,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             "--frontier-cap" => {
                 frontier_cap = Some(flag_value(&mut args, &arg)?);
+            }
+            "--update-fraction" | "-u" => {
+                update_fraction = flag_value(&mut args, &arg)?;
             }
             "--timeout" | "-t" => {
                 timeout_secs = flag_value(&mut args, &arg)?;
@@ -157,6 +165,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if timeout_secs <= 0.0 {
         return Err("--timeout must be positive".into());
     }
+    if !(0.0..=1.0).contains(&update_fraction) {
+        return Err("--update-fraction must be in 0..=1".into());
+    }
     let config = match frontier_cap {
         Some(cap) => RocksFrontierConfig::with_depths(max_depth, cap),
         None => RocksFrontierConfig::with_max_depth(max_depth),
@@ -172,7 +183,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let init_secs = init_start.elapsed().as_secs_f64();
 
     info!(
-        "Benchmarking: backend=rocks, timeout={timeout_secs}s, window_size={}, batch_size={}",
+        "Benchmarking: backend=rocks, timeout={timeout_secs}s, window_size={}, batch_size={}, \
+         update_fraction={update_fraction}",
         human_count(window_size),
         human_count(batch_size)
     );
@@ -186,7 +198,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             w,
             "{{\"kind\":\"run\",\"started\":{:.3},\"seed\":{seed},\"window_size\":{window_size},\
              \"batch_size\":{batch_size},\"max_depth\":{max_depth},\
-             \"frontier_cap\":{frontier_cap},\"db\":{},\"leaves_at_open\":{},\
+             \"frontier_cap\":{frontier_cap},\"update_fraction\":{update_fraction},\
+             \"db\":{},\"leaves_at_open\":{},\
              \"frontier_at_open\":{},\"levels_depth_at_open\":{}}}",
             unix_now(),
             json_string(db_path),
@@ -202,7 +215,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut window_count = 0usize;
     let mut batch_times: Vec<f64> = Vec::new();
     // The census covers the insert loop only, not the open.
-    let mut rng = KeyStream::with_seed(seed);
+    let mut workload = Workload::new(seed, update_fraction);
     tree.census_reset();
     let mut census_base = CensusSnapshot::default();
     let mut census_base_entries = 0usize;
@@ -219,9 +232,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             break;
         }
 
-        let mut entries = generate_entries(&mut rng, window_size);
-        // Sorted windows are the recorded protocol.
-        entries.sort_unstable_by_key(|a| a.0);
+        let mut entries = workload.window(window_size);
+        // Sorted windows are the recorded protocol. Stable, so the occurrences of a key
+        // updated more than once in a window keep their order, and an update follows the
+        // fresh insert it overwrites.
+        entries.sort_by_key(|a| a.0);
         window_count += 1;
 
         for chunk in entries.chunks(batch_size) {
@@ -321,6 +336,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         "Inserted:           {} entries",
         human_count(total_inserted)
     );
+    if update_fraction > 0.0 {
+        let fresh = total_inserted.saturating_sub(workload.updates_generated());
+        eprintln!(
+            "Updates:            {} of them overwrote an existing key ({} fresh; \
+             --update-fraction {update_fraction})",
+            human_count(total_inserted - fresh),
+            human_count(fresh)
+        );
+    }
     eprintln!("Insert time:        {insert_secs:.3} s");
     eprintln!("Throughput:         {throughput:.1} entries/s");
     eprintln!("Windows processed:  {window_count}");
@@ -415,14 +439,15 @@ fn write_census_record(
         "{{\"kind\":\"census\",\"timestamp\":{:.3},\"elapsed_secs\":{elapsed_secs:.6},\
          \"total_inserted\":{total_inserted},\"leaf_count\":{},\"frontier_depth\":{},\
          \"levels_depth\":{},\"entries\":{entries},\"leaf_puts\":{},\"interior_puts\":{},\
-         \"bytes_staged\":{},\"write_batches\":{},\"subtree_loads\":{},\"leaves_read\":{},\
-         \"data_blocks_read\":{},\"index_blocks_read\":{},\"seeks\":{}}}",
+         \"history_puts\":{},\"bytes_staged\":{},\"write_batches\":{},\"subtree_loads\":{},\
+         \"leaves_read\":{},\"data_blocks_read\":{},\"index_blocks_read\":{},\"seeks\":{}}}",
         unix_now(),
         tree.leaf_count(),
         tree.frontier_depth(),
         tree.levels_depth(),
         census[Metric::LeafPuts],
         census[Metric::InteriorPuts],
+        census[Metric::HistoryPuts],
         census[Metric::BytesStaged],
         census[Metric::BatchesCommitted],
         census[Metric::SubtreeLoads],
@@ -444,10 +469,11 @@ fn print_census(census: &CensusSnapshot, entries: usize) {
     eprintln!();
     eprintln!("--- Write census ({} entries) ---", human_count(entries));
     eprintln!(
-        "  puts/insert:            {:.3}  ({:.3} leaf + {:.3} interior)",
+        "  puts/insert:            {:.3}  ({:.3} leaf + {:.3} interior + {:.3} history)",
         per_insert(census.total_puts()),
         per_insert(census[Metric::LeafPuts]),
-        per_insert(census[Metric::InteriorPuts])
+        per_insert(census[Metric::InteriorPuts]),
+        per_insert(census[Metric::HistoryPuts])
     );
     eprintln!(
         "  bytes staged/insert:    {:.1}",
@@ -657,18 +683,66 @@ fn ensure_parent(path_str: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// `count` uniform key/value pairs. The generator is threaded through the run, so a run is a
-/// function of the seed and the entry count alone.
-fn generate_entries(rng: &mut KeyStream, count: usize) -> Vec<Entry> {
-    let mut vec = Vec::with_capacity(count);
-    for _ in 0..count {
-        let mut key = [0u8; 32];
-        rng.fill(&mut key);
-        let mut value = [0u8; 32];
-        rng.fill(&mut value);
-        vec.push((Key(key), Value(value)));
+/// The entry stream. Fresh entries come from one key stream, drawn sequentially, so with no
+/// updates a run is a function of the seed and the entry count alone, exactly as recorded.
+/// An update overwrites a fresh key already generated, chosen uniformly over all of them: the
+/// stream's state is a counter, so the `i`th fresh key is re-derived in O(1) rather than kept
+/// (a billion keys would not fit). The choice of slot and key and the new value come from two
+/// further streams, so they never disturb the fresh stream.
+struct Workload {
+    seed: u64,
+    fresh: KeyStream,
+    fresh_generated: u64,
+    update_fraction: f64,
+    chooser: KeyStream,
+    update_values: KeyStream,
+    updates_generated: u64,
+}
+
+impl Workload {
+    fn new(seed: u64, update_fraction: f64) -> Self {
+        Self {
+            seed,
+            fresh: KeyStream::with_seed(seed),
+            fresh_generated: 0,
+            update_fraction,
+            chooser: KeyStream::with_seed(seed ^ 0x7570_6461_7465_7321), // "update!"
+            update_values: KeyStream::with_seed(seed ^ 0x7661_6c75_6573_2121), // "values!!"
+            updates_generated: 0,
+        }
     }
-    vec
+
+    fn updates_generated(&self) -> usize {
+        usize::try_from(self.updates_generated).unwrap_or(usize::MAX)
+    }
+
+    /// `count` entries in generation order.
+    fn window(&mut self, count: usize) -> Vec<Entry> {
+        (0..count).map(|_| self.next()).collect()
+    }
+
+    fn next(&mut self) -> Entry {
+        if self.update_fraction > 0.0 && self.fresh_generated > 0 {
+            // 53 random bits as a uniform in [0, 1).
+            let roll = (self.chooser.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+            if roll < self.update_fraction {
+                let index = ((u128::from(self.chooser.next_u64())
+                    * u128::from(self.fresh_generated))
+                    >> 64) as u64;
+                let key = KeyStream::with_seed(self.seed).key_at(index);
+                let mut value = [0u8; 32];
+                self.update_values.fill(&mut value);
+                self.updates_generated += 1;
+                return (key, Value(value));
+            }
+        }
+        let mut key = [0u8; 32];
+        self.fresh.fill(&mut key);
+        let mut value = [0u8; 32];
+        self.fresh.fill(&mut value);
+        self.fresh_generated += 1;
+        (Key(key), Value(value))
+    }
 }
 
 /// wyrand, bit-identical to `fastrand` 2.x, so recorded seeds still name the same keys and
@@ -676,16 +750,40 @@ fn generate_entries(rng: &mut KeyStream, count: usize) -> Vec<Entry> {
 struct KeyStream(u64);
 
 impl KeyStream {
+    const WY_CONST_0: u64 = 0x2d35_8dcc_aa6c_78a5;
+    const WY_CONST_1: u64 = 0x8bb8_4b93_962e_acc9;
+
     fn with_seed(seed: u64) -> Self {
         Self(seed)
     }
 
-    fn next_u64(&mut self) -> u64 {
-        const WY_CONST_0: u64 = 0x2d35_8dcc_aa6c_78a5;
-        const WY_CONST_1: u64 = 0x8bb8_4b93_962e_acc9;
-        self.0 = self.0.wrapping_add(WY_CONST_0);
-        let t = u128::from(self.0) * u128::from(self.0 ^ WY_CONST_1);
+    fn mix(state: u64) -> u64 {
+        let t = u128::from(state) * u128::from(state ^ Self::WY_CONST_1);
         (t as u64) ^ (t >> 64) as u64
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(Self::WY_CONST_0);
+        Self::mix(self.0)
+    }
+
+    /// Draw number `index` (from 0) of a stream at its seed, without advancing: the state
+    /// before draw `k` is `seed + k * WY_CONST_0`.
+    fn draw_at(&self, index: u64) -> u64 {
+        Self::mix(
+            self.0
+                .wrapping_add(Self::WY_CONST_0.wrapping_mul(index.wrapping_add(1))),
+        )
+    }
+
+    /// The key of fresh entry `index` of a stream at its seed: an entry is eight draws, the
+    /// first four its key (see [`Self::fill`]).
+    fn key_at(&self, index: u64) -> Key {
+        let mut key = [0u8; 32];
+        for (chunk, draw) in key.as_chunks_mut::<8>().0.iter_mut().zip(index * 8..) {
+            *chunk = self.draw_at(draw).to_ne_bytes();
+        }
+        Key(key)
     }
 
     /// Eight bytes per draw in native order, as `fastrand::Rng::fill` did.
@@ -700,4 +798,52 @@ impl KeyStream {
 fn random_seed() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     std::hash::RandomState::new().build_hasher().finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `key_at` names the key `fill` produced for that entry, and with no updates the stream
+    /// is the recorded one.
+    #[test]
+    fn the_workload_re_derives_fresh_keys_and_updates_only_existing_ones() {
+        let seed = 0xBEEF;
+        let mut plain = Workload::new(seed, 0.0);
+        // As many fresh keys as the mixed window below can possibly draw.
+        let recorded = plain.window(10_000);
+        let mut sequential = KeyStream::with_seed(seed);
+        let stream = KeyStream::with_seed(seed);
+        for (i, (key, value)) in recorded.iter().enumerate() {
+            let mut k = [0u8; 32];
+            sequential.fill(&mut k);
+            let mut v = [0u8; 32];
+            sequential.fill(&mut v);
+            assert_eq!((*key, *value), (Key(k), Value(v)), "entry {i}");
+            assert_eq!(stream.key_at(i as u64), *key, "entry {i}");
+        }
+        assert_eq!(plain.updates_generated(), 0);
+
+        let mut mixed = Workload::new(seed, 0.5);
+        let entries = mixed.window(10_000);
+        let fresh: Vec<Key> = recorded.iter().map(|(k, _)| *k).collect();
+        let mut seen_fresh = 0usize;
+        let mut updates = 0usize;
+        for (key, _) in &entries {
+            if seen_fresh < fresh.len() && *key == fresh[seen_fresh] {
+                seen_fresh += 1;
+            } else {
+                assert!(
+                    fresh[..seen_fresh].contains(key) || seen_fresh >= fresh.len(),
+                    "an update named a key not yet generated"
+                );
+                updates += 1;
+            }
+        }
+        assert_eq!(updates, mixed.updates_generated());
+        assert!(
+            (4_000..6_000).contains(&updates),
+            "{updates} updates of 10,000 at a half fraction"
+        );
+    }
 }

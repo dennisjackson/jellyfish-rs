@@ -1,13 +1,14 @@
 use sha2::Digest as _;
 
-use crate::{Digest, Key, Prefix, Value};
+use crate::{Digest, Key, Prefix, Record};
 
-/// `H("leaf" || key || value)`.
-pub fn leaf(key: Key, value: Value) -> Digest {
+/// `H("leaf" || key || value || link)` (HASHCHAINS.md).
+pub fn leaf(key: Key, record: &Record) -> Digest {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"leaf");
     hasher.update(key);
-    hasher.update(value);
+    hasher.update(record.value);
+    hasher.update(record.link);
     Digest(hasher.finalize().into())
 }
 

@@ -41,6 +41,8 @@ pub enum Metric {
     LeafPuts,
     /// Frontier rows staged.
     InteriorPuts,
+    /// History rows staged: one per version written (HASHCHAINS.md).
+    HistoryPuts,
     /// Key + value bytes staged.
     BytesStaged,
     /// `db.write` calls for node batches.
@@ -60,9 +62,10 @@ pub enum Metric {
 }
 
 impl Metric {
-    pub const ALL: [Metric; 9] = [
+    pub const ALL: [Metric; 10] = [
         Metric::LeafPuts,
         Metric::InteriorPuts,
+        Metric::HistoryPuts,
         Metric::BytesStaged,
         Metric::BatchesCommitted,
         Metric::SubtreeLoads,
@@ -135,9 +138,9 @@ impl CensusSnapshot {
         CensusSnapshot { values }
     }
 
-    /// Leaf plus frontier puts: "puts per insert".
+    /// Leaf, frontier and history puts: "puts per insert".
     pub fn total_puts(&self) -> u64 {
-        self[Metric::LeafPuts] + self[Metric::InteriorPuts]
+        self[Metric::LeafPuts] + self[Metric::InteriorPuts] + self[Metric::HistoryPuts]
     }
 }
 
@@ -165,7 +168,11 @@ mod tests {
         for (position, metric) in Metric::ALL.into_iter().enumerate() {
             assert_eq!(first[metric], position as u64 + 1);
         }
-        assert_eq!(first.total_puts(), 1 + 2, "leaf puts plus interior puts");
+        assert_eq!(
+            first.total_puts(),
+            1 + 2 + 3,
+            "leaf, interior and history puts"
+        );
 
         census[Metric::LeafPuts].bump();
         census[Metric::LeavesReadByLoads].add(40);

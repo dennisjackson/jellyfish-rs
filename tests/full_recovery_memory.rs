@@ -5,7 +5,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use jellyfish_rs::mpt::rocks_frontier::storage::{RocksStorage, RocksWriteBatch};
+use jellyfish_rs::mpt::rocks_frontier::storage::{RocksStorage, RocksWriteBatch, Version};
 use jellyfish_rs::{Digest, Entry, Key, Prefix, RocksFrontierConfig, RocksFrontierMPT, Value};
 
 mod common;
@@ -125,7 +125,9 @@ fn opening_a_frontierless_database_allocates_next_to_nothing() {
     {
         let storage = RocksStorage::open(&path).expect("open storage");
         let mut batch = RocksWriteBatch::default();
-        batch.put_leaf(&key, &value);
+        let version = Version::first(key, value, 1);
+        batch.put_leaf(&version.leaf_row());
+        batch.put_history(&version);
         storage.write_batch(batch).expect("write leaf");
         storage.flush().expect("flush wal");
     }
@@ -134,6 +136,7 @@ fn opening_a_frontierless_database_allocates_next_to_nothing() {
         RocksFrontierMPT::open(&path, RocksFrontierConfig::default()).expect("recover tree")
     });
     assert_eq!(tree.get_leaf_value(key), Some(value));
+    assert_eq!(tree.get_history(key), [jellyfish_rs::Record::first(value)]);
     assert!(
         peak < PEAK_LIMIT,
         "the open peak-allocated {peak} bytes: a buffer is reserved up front"

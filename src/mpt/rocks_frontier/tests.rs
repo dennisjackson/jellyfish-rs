@@ -1,16 +1,19 @@
 //! The RocksDB tree against the oracle. Trees use [`RocksFrontierConfig::test_config`] unless
-//! a test says otherwise; a [`Model`] carries the oracle and the contents, and after every
-//! batch the tree must report the model's root, count and values and pass the levels'
-//! invariants.
+//! a test says otherwise; a [`Model`] carries the oracle and every key's history, and after
+//! every batch the tree must report the model's root, count, values and chains and pass the
+//! levels' invariants.
 
 use super::levels::Slot;
-use super::storage::{FRONTIER_RECORD_LEN, LEAF_RECORD_LEN, NODE_KEY_LEN};
+use super::storage::{
+    FORMAT_VERSION, FRONTIER_RECORD_LEN, HISTORY_KEY_LEN, HISTORY_RECORD_LEN, LEAF_RECORD_LEN,
+    NODE_KEY_LEN,
+};
 use super::*;
 use crate::census::Metric;
 use crate::mpt::SimpleMPT;
 use crate::prefix::Side;
 use crate::testing::{TestRng, fresh_dir};
-use crate::{Digest, Entry, Key, Value, hash};
+use crate::{Digest, Entry, Key, Record, Value, hash};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -49,11 +52,23 @@ fn key(byte: u8) -> Key {
     Key(key)
 }
 
-/// The oracle plus the contents it was built from.
+/// `entries` (distinct keys) as first-version leaf rows, in key order: what a fresh tree
+/// holds. The sequence numbers are arbitrary; hashing never reads them.
+fn first_leaves(entries: &[Entry]) -> Vec<LeafRow> {
+    let mut leaves: Vec<LeafRow> = entries
+        .iter()
+        .zip(1..)
+        .map(|((key, value), seq)| Version::first(*key, *value, seq).leaf_row())
+        .collect();
+    leaves.sort_by_key(|leaf| leaf.key);
+    leaves
+}
+
+/// The oracle plus every key's history, oldest first.
 #[derive(Default)]
 pub(super) struct Model {
     pub(super) oracle: SimpleMPT,
-    pub(super) contents: BTreeMap<Key, Value>,
+    pub(super) contents: BTreeMap<Key, Vec<Value>>,
 }
 
 impl Model {
@@ -62,28 +77,58 @@ impl Model {
         for (key, _) in batch {
             if !self.contents.contains_key(key) {
                 assert_eq!(tree.get_leaf_value(*key), None, "unwritten key present");
+                assert_eq!(tree.get_record(*key), None, "unwritten key has a record");
+                assert!(
+                    tree.get_history(*key).is_empty(),
+                    "unwritten key has history"
+                );
             }
         }
         tree.batch_upsert(batch);
-        self.oracle.batch_upsert(batch);
-        self.contents.extend(batch.iter().copied());
+        self.note(batch);
         self.check(tree);
+    }
+
+    /// `batch` reached the tree by some other route: bring the model up to date.
+    pub(super) fn note(&mut self, batch: &[Entry]) {
+        self.oracle.batch_upsert(batch);
+        for (key, value) in batch {
+            self.contents.entry(*key).or_default().push(*value);
+        }
     }
 
     pub(super) fn check(&self, tree: &RocksFrontierMPT) {
         assert_eq!(tree.get_root_hash(), self.oracle.get_root_hash(), "root");
         assert_eq!(tree.leaf_count(), self.contents.len(), "leaf count");
-        for (key, value) in &self.contents {
+        for (key, values) in &self.contents {
+            let history = tree.get_history(*key);
+            assert_eq!(
+                history
+                    .iter()
+                    .map(|record| record.value)
+                    .collect::<Vec<_>>(),
+                *values,
+                "history under {key:?}"
+            );
+            assert!(Record::verify_chain(*key, &history), "chain under {key:?}");
+            assert_eq!(history, self.oracle.get_history(*key), "oracle history");
+            let head = history[history.len() - 1];
+            assert_eq!(
+                tree.get_record(*key),
+                Some((values.len() as u64 - 1, head)),
+                "record under {key:?}"
+            );
             assert_eq!(
                 tree.get_leaf_value(*key),
-                Some(*value),
+                Some(values[values.len() - 1]),
                 "value under {key:?}"
             );
         }
         tree.check_invariants();
     }
 
-    /// `n` entries: up to half updates of existing keys, the rest new.
+    /// `n` entries: up to half updates of existing keys, the rest new, with one existing key
+    /// and one new key each repeated once so runs fold within the batch.
     pub(super) fn mixed_batch(&self, n: usize) -> Vec<Entry> {
         let mut batch: Vec<Entry> = self
             .contents
@@ -91,7 +136,21 @@ impl Model {
             .take(n / 2)
             .map(|key| (*key, random_value()))
             .collect();
-        batch.extend(random_entries(n - batch.len()));
+        if let Some(&(repeated, _)) = batch.first()
+            && batch.len() < n
+        {
+            batch.push((repeated, random_value()));
+        }
+        let fresh = random_entries(n - batch.len());
+        if let Some(&(repeated, _)) = fresh.first()
+            && fresh.len() >= 2
+        {
+            batch.extend_from_slice(&fresh[1..]);
+            batch.insert(batch.len() / 2, (repeated, random_value()));
+            batch.push((repeated, random_value()));
+        } else {
+            batch.extend(fresh);
+        }
         batch
     }
 }
@@ -100,8 +159,12 @@ impl RocksFrontierMPT {
     /// The levels cover the configured range (a batch may size them one deeper); every
     /// position at or above the frontier's children is hashed; every hash is what its
     /// children imply; the per-depth hashed counts agree with a census of the slots and
-    /// `depth_is_complete` with the counts.
+    /// `depth_is_complete` with the counts; the sink is empty between batches.
     pub(super) fn check_invariants(&self) {
+        assert!(
+            self.staged.lock().unwrap().is_empty(),
+            "rows left in the sink after a batch"
+        );
         let frontier = self.frontier_depth();
         let deepest = self.deepest_level();
         assert!(
@@ -172,6 +235,18 @@ impl RocksFrontierMPT {
             assert_eq!(rows, expected, "interior rows at depth {depth}");
         }
     }
+
+    /// The descent and the staging by hand, as `batch_upsert` runs them, without committing.
+    fn descend_and_stage(&mut self, entries: &[Entry]) -> Vec<RocksWriteBatch> {
+        let entries = crate::mpt::sorted_entries(entries);
+        let leaves_after = self.leaf_count() as u64 + entries.len() as u64;
+        let deepest = self.config.deepest_level(self.frontier, leaves_after);
+        self.levels.ensure_depth(deepest);
+        #[cfg(debug_assertions)]
+        self.visited.lock().unwrap().clear();
+        self.upsert(Position::ROOT, &entries);
+        self.stage_batches()
+    }
 }
 
 /// Growth through the advance, a cold reopen, a cold single-key update, a cold mixed batch
@@ -207,7 +282,8 @@ fn a_tree_matches_the_oracle_through_growth_advances_reopens_and_cold_batches() 
         "the levels below the frontier's children must be populated"
     );
 
-    // Each new key once, plus exactly one row per touched frontier subtree.
+    // Each new key once as a leaf and once as history, plus exactly one row per touched
+    // frontier subtree.
     let fresh = random_entries(200);
     let touched: HashSet<u64> = fresh
         .iter()
@@ -223,14 +299,33 @@ fn a_tree_matches_the_oracle_through_growth_advances_reopens_and_cold_batches() 
     );
     let census = tree.census_snapshot();
     assert_eq!(census[Metric::LeafPuts], 200);
+    assert_eq!(census[Metric::HistoryPuts], 200);
     assert_eq!(census[Metric::InteriorPuts], touched);
     assert_eq!(
         census[Metric::BytesStaged],
         200 * (NODE_KEY_LEN + LEAF_RECORD_LEN) as u64
+            + 200 * (HISTORY_KEY_LEN + HISTORY_RECORD_LEN) as u64
             + touched * (NODE_KEY_LEN + FRONTIER_RECORD_LEN) as u64
     );
     assert!(census[Metric::BatchesCommitted] >= 1);
     tree.check_persisted_rows();
+
+    // A key three times in one batch: one leaf, three history rows.
+    let (&existing, _) = model.contents.iter().next().expect("contents");
+    tree.census_reset();
+    model.apply(
+        &mut tree,
+        &[
+            (existing, random_value()),
+            (existing, random_value()),
+            (existing, random_value()),
+        ],
+    );
+    let census = tree.census_snapshot();
+    assert_eq!(
+        (census[Metric::LeafPuts], census[Metric::HistoryPuts]),
+        (1, 3)
+    );
 
     drop(tree);
     let mut tree = open_test(&path).expect("reopen tree");
@@ -346,6 +441,79 @@ fn a_tree_reopened_between_every_batch_matches_the_oracle() {
     assert!(open_test(&path).expect("final open").frontier_depth() >= 1);
 }
 
+/// Chains grow through every path a version can take: a run folded on a fresh subtree, a
+/// run folded over disk cold after a reopen, a long run in one batch, and ranged reads.
+#[test]
+fn a_key_written_many_times_carries_every_version_in_order() {
+    let path = fresh_dir().join("chains.db");
+    let mut model = Model::default();
+    let mut tree = open_test(&path).expect("create tree");
+    let hot = key(0x55);
+    let cold = key(0xAA);
+
+    // Fresh subtree: a run of five, interleaved with other keys, in one batch.
+    let mut batch = random_entries(40);
+    for i in 0..5u8 {
+        batch.insert(usize::from(i) * 7, (hot, Value([i; 32])));
+        batch.push((cold, Value([i + 10; 32])));
+    }
+    model.apply(&mut tree, &batch);
+    assert_eq!(tree.get_record(hot).map(|(v, _)| v), Some(4));
+    let history = tree.get_history(hot);
+    assert_eq!(
+        history.iter().map(|r| r.value).collect::<Vec<_>>(),
+        (0..5u8).map(|i| Value([i; 32])).collect::<Vec<_>>()
+    );
+    assert_eq!(history[0].link, Record::GENESIS_LINK);
+    for (previous, record) in history.iter().zip(&history[1..]) {
+        assert_eq!(record.link, previous.leaf_hash(hot));
+    }
+    // A run's intermediate versions never appear under a root, but the head does: an
+    // oracle fed only the heads disagrees, one fed the whole chain agrees (via the model).
+    let mut heads_only = SimpleMPT::new();
+    for (k, values) in &model.contents {
+        heads_only.upsert(*k, values[values.len() - 1]);
+    }
+    assert_ne!(tree.get_root_hash(), heads_only.get_root_hash());
+
+    // Cold: the chain on disk is extended after a reopen, twice in one batch.
+    for _ in 0..4 {
+        let batch = model.mixed_batch(300);
+        model.apply(&mut tree, &batch);
+    }
+    assert!(tree.frontier_depth() >= 1);
+    drop(tree);
+    let mut tree = open_test(&path).expect("reopen tree");
+    let before = model.contents[&cold].len() as u64;
+    model.apply(
+        &mut tree,
+        &[(cold, Value([20; 32])), (cold, Value([21; 32]))],
+    );
+    assert_eq!(tree.get_record(cold).map(|(v, _)| v), Some(before + 1));
+
+    // A long run: a key sixty times in one batch, and once more in the next.
+    let long = key(0x33);
+    let run: Vec<Entry> = (0..60u8).map(|i| (long, Value([i; 32]))).collect();
+    model.apply(&mut tree, &run);
+    model.apply(&mut tree, &[(long, Value([60; 32]))]);
+    let history = tree.get_history(long);
+    assert_eq!(history.len(), 61);
+    assert!(Record::verify_chain(long, &history));
+    assert_eq!(tree.get_history_range(long, 10..13), history[10..13]);
+    assert_eq!(tree.get_history_range(long, 59..), history[59..]);
+    assert_eq!(tree.get_history_range(long, ..=0), history[..1]);
+    assert_eq!(tree.get_history_range(long, 61..), []);
+    assert_eq!(tree.get_history_range(long, 5..5), []);
+    assert_eq!(tree.get_history_range(long, ..0), []);
+    assert!(
+        Record::verify_chain(long, &tree.get_history_range(long, ..30)),
+        "a prefix of a chain is a chain"
+    );
+
+    drop(tree);
+    model.check(&open_test(&path).expect("reopen tree"));
+}
+
 /// A 9-level budget lets the frontier advance several times; the hashed counts must track
 /// the slots across it (via the model's check), and a known position stays known.
 #[test]
@@ -380,7 +548,8 @@ fn the_levels_stay_counted_and_never_forget_across_batches_advances_and_a_reopen
     );
 }
 
-/// Every refusal in DESIGN.md (Safety and Correctness), by name, plus a whole deep level as the positive control.
+/// Every refusal in DESIGN.md (Safety and Correctness) and HASHCHAINS.md (Migration), by
+/// name, plus a whole deep level as the positive control.
 #[test]
 fn the_open_refuses_everything_outside_the_format_and_loads_a_whole_level() {
     let row = |depth, index| {
@@ -419,6 +588,26 @@ fn the_open_refuses_everything_outside_the_format_and_loads_a_whole_level() {
     });
     assert!(err.contains("leaf count"), "{err}");
 
+    // A v4 database with a frontier: count and depth, no format version.
+    let err = plant("v4", &|s| {
+        s.write_frontier_rows(&[row(1, 0), row(1, 1)]).unwrap();
+        s.plant_v4_metadata(2, 1).unwrap();
+    });
+    assert!(
+        err.contains("format v4") && err.contains("7f87873"),
+        "{err}"
+    );
+
+    let err = plant("future", &|s| {
+        s.write_frontier_rows(&[row(1, 0), row(1, 1)]).unwrap();
+        s.plant_v4_metadata(2, 1).unwrap();
+        s.plant_format_version(FORMAT_VERSION + 1).unwrap();
+    });
+    assert!(
+        err.contains(&format!("format v{}", FORMAT_VERSION + 1)),
+        "{err}"
+    );
+
     let err = plant("stripped", &|s| {
         s.write_frontier_rows(&[row(1, 0)]).unwrap()
     });
@@ -426,32 +615,38 @@ fn the_open_refuses_everything_outside_the_format_and_loads_a_whole_level() {
 
     let err = plant("dirty_row", &|s| {
         s.write_frontier_rows(&[row(1, 0), row(1, 1)]).unwrap();
-        let mut dirty = RocksWriteBatch::default();
-        dirty.put_raw(
-            [&1u16.to_be_bytes()[..], &key(0x20).0[..]].concat(),
-            [1u8; FRONTIER_RECORD_LEN].to_vec(),
-        );
-        s.write_batch(dirty).unwrap();
+        s.plant_raw_frontier(
+            &[&1u16.to_be_bytes()[..], &key(0x20).0[..]].concat(),
+            &[1u8; FRONTIER_RECORD_LEN],
+        )
+        .unwrap();
         s.commit_metadata(0, 1).unwrap();
     });
     assert!(err.contains("past its length"), "{err}");
 
-    // A v3 leaf record: the open counts it without decoding; the first read refuses it.
-    let path = fresh_dir().join("legacy.db");
-    {
-        let storage = RocksStorage::open(&path).expect("open storage");
-        let mut batch = RocksWriteBatch::default();
-        batch.put_raw(
-            [&256u16.to_be_bytes()[..], &[7u8; 32][..]].concat(),
-            [&[2u8][..], &[0x5Au8; 32][..]].concat(),
-        );
-        storage.write_batch(batch).expect("plant record");
-        storage.flush().expect("flush wal");
+    // Legacy leaf records without metadata: the open counts them without decoding; the first
+    // read refuses each by its format.
+    for (name, record, expected) in [
+        ("v3.db", [&[2u8][..], &[0x5Au8; 32][..]].concat(), "got 33"),
+        ("v4.db", vec![0x5Au8; 32], "format v4"),
+        ("v5.db", vec![0x5Au8; 72], "format v5"),
+    ] {
+        let path = fresh_dir().join(name);
+        {
+            let storage = RocksStorage::open(&path).expect("open storage");
+            storage
+                .plant_raw(
+                    &[&256u16.to_be_bytes()[..], &[7u8; 32][..]].concat(),
+                    &record,
+                )
+                .expect("plant record");
+            storage.flush().expect("flush wal");
+        }
+        let tree = open_test(&path).expect("the open decodes no leaf");
+        let panic = catch_unwind(AssertUnwindSafe(|| tree.get_root_hash())).expect_err("refuse");
+        let message = panic.downcast_ref::<String>().cloned().expect("message");
+        assert!(message.contains(expected), "{message}");
     }
-    let tree = open_test(&path).expect("the open decodes no leaf");
-    let panic = catch_unwind(AssertUnwindSafe(|| tree.get_root_hash())).expect_err("refuse");
-    let message = panic.downcast_ref::<String>().cloned().expect("message");
-    assert!(message.contains("got 33"), "{message}");
 
     let path = fresh_dir().join("deep.db");
     {
@@ -472,8 +667,8 @@ fn the_open_refuses_everything_outside_the_format_and_loads_a_whole_level() {
     tree.check_invariants();
 }
 
-/// Leaf records and nothing else open to the tree they describe: exact count, lazy root
-/// rebuild that writes nothing, and the next batch builds on both.
+/// Leaf records and their history and nothing else open to the tree they describe: exact
+/// count, lazy root rebuild that writes nothing, and the next batch builds on both.
 #[test]
 fn a_leaves_only_database_opens_to_the_tree_its_leaves_describe() {
     for count in [0, 1, 5, 60, 200] {
@@ -485,8 +680,7 @@ fn a_leaves_only_database_opens_to_the_tree_its_leaves_describe() {
             storage.write_leaves(&entries).expect("write leaves");
             storage.flush().expect("flush wal");
         }
-        model.oracle.batch_upsert(&entries);
-        model.contents.extend(entries.iter().copied());
+        model.note(&entries);
 
         let mut tree = open_test(&path).expect("recover tree");
         let sequence = tree.storage.latest_sequence_number();
@@ -524,7 +718,8 @@ fn the_frontier_advances_to_the_deepest_complete_level_within_the_cap() {
     ] {
         let mut tree = RocksFrontierMPT::open(fresh_dir(), config).expect("create tree");
         let mut model = Model::default();
-        // Re-applying the same entries moves no leaf, so the frontier settles honestly.
+        // Re-applying the same entries moves no leaf (each grows its chain), so the frontier
+        // settles honestly.
         for _ in 0..8 {
             model.apply(&mut tree, &entries);
         }
@@ -558,13 +753,15 @@ fn the_tree_top_follows_the_block_floor_up_to_the_budget() {
         );
     }
 
+    // 82 bytes a leaf row: 49 to a 4 KiB block (HASHCHAINS.md, Database Schema).
+    assert_eq!(LEAVES_PER_BLOCK, 49);
     for (leaves, expected) in [
         (0, 0),
         (LEAVES_PER_BLOCK, 0),
         (LEAVES_PER_BLOCK + 1, 1),
-        (1_000_000_000, 24),
-        (4_000_000_000, 26),
-        (16_000_000_000, 28),
+        (1_000_000_000, 25),
+        (4_000_000_000, 27),
+        (16_000_000_000, 29),
     ] {
         assert_eq!(
             block_floor(leaves, LEAVES_PER_BLOCK),
@@ -641,17 +838,17 @@ fn the_positional_builder_matches_the_compressed_builder() {
 
     let mut tree = fresh_tree();
     for entries in &cases {
-        let sorted = crate::mpt::sorted_unique_entries(entries);
-        let expected = RocksFrontierMPT::subtree_hash(&sorted);
+        let leaves = first_leaves(entries);
+        let expected = RocksFrontierMPT::subtree_hash(&leaves);
         // `build_subtree` only writes positions, so a stale one cannot change the hash.
         for deepest in [2, 3, 8, 12] {
             tree.levels.ensure_depth(deepest);
-            let built = tree.build_subtree(Position::ROOT, &sorted);
+            let built = tree.build_subtree(Position::ROOT, &leaves);
             assert_eq!(
                 built,
                 expected,
                 "{} leaves, levels to {deepest}",
-                sorted.len()
+                leaves.len()
             );
         }
     }
@@ -711,8 +908,8 @@ fn a_level_is_persisted_in_chunks_without_its_pass_throughs() {
     }
 }
 
-/// The merge stages only the batch's own leaves. A rewrite would be byte-identical, so the
-/// pin is the sequence number: one leaf plus two metadata puts.
+/// The merge stages only the batch's own rows. A rewrite would be byte-identical, so the pin
+/// is the sequence number: one leaf, one history row, three metadata puts.
 #[test]
 fn a_merge_does_not_rewrite_the_leaves_it_read() {
     let mut tree = fresh_tree();
@@ -731,16 +928,16 @@ fn a_merge_does_not_rewrite_the_leaves_it_read() {
     model.apply(&mut tree, &[(Key(arriving), random_value())]);
     assert_eq!(
         tree.storage.latest_sequence_number() - sequence,
-        3,
-        "writes beyond the leaf"
+        5,
+        "writes beyond the leaf and its history row"
     );
 }
 
-/// Half the staged batches dropped on the floor (DESIGN.md, Safety and Correctness): the reopened root must be
-/// the oracle's root over the leaves that reached disk, since a subtree's row and its
-/// leaves share a batch.
+/// Half the staged batches dropped on the floor (DESIGN.md, Safety and Correctness): the
+/// reopened root must be the oracle's root over the chains that reached disk, since a
+/// subtree's row, its leaves and its history rows share a batch.
 #[test]
-fn a_torn_commit_leaves_the_rows_agreeing_with_the_leaves() {
+fn a_torn_commit_leaves_the_rows_agreeing_with_the_leaves_and_their_history() {
     let path = fresh_dir().join("torn.db");
     let mut model = Model::default();
     let mut tree = open_test(&path).expect("create tree");
@@ -753,12 +950,7 @@ fn a_torn_commit_leaves_the_rows_agreeing_with_the_leaves() {
         "rows exist only with a frontier"
     );
 
-    // The descent and the staging by hand, as `batch_upsert` runs them.
-    let entries = crate::mpt::sorted_unique_entries(&model.mixed_batch(300));
-    #[cfg(debug_assertions)]
-    tree.visited.lock().unwrap().clear();
-    tree.upsert(Position::ROOT, &entries);
-    let batches = tree.stage_batches(&entries);
+    let batches = tree.descend_and_stage(&model.mixed_batch(300));
     assert!(batches.len() > 1, "one batch cannot tear");
     for (i, batch) in batches.into_iter().enumerate() {
         if i % 2 == 0 {
@@ -771,14 +963,31 @@ fn a_torn_commit_leaves_the_rows_agreeing_with_the_leaves() {
     let tree = open_test(&path).expect("reopen the torn database");
     let on_disk = tree
         .storage
-        .get_leaf_entries_by_prefix(&Prefix::root())
+        .get_leaf_rows_by_prefix(&Prefix::root())
         .expect("scan leaves");
     assert!(
         on_disk.len() > model.contents.len(),
         "the committed half added leaves"
     );
     let mut oracle = SimpleMPT::new();
-    oracle.batch_upsert(&on_disk);
+    let mut advanced = 0;
+    for leaf in &on_disk {
+        let history = tree.get_history(leaf.key);
+        assert!(Record::verify_chain(leaf.key, &history), "chain on disk");
+        assert_eq!(
+            history.last().map(|record| record.leaf_hash(leaf.key)),
+            Some(leaf.hash),
+            "a leaf's history ends at the record it hashes, torn or not"
+        );
+        assert_eq!(history.len() as u64, leaf.version + 1);
+        let before = model.contents.get(&leaf.key).map_or(0, Vec::len);
+        assert!(history.len() >= before, "history lost");
+        advanced += usize::from(history.len() > before);
+        for record in &history {
+            oracle.upsert(leaf.key, record.value);
+        }
+    }
+    assert!(advanced > 0, "the committed half wrote versions");
     assert_eq!(
         tree.get_root_hash(),
         oracle.get_root_hash(),
@@ -824,8 +1033,7 @@ fn a_wrong_leaf_count_does_not_stall_the_frontier() {
         let entries = random_entries(300);
         added += entries.len();
         tree.batch_upsert(&entries);
-        model.oracle.batch_upsert(&entries);
-        model.contents.extend(entries.iter().copied());
+        model.note(&entries);
         assert_eq!(
             tree.leaf_count(),
             added,
@@ -885,15 +1093,8 @@ fn a_crash_inside_an_advance_leaves_an_openable_database() {
     model.apply(&mut tree, &random_entries(3));
     assert_eq!(tree.frontier_depth(), 0, "three leaves complete no level");
 
-    let entries = crate::mpt::sorted_unique_entries(&random_entries(300));
-    // Driving the descent by hand, so size the tree top as `batch_upsert` would.
-    let leaves_after = tree.leaf_count() as u64 + entries.len() as u64;
-    let deepest = tree.config.deepest_level(tree.frontier, leaves_after);
-    tree.levels.ensure_depth(deepest);
-    #[cfg(debug_assertions)]
-    tree.visited.lock().unwrap().clear();
-    tree.upsert(Position::ROOT, &entries);
-    for batch in tree.stage_batches(&entries) {
+    let entries = random_entries(300);
+    for batch in tree.descend_and_stage(&entries) {
         tree.storage.write_batch(batch).expect("commit leaves");
     }
     assert!(
@@ -915,8 +1116,7 @@ fn a_crash_inside_an_advance_leaves_an_openable_database() {
     tree.storage.flush().expect("flush wal");
     drop(tree);
 
-    model.oracle.batch_upsert(&entries);
-    model.contents.extend(entries.iter().copied());
+    model.note(&entries);
     let mut tree = RocksFrontierMPT::open(&path, config).expect("reopen after the torn advance");
     assert_eq!(tree.frontier_depth(), 1);
     model.check(&tree);
@@ -957,10 +1157,8 @@ fn a_tree_whose_batch_panicked_refuses_further_use() {
     let mut beside = existing.0;
     beside[31] ^= 1;
     let corrupt_key = [&256u16.to_be_bytes()[..], &beside[..]].concat();
-    let mut plant = RocksWriteBatch::default();
-    plant.put_raw(corrupt_key.clone(), [&[2u8][..], &[0x5A; 32][..]].concat());
     tree.storage
-        .write_batch(plant)
+        .plant_raw(&corrupt_key, &[&[2u8][..], &[0x5A; 32][..]].concat())
         .expect("plant a corrupt record");
 
     let message = |panic: Box<dyn std::any::Any + Send>| -> String {
@@ -978,6 +1176,7 @@ fn a_tree_whose_batch_panicked_refuses_further_use() {
         .expect_err("a poisoned tree refuses a batch");
     assert!(message(panic).contains("panicked part-way"));
     assert!(catch_unwind(AssertUnwindSafe(|| tree.leaf_count())).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| tree.get_history(existing))).is_err());
 
     tree.storage
         .delete_raw(&corrupt_key)

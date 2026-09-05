@@ -7,4 +7,4 @@ mod testing;
 
 pub use census::{Census, CensusSnapshot, Metric};
 pub use mpt::{RocksFrontierConfig, RocksFrontierMPT};
-pub use prefix::{Digest, Entry, Key, Prefix, Side, Value};
+pub use prefix::{Digest, Entry, Key, Prefix, Record, Side, Value};
