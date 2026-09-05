@@ -481,8 +481,41 @@ two-level shape rather than the narrower prefix), and 15.6 leaves read per inser
 19.6 because scans start at depth 26. The from-empty case is slower because a 10 M-leaf
 tree does not need a 26-level tree top: the descent is five levels deeper than it would
 otherwise be and 4.4 GB of slots are touched for nothing. That cost is fixed while the read
-saving grows with the tree, so at a billion entries v7 should be ahead of v6 by more than
-15%; that run has not been done.
+saving grows with the tree.
+
+**Fourth run: v7 at a billion entries** (same machine, same arguments, wiped database; root
+`bd224678…` again).
+
+| entries (M) | v6, k entries/s over that 100 M | v7 |
+|------------:|--------------------------------:|----:|
+|         100 |                             235 | 286 |
+|         200 |                             173 | 223 |
+|         400 |                             172 | 201 |
+|         600 |                             159 | 194 |
+|         800 |                             152 | 177 |
+|        1000 |                             146 | 171 |
+
+| | v6 | v7 |
+|---|---:|---:|
+| overall | 164 k entries/s (6087 s) | **197 k entries/s** (5071 s) |
+| batch p50 / p99 | 55 / 138 ms | 47 / 104 ms |
+| data blocks read per insert | 2.5 | 1.8 |
+| leaves read per insert | 12.9 | 4.2 |
+| leaf compaction written / write amp / CPU-s | 784 GB / 9.4 / 10,900 | 439 GB / 5.7 / 5,500 |
+| populated leaf levels at the end | L3–L6 | L4–L6 (L4 and L5 at 2 and 3.5 GB) |
+| write stalls / stall time | 17 / 0.1% | 16 / 0.1% |
+| on disk / peak RSS | 106 GB / 5.9 GB | 106 GB / 8.8 GB |
+
+Blocks read per scan came out at 1.8, which is what the 26-bit prefix model above predicted;
+leaves read per scan fell from 13 to 4 because the scan starts at depth 26. Leaf compaction
+halved. History and frontier costs are unchanged. The 20% overall gain is the sum of a
+faster read path and a lighter leaf LSM, bought with 3 GB of RSS for the deeper tree top.
+
+Against `main`'s history (fresh inserts only), v7's 197 k/s average over a billion entries
+and 171 k/s over the last hundred million are now above main's 142 k/s average over its
+1.76 B-leaf build and its 95–116 k/s past RAM, with the caveat that main's tree held twice
+the leaves at equal entries. The remaining large costs, in order: leaf compaction (439 GB per
+billion entries), frontier-row compaction (183 GB, item 3 above), and the WAL.
 
 ## Testing
 
