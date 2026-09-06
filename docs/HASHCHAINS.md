@@ -517,6 +517,22 @@ and 171 k/s over the last hundred million are now above main's 142 k/s average o
 the leaves at equal entries. The remaining large costs, in order: leaf compaction (439 GB per
 billion entries), frontier-row compaction (183 GB, item 3 above), and the WAL.
 
+**To a billion leaves.** The v7 database was then reopened and 500 M fresh keys added
+(`bench -n 500000000 -s 2027`, no updates), taking it from 499,988,795 to 999,988,795 leaves.
+The cold open, loading the 2^23-row frontier level and seeking the history counter, took
+11.8 s. The 500 M inserts took 3637 s, **137 k entries/s**: 160 k/s over the first hundred
+million (600 M leaves), 137 k/s as the frontier reached its cap of 24 at about 800 M leaves
+(16.7 M rows written in one batch, 24 stalls, 0.3% of the time), 117 k/s over the last
+hundred million at a billion leaves. Per insert at the end: 11.9 leaves read (a depth-26
+scan covers 15 leaves at this size), 2.5 data blocks, 3.03 puts, 258 bytes staged. On
+disk: 164 GB, of which leaves 79 GB, history 80 GB (1.5 B rows), frontier 3 GB; peak RSS
+9.0 GB. Root `9f214325b09646e1e0e3f611164ae71f1e01b7f9c208b1cafe0a4146791ecb19`.
+
+For comparison, main (v4) at a billion leaves on this class of machine held 95 k/s cold and
+116 k/s after an idle-window compaction (docs/old/BENCHMARK-BASELINE.md §5.4, §5.6), with a
+database of 68–124 GB and no history. So the hash chain, at v7, costs nothing in throughput
+against the v4 record at this size, while storing every version of every key.
+
 ## Testing
 
 The oracle (`SimpleMPT`) keeps every key's chain and applies the same link rule by a
