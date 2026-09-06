@@ -1,6 +1,6 @@
 # Hash chains
 
-Status: implemented on the `hashchains` branch (format v5). Extends DESIGN.md; nothing there
+Status: implemented on the `hashchains` branch (format v7). Extends DESIGN.md; nothing there
 is changed except where this document says so.
 
 ## Goal
@@ -516,6 +516,34 @@ and 171 k/s over the last hundred million are now above main's 142 k/s average o
 1.76 B-leaf build and its 95–116 k/s past RAM, with the caveat that main's tree held twice
 the leaves at equal entries. The remaining large costs, in order: leaf compaction (439 GB per
 billion entries), frontier-row compaction (183 GB, item 3 above), and the WAL.
+
+**On to a billion leaves.** The v7 database was then reopened and extended with 500 M fresh
+keys (`bench -n 500000000 -s 2027`, a new seed so the keys are new), taking the tree from
+500 M to 1,000 M leaves and the history to 1.5 B rows. The cold open at 500 M leaves took
+11.8 s: the depth-23 frontier level (8.4 M rows) and one seek for the sequence counter.
+
+| leaves (M) | frontier | k fresh entries/s over that 100 M |
+|-----------:|---------:|----------------------------------:|
+|        600 |       23 |                               160 |
+|        700 |       23 |                               154 |
+|        800 |       24 |                               137 |
+|        900 |       24 |                               129 |
+|       1000 |       24 |                               117 |
+
+137 k entries/s over the 500 M (3637 s), batch p50 65 ms and p99 154 ms; 24 write stalls,
+all at the depth-24 advance, 0.3% of the time. Per insert: 3.03 puts, 12 leaves read in one
+subtree load, 2.5 data blocks read. The frontier reached its cap of 24 at about 800 M leaves,
+after which each frontier subtree grows with the tree: leaves read per scan went from 4 at
+depth 26 with 500 M leaves to 12 as the tree doubled and the block floor caught up with the
+scan floor, and blocks per scan from 1.8 to 2.5 as the leaf column family (79 GB) spread
+over more levels (write amplification 8.7 over the continuation). Final state: 1,000 M
+leaves, 1.5 B history rows, 164 GB on disk (leaves 79 GB, history 80 GB, frontier 3 GB),
+peak RSS 9.0 GB, root `9f214325…`.
+
+For comparison, `main` (v4, fresh inserts) held 95–116 k/s in the same 0.5–1 B-leaf regime
+on this class of machine (docs/old/BENCHMARK-BASELINE.md §5.4–5.6), with a tree of the same
+leaf count but without the history rows or the second column family's traffic. The final
+100 M here ran at 117 k/s with both.
 
 **To a billion leaves.** The v7 database was then reopened and 500 M fresh keys added
 (`bench -n 500000000 -s 2027`, no updates), taking it from 499,988,795 to 999,988,795 leaves.
