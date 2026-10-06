@@ -3,7 +3,10 @@
 A binary Merkle-Patricia trie over 256-bit keys with a RocksDB backend, optimised for batch
 insertion.
 
-This code was written to evaluate different strategies for performant MPT implementations. The final design achieves an insertion rate of over 100k/s at a tree size of 1 billion entries on a commodity SSD whilst using only 8GB of RAM. The implementation ensures inserted nodes are persisted to disk, is crash-safe and can cold-start in under 5 seconds.
+This code was written to evaluate different strategies for performant MPT implementations. The final design achieves an insertion rate of over 100k/s at a tree size of 1 billion entries on a commodity SSD whilst using only 8GB of RAM. The implementation ensures inserted nodes are persisted to disk, is crash-safe and can cold-start in under 5 seconds. In one image: 
+
+<img width="2803" height="1350" alt="image" src="https://github.com/user-attachments/assets/1dbf8a3f-e9b3-4cf5-a7c4-8857129f0f94" />
+
 
 [DESIGN.md](docs/DESIGN.md) explains the design in more detail. [bigdb-report.html](docs/report-bigdb-6f4ad7.html) reports benchmarking results for a MPT with 2 billion entries.
 
